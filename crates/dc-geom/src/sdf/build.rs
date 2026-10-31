@@ -15,7 +15,7 @@
 //!    An inside voxel at distance zero (a wall of a part through voxel
 //!    centres, inside another part) keeps a negative value.
 //! 4. Distances measured to a surface left inside the solid (a union) are
-//!    corrected by one re-distancing pass.
+//!    corrected by re-distancing the blocks within the band of it.
 //!
 //! [`closed`] is the blockout closing of the add-on on top of it: the level
 //! set at `+r` meshed and sampled again from that surface, read at `−r`.
@@ -442,8 +442,11 @@ fn sample(mesh: &TriMesh, vs: f32, band: f32, interior: Interior) -> Result<SdfG
     drop(raws);
     let mut grid = SdfGrid::from_store(vs, origin, band, Store::new(keys, data, tiles));
     clean_isolated(&mut grid);
-    if interior == Interior::Exact && has_buried_surface(&grid) {
-        grid.redistance_to(band)?;
+    if interior == Interior::Exact {
+        let near = buried_blocks(&grid);
+        if !near.is_empty() {
+            super::ops::redistance_in(&mut grid, band, Some(&near))?;
+        }
     }
     Ok(grid)
 }
@@ -505,24 +508,40 @@ fn clean_isolated(grid: &mut SdfGrid) {
     }
 }
 
-/// `true` when an inside voxel very close to the surface has no outside
-/// neighbour among its 26: its distance was measured to a surface buried
-/// inside the solid (the face neighbours alone miss a surface crossing
-/// diagonally at a sharp concave crease).
-fn has_buried_surface(grid: &SdfGrid) -> bool {
+/// Blocks whose distances may have been measured to a surface buried inside
+/// the solid: within the band of an inside voxel very close to a surface
+/// ([`BURIED`]) with no outside neighbour among its 26 (the face neighbours
+/// alone miss a surface crossing diagonally at a sharp concave crease).
+fn buried_blocks(grid: &SdfGrid) -> store::KeySet {
     let band = grid.band;
     let lim = -BURIED * grid.voxel_size;
     let store = &grid.store;
-    (0..store.len()).into_par_iter().any(|bi| {
-        let base = store.keys[bi] * SIDE;
-        let vals = store.block(bi);
-        (0..VOXELS).any(|i| {
-            let v = vals[i];
-            v < 0.0
-                && v > lim
-                && NEIGHBOURS_26
-                    .iter()
-                    .all(|d| store.value(base + local_coord(i) + *d, band) < 0.0)
+    let seeds: Vec<IVec3> = (0..store.len())
+        .into_par_iter()
+        .filter(|&bi| {
+            let base = store.keys[bi] * SIDE;
+            let vals = store.block(bi);
+            (0..VOXELS).any(|i| {
+                let v = vals[i];
+                v < 0.0
+                    && v > lim
+                    && NEIGHBOURS_26
+                        .iter()
+                        .all(|d| store.value(base + local_coord(i) + *d, band) < 0.0)
+            })
         })
-    })
+        .map(|bi| store.keys[bi])
+        .collect();
+    let r = (band / (SIDE as f32 * grid.voxel_size)).ceil() as i32 + 1;
+    let mut out = store::KeySet::default();
+    for s in seeds {
+        for z in -r..=r {
+            for y in -r..=r {
+                for x in -r..=r {
+                    out.insert(store::pack(s + IVec3::new(x, y, z)));
+                }
+            }
+        }
+    }
+    out
 }

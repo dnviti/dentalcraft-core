@@ -16,6 +16,16 @@ use crate::{GeomError, Result};
 /// level: exact distances to the extracted surface, signs from the current
 /// values.
 pub(crate) fn redistance(grid: &mut SdfGrid, band: f32) -> Result<()> {
+    redistance_in(grid, band, None)
+}
+
+/// [`redistance`] of the blocks in `only` (all when `None`); the other
+/// blocks keep their values.
+pub(crate) fn redistance_in(
+    grid: &mut SdfGrid,
+    band: f32,
+    only: Option<&store::KeySet>,
+) -> Result<()> {
     let (vs, origin) = (grid.voxel_size, grid.origin);
     let (positions, tris) = mesher::extract(&grid.store, grid.band, origin, vs, 0.0);
     if tris.is_empty() {
@@ -34,9 +44,16 @@ pub(crate) fn redistance(grid: &mut SdfGrid, band: f32) -> Result<()> {
     let blocks: Vec<(IVec3, Box<[f32; VOXELS]>)> = candidates
         .par_iter()
         .filter_map(|&(key, dc)| {
+            let src = old.find(key).map(|i| old.block(i));
+            if let (Some(set), Some(v)) = (only, src)
+                && !set.contains(&store::pack(key))
+            {
+                let mut vals = Box::new([0f32; VOXELS]);
+                vals.copy_from_slice(v);
+                return Some((key, vals));
+            }
             let mut vals = Box::new([band; VOXELS]);
             let mut any = false;
-            let src = old.find(key).map(|i| old.block(i));
             let bg = old.background(key, old_band);
             scan_block(&bvh, key, dc, origin, vs, band, |i, _, d, _| {
                 any |= d < band;

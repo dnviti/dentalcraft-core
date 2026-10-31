@@ -351,10 +351,6 @@ impl SdfGrid {
         ops::redistance(self, self.band)
     }
 
-    fn redistance_to(&mut self, band: f32) -> Result<()> {
-        ops::redistance(self, band)
-    }
-
     /// Extracts the zero level set as a closed, manifold triangle mesh with
     /// counter-clockwise (outward) faces. Empty for an empty solid.
     pub fn to_mesh(&self) -> Result<TriMesh> {
