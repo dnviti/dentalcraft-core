@@ -90,10 +90,6 @@ mod tests {
             Err(GeomError::NotImplemented(_))
         ));
         assert!(matches!(
-            icp::point_to_plane(&m, &m, &icp::IcpParams::default()),
-            Err(GeomError::NotImplemented(_))
-        ));
-        assert!(matches!(
             sdf::SdfGrid::from_mesh(&m, &sdf::SdfParams::default()),
             Err(GeomError::NotImplemented(_))
         ));
