@@ -98,9 +98,9 @@ mod tests {
             Err(GeomError::NotImplemented(_))
         ));
         let a = sparse::CsrMatrix::identity(2);
-        assert!(matches!(
-            sparse::pcg_solve(&a, &[1.0, 1.0], &sparse::PcgParams::default()),
-            Err(GeomError::NotImplemented(_))
-        ));
+        assert_eq!(
+            sparse::pcg_solve(&a, &[1.0, 1.0], &sparse::PcgParams::default()).unwrap(),
+            vec![1.0, 1.0]
+        );
     }
 }
