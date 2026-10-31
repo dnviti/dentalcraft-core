@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/dnviti-personal-org/dentalcraft-core/compare/v0.2.0...v0.2.1) (2026-10-31)
+
+
+### Bug Fixes
+
+* **workspace:** drop version requirements on internal path dependencies ([#5](https://github.com/dnviti-personal-org/dentalcraft-core/issues/5)) ([73ebf70](https://github.com/dnviti-personal-org/dentalcraft-core/commit/73ebf70638cbb7875cf9fbe7b731883057eddc83))
+
 ## [0.2.0](https://github.com/dnviti-personal-org/dentalcraft-core/compare/v0.1.0...v0.2.0) (2026-10-31)
 
 
