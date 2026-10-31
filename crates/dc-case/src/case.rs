@@ -43,8 +43,9 @@ pub struct Scan {
 /// Dental world frame of a case.
 ///
 /// Convention (same as the old `worldframe.py`): the occlusal plane is XY,
-/// the midline runs along Y with the incisors towards −Y, and the lower arch
-/// lies towards +Z.
+/// the midline runs along Y with the incisors towards −Y. The lower arch has
+/// its teeth up (+Z) and the upper arch stands above it with its teeth down,
+/// so the lower arch lies below the upper one (towards −Z).
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct WorldFrame {
     /// Transform from case coordinates to the world frame.
@@ -58,8 +59,9 @@ impl WorldFrame {
     pub const MIDLINE: DVec3 = DVec3::Y;
     /// Direction towards the incisors.
     pub const ANTERIOR: DVec3 = DVec3::NEG_Y;
-    /// Direction from the upper towards the lower arch.
-    pub const TOWARDS_LOWER: DVec3 = DVec3::Z;
+    /// Direction from the upper towards the lower arch (the lower arch lies
+    /// below the upper one).
+    pub const TOWARDS_LOWER: DVec3 = DVec3::NEG_Z;
 }
 
 /// Which jaws a case treats.
@@ -238,6 +240,21 @@ mod tests {
         assert_eq!(case.jaws, Jaws::Both);
         let json = serde_json::to_value(&case).unwrap();
         assert_eq!(json["jaws"], "both");
+    }
+
+    #[test]
+    fn world_frame_convention_matches_the_plugin() {
+        // worldframe.py: lower arch teeth up (+Z), upper arch teeth down,
+        // lower arch below the upper, incisors towards −Y, midline along Y.
+        assert_eq!(WorldFrame::OCCLUSAL_NORMAL, DVec3::Z);
+        assert_eq!(WorldFrame::TOWARDS_LOWER, DVec3::NEG_Z);
+        assert_eq!(WorldFrame::ANTERIOR, DVec3::NEG_Y);
+        assert_eq!(WorldFrame::MIDLINE, DVec3::Y);
+        // the lower teeth point up, i.e. away from the upper arch
+        assert_eq!(
+            WorldFrame::TOWARDS_LOWER.dot(WorldFrame::OCCLUSAL_NORMAL),
+            -1.0
+        );
     }
 
     #[test]
