@@ -12,8 +12,13 @@
 //!    closest feature, and a positive one with no exterior voxel among its 26
 //!    neighbours is moved inside (the self-intersecting surface of a union of
 //!    overlapping closed meshes, OpenVDB `RemoveSelfIntersectingSurface`).
+//!    An inside voxel at distance zero (a wall of a part through voxel
+//!    centres, inside another part) keeps a negative value.
 //! 4. Distances measured to a surface left inside the solid (a union) are
 //!    corrected by one re-distancing pass.
+//!
+//! [`closed`] is the blockout closing of the add-on on top of it: the level
+//! set at `+r` meshed and sampled again from that surface, read at `−r`.
 
 use glam::{DVec3, IVec3, Vec3};
 use rayon::prelude::*;
@@ -280,7 +285,92 @@ pub(crate) fn check_params(vs: f32, band: f32) -> Result<f32> {
     Ok(band.max(super::MIN_BAND_VOXELS * vs))
 }
 
+/// What [`sample`] must get right inside the solid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Interior {
+    /// Exact distances (to the outer surface of a union of parts).
+    Exact,
+    /// The sign only: the distances inside may be measured to walls left
+    /// inside the solid (outside they are exact in any case: the closest
+    /// point of a part to an outside point is on the surface of the union).
+    SignOnly,
+}
+
 pub(crate) fn from_mesh(mesh: &TriMesh, vs: f32, band: f32) -> Result<SdfGrid> {
+    sample(mesh, vs, band, Interior::Exact)
+}
+
+/// Extra voxels of band beyond the level read from the first field of
+/// [`closed`] (the mesher needs exact values on both sides of it).
+const CLOSING_EXTRA: f32 = 2.0;
+
+/// The solid of `mesh` closed by `radius` as OpenVDB does it in the add-on
+/// (`aligner._sdf_group`): the level set at `+radius` of the field of the
+/// mesh is meshed and sampled again from that surface (enclosed cavities of
+/// the dilated solid are filled, gaps narrower than the barrier bridged),
+/// then moved back by `radius` without re-distancing. The values are the
+/// distance to the dilated surface minus `radius` (exact outside the closed
+/// surface, `band` the half width of the result).
+pub(crate) fn closed(mesh: &TriMesh, vs: f32, band: f32, radius: f32) -> Result<SdfGrid> {
+    let band = check_params(vs, band)?;
+    if !(radius.is_finite() && radius >= 0.0) {
+        return Err(GeomError::InvalidInput(format!(
+            "radius must be finite and not negative, got {radius}"
+        )));
+    }
+    if radius < 1e-6 * vs {
+        return sample(mesh, vs, band, Interior::Exact);
+    }
+    let first = sample(mesh, vs, radius + CLOSING_EXTRA * vs, Interior::SignOnly)?;
+    let (positions, tris) =
+        super::mesher::extract(&first.store, first.band, first.origin, vs, radius);
+    drop(first);
+    if tris.is_empty() {
+        return Ok(SdfGrid::from_store(vs, Vec3::ZERO, band, Store::default()));
+    }
+    let dilated = without_cavities(TriMesh::new(positions, tris));
+    let mut g = sample(&dilated, vs, band + radius, Interior::Exact)?;
+    drop(dilated);
+    super::ops::shift_to(&mut g, -radius, band);
+    Ok(g)
+}
+
+/// The closed, outward surface of a mesher output without its pieces of
+/// negative volume (the walls of enclosed cavities, which the exterior flood
+/// fills anyway and which would be left as walls inside the solid).
+fn without_cavities(mesh: TriMesh) -> TriMesh {
+    let comps = mesh.connected_components();
+    if comps.len() < 2 {
+        return mesh;
+    }
+    let pos = |v: u32| mesh.positions[v as usize].as_dvec3();
+    let mut keep = vec![true; mesh.tris.len()];
+    for c in &comps {
+        let o = pos(mesh.tris[c[0] as usize][0]);
+        let vol: f64 = c
+            .iter()
+            .map(|&f| {
+                let [a, b, d] = mesh.tris[f as usize].map(|v| pos(v) - o);
+                a.dot(b.cross(d))
+            })
+            .sum();
+        if vol < 0.0 {
+            for &f in c {
+                keep[f as usize] = false;
+            }
+        }
+    }
+    let tris = mesh
+        .tris
+        .iter()
+        .zip(&keep)
+        .filter(|(_, k)| **k)
+        .map(|(t, _)| *t)
+        .collect();
+    TriMesh::new(mesh.positions, tris)
+}
+
+fn sample(mesh: &TriMesh, vs: f32, band: f32, interior: Interior) -> Result<SdfGrid> {
     let band = check_params(vs, band)?;
     if mesh.tris.is_empty() {
         return Err(GeomError::InvalidInput("mesh has no triangles".into()));
@@ -342,7 +432,7 @@ pub(crate) fn from_mesh(mesh: &TriMesh, vs: f32, band: f32) -> Result<SdfGrid> {
                 } else {
                     true
                 };
-                *o = if inside { -d } else { d };
+                *o = store::signed(d, inside);
             }
         });
     let tiles: Vec<IVec3> = (0..domain.cells.len())
@@ -352,7 +442,7 @@ pub(crate) fn from_mesh(mesh: &TriMesh, vs: f32, band: f32) -> Result<SdfGrid> {
     drop(raws);
     let mut grid = SdfGrid::from_store(vs, origin, band, Store::new(keys, data, tiles));
     clean_isolated(&mut grid);
-    if has_buried_surface(&grid) {
+    if interior == Interior::Exact && has_buried_surface(&grid) {
         grid.redistance_to(band)?;
     }
     Ok(grid)
@@ -416,8 +506,9 @@ fn clean_isolated(grid: &mut SdfGrid) {
 }
 
 /// `true` when an inside voxel very close to the surface has no outside
-/// face neighbour: its distance was measured to a surface buried inside the
-/// solid.
+/// neighbour among its 26: its distance was measured to a surface buried
+/// inside the solid (the face neighbours alone miss a surface crossing
+/// diagonally at a sharp concave crease).
 fn has_buried_surface(grid: &SdfGrid) -> bool {
     let band = grid.band;
     let lim = -BURIED * grid.voxel_size;
@@ -429,7 +520,7 @@ fn has_buried_surface(grid: &SdfGrid) -> bool {
             let v = vals[i];
             v < 0.0
                 && v > lim
-                && flood::DIRS
+                && NEIGHBOURS_26
                     .iter()
                     .all(|d| store.value(base + local_coord(i) + *d, band) < 0.0)
         })

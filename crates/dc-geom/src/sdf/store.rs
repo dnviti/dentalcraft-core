@@ -72,6 +72,14 @@ pub(crate) fn local_coord(i: usize) -> IVec3 {
     IVec3::new(i & 7, (i >> 3) & 7, i >> 6)
 }
 
+/// Distance `d` with the sign of its side (negative inside). An inside
+/// voxel at distance zero (on a wall left inside the solid, or exactly on
+/// the surface) keeps a negative value: `-0.0` would read as outside.
+#[inline]
+pub(crate) fn signed(d: f32, inside: bool) -> f32 {
+    if inside { -d.max(f32::MIN_POSITIVE) } else { d }
+}
+
 /// Sorts block keys in storage order and removes duplicates.
 pub(crate) fn sort_keys(keys: &mut Vec<IVec3>) {
     keys.sort_unstable_by_key(|&k| pack(k));
@@ -202,5 +210,13 @@ mod tests {
             IVec3::new(7, 1, 7)
         );
         assert_eq!(block_of(IVec3::new(-1, 9, 23)), IVec3::new(-1, 1, 2));
+    }
+
+    #[test]
+    fn inside_zero_stays_negative() {
+        assert!(signed(0.0, true) < 0.0);
+        assert!(signed(0.0, false) >= 0.0 && !signed(0.0, false).is_sign_negative());
+        assert_eq!(signed(0.25, true), -0.25);
+        assert_eq!(signed(0.25, false), 0.25);
     }
 }
