@@ -82,10 +82,6 @@ mod tests {
     fn stubs_report_not_implemented() {
         let m = dc_mesh::TriMesh::default();
         assert!(matches!(
-            bvh::Bvh::build(&m),
-            Err(GeomError::NotImplemented(_))
-        ));
-        assert!(matches!(
             qem::decimate(&m, &qem::DecimateParams::default()),
             Err(GeomError::NotImplemented(_))
         ));
