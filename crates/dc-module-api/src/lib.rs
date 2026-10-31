@@ -1,7 +1,8 @@
 //! Contract between the DentalCraft shell and its dental modules.
 //!
 //! A module (e.g. `aligners`) implements [`Module`]: it declares its menu
-//! ([`MenuTree`]), its commands ([`CommandDesc`]), draws its inspector with
+//! ([`MenuTree`]), its commands ([`CommandDesc`]) and the agent-drivable
+//! ones with their parameters ([`CommandSpec`]), draws its inspector with
 //! egui, describes what the viewport shows ([`dc_scene::SceneItem`]) and
 //! provides a [`ModuleCodec`] (the one of `dc-project`) for its data in
 //! `.dcprj` files. Modules are
@@ -9,11 +10,13 @@
 //! depends on the user's entitlements.
 
 mod menu;
+mod spec;
 
 use std::sync::Arc;
 
 pub use dc_project::{ModuleCodec, ModuleCodecs};
 pub use menu::{MenuItem, MenuKind, MenuStatus, MenuTree};
+pub use spec::{CommandOutput, CommandRunFn, CommandSpec, SpecCommand};
 
 use dc_case::CaseState;
 use dc_command::Command;
@@ -176,6 +179,13 @@ pub trait Module: Send {
 
     /// Commands the module offers.
     fn commands(&self) -> Vec<CommandDesc>;
+
+    /// Registered commands with a parameter schema and a run function, as
+    /// listed and executed by the CLI and the MCP server. The default has
+    /// none.
+    fn command_specs(&self) -> Vec<CommandSpec> {
+        Vec::new()
+    }
 
     /// Runs command `command_id` (menu click or shortcut). The default
     /// shows the "not available yet" toast for placeholder commands.
@@ -373,6 +383,11 @@ mod tests {
         assert!(c.load(serde_json::json!({}), 3).is_err());
         // no step registered from version 0
         assert!(c.load(serde_json::json!({}), 0).is_err());
+    }
+
+    #[test]
+    fn command_specs_default_to_none() {
+        assert!(Demo("x").command_specs().is_empty());
     }
 
     #[test]

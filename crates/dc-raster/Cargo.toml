@@ -1,0 +1,19 @@
+[package]
+name = "dc-raster"
+description = "CPU rasteriser for headless renders and screenshots (PNG output)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+dc-mesh.workspace = true
+glam.workspace = true
+png.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
