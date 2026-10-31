@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "LicenseRef-Proprietary"
+repository = "https://github.com/dnviti-personal-org/dentalcraft-core"
+authors = ["Daniele Viti"]
+publish = false
+
+[workspace.dependencies]
+# internal crates
+dc-mesh = { path = "crates/dc-mesh", version = "0.1.0" }
+dc-geom = { path = "crates/dc-geom", version = "0.1.0" }
+dc-case = { path = "crates/dc-case", version = "0.1.0" }
+dc-command = { path = "crates/dc-command", version = "0.1.0" }
+dc-jobs = { path = "crates/dc-jobs", version = "0.1.0" }
+dc-scene = { path = "crates/dc-scene", version = "0.1.0" }
+dc-project = { path = "crates/dc-project", version = "0.1.0" }
+dc-module-api = { path = "crates/dc-module-api", version = "0.1.0" }
+dc-i18n = { path = "crates/dc-i18n", version = "0.1.0" }
+dc-theme = { path = "crates/dc-theme", version = "0.1.0" }
+
+# GUI: egui, eframe and egui-wgpu must always share the same version
+egui = { version = "=0.37.0", default-features = false, features = ["default_fonts"] }
+eframe = { version = "=0.37.0", default-features = false }
+egui-wgpu = { version = "=0.37.0", default-features = false }
+
+# math, hashing, serialization
+glam = { version = "0.34.1", features = ["serde"] }
+blake3 = { version = "1.8.7", default-features = false, features = ["std", "pure"] }  # "pure": no C/asm build step
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+uuid = { version = "1.29.0", features = ["v4", "serde"] }
+
+# concurrency
+rayon = "1.12.0"
+
+# i18n
+i18n-embed = { version = "0.16.0", features = ["fluent-system", "desktop-requester"] }
+i18n-embed-fl = "0.10.1"
+rust-embed = { version = "8.13.0", features = ["debug-embed"] }
+fluent-syntax = "0.12.0"
+unic-langid = "0.9.6"
+
+# project file container (deflate via pure-Rust zlib-rs; no zstd: it needs a C build)
+zip = { version = "9.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+# testing
+proptest = "1.12.0"
+tempfile = "3.27.0"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

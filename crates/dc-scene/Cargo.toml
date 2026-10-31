@@ -1,0 +1,18 @@
+[package]
+name = "dc-scene"
+description = "GPU-agnostic scene description: meshes, lines, points, 3D labels, overlays"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+dc-case.workspace = true
+glam.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "dc-module-api"
+description = "Module trait, menu tree, command descriptors, module registry and codecs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+dc-case.workspace = true
+dc-command.workspace = true
+dc-jobs.workspace = true
+dc-scene.workspace = true
+egui.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true

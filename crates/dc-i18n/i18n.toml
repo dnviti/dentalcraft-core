@@ -1,0 +1,5 @@
+# i18n-embed configuration: checked at compile time by the `fl!` macro.
+fallback_language = "en"
+
+[fluent]
+assets_dir = "i18n"

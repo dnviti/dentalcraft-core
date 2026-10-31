@@ -1,0 +1,438 @@
+//! Contract between the DentalCraft shell and its dental modules.
+//!
+//! A module (e.g. `aligners`) implements [`Module`]: it declares its menu
+//! ([`MenuTree`]), its commands ([`CommandDesc`]), draws its inspector with
+//! egui, describes what the viewport shows ([`dc_scene::SceneItem`]) and
+//! provides a [`ModuleCodec`] for its data in `.dcprj` files. Modules are
+//! compiled in and collected in a [`ModuleRegistry`]; which ones are usable
+//! depends on the user's entitlements.
+
+mod menu;
+
+use std::sync::Arc;
+
+pub use menu::{MenuItem, MenuKind, MenuStatus, MenuTree};
+
+use dc_case::{CaseState, ModuleData};
+use dc_command::Command;
+use dc_jobs::JobSystem;
+use dc_scene::SceneItem;
+use serde_json::Value;
+
+/// Errors of the module layer.
+#[derive(Debug, thiserror::Error)]
+pub enum ModuleError {
+    /// A module with this id is already registered.
+    #[error("module {0} is already registered")]
+    Duplicate(String),
+    /// No module with this id.
+    #[error("unknown module {0}")]
+    UnknownModule(String),
+    /// The module has no command with this id.
+    #[error("unknown command {0}")]
+    UnknownCommand(String),
+    /// Module data could not be encoded or decoded.
+    #[error("codec error: {0}")]
+    Codec(String),
+    /// The stored data has a newer schema than the module understands.
+    #[error("schema version {found} is newer than the supported {supported}")]
+    SchemaTooNew {
+        /// Version in the data.
+        found: u32,
+        /// Newest version the module understands.
+        supported: u32,
+    },
+}
+
+/// Describes a command a module offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandDesc {
+    /// Stable id, e.g. `aligners.segment`.
+    pub id: &'static str,
+    /// i18n key of the label.
+    pub label_key: &'static str,
+    /// i18n key of the tooltip, if any.
+    pub tooltip_key: Option<&'static str>,
+    /// Keyboard shortcut, egui notation (e.g. `Ctrl+Shift+S`).
+    pub shortcut: Option<&'static str>,
+    /// Implemented or placeholder.
+    pub status: MenuStatus,
+}
+
+impl CommandDesc {
+    /// Ready command without tooltip or shortcut.
+    pub const fn new(id: &'static str, label_key: &'static str) -> Self {
+        Self {
+            id,
+            label_key,
+            tooltip_key: None,
+            shortcut: None,
+            status: MenuStatus::Ready,
+        }
+    }
+
+    /// Same command marked as a placeholder.
+    pub const fn stub(mut self) -> Self {
+        self.status = MenuStatus::Stub;
+        self
+    }
+}
+
+/// Severity of a [`Toast`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastLevel {
+    /// Information.
+    Info,
+    /// Operation completed.
+    Success,
+    /// Something to look at.
+    Warning,
+    /// Operation failed.
+    Error,
+}
+
+/// Short notification shown by the shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toast {
+    /// Severity.
+    pub level: ToastLevel,
+    /// i18n key of the message.
+    pub message_key: String,
+    /// Untranslated detail (e.g. an error message), if any.
+    pub detail: Option<String>,
+}
+
+impl Toast {
+    /// Toast of the given level.
+    pub fn new(level: ToastLevel, message_key: impl Into<String>) -> Self {
+        Self {
+            level,
+            message_key: message_key.into(),
+            detail: None,
+        }
+    }
+
+    /// Adds an untranslated detail.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+}
+
+/// i18n key of the toast shown for placeholder commands.
+pub const NOT_AVAILABLE_KEY: &str = "module-command-not-available";
+
+/// What a module can reach while handling UI or a command invocation.
+pub struct ModuleCtx<'a> {
+    state: &'a Arc<CaseState>,
+    jobs: &'a JobSystem,
+    commands: Vec<Box<dyn Command>>,
+    toasts: Vec<Toast>,
+}
+
+impl<'a> ModuleCtx<'a> {
+    /// Context over the current state and the shell's job system.
+    pub fn new(state: &'a Arc<CaseState>, jobs: &'a JobSystem) -> Self {
+        Self {
+            state,
+            jobs,
+            commands: Vec::new(),
+            toasts: Vec::new(),
+        }
+    }
+
+    /// The current case state (read only: changes go through commands).
+    pub fn state(&self) -> &Arc<CaseState> {
+        self.state
+    }
+
+    /// The job system, for background work that does not change the case
+    /// (previews, analyses); changes go through [`ModuleCtx::queue`].
+    pub fn jobs(&self) -> &JobSystem {
+        self.jobs
+    }
+
+    /// Queues a command; the shell runs it (in the background when long)
+    /// and pushes the result on the undo stack.
+    pub fn queue(&mut self, cmd: Box<dyn Command>) {
+        self.commands.push(cmd);
+    }
+
+    /// Shows a notification.
+    pub fn toast(&mut self, toast: Toast) {
+        self.toasts.push(toast);
+    }
+
+    /// Takes the queued commands and toasts (called by the shell).
+    pub fn finish(self) -> (Vec<Box<dyn Command>>, Vec<Toast>) {
+        (self.commands, self.toasts)
+    }
+}
+
+/// Encodes and decodes a module's data for `.dcprj` files.
+pub trait ModuleCodec: Send + Sync {
+    /// Newest schema version (written on save).
+    fn schema_version(&self) -> u32;
+
+    /// JSON of the data (defaults to [`ModuleData::to_json`]).
+    fn encode(&self, data: &dyn ModuleData) -> Result<Value, ModuleError> {
+        data.to_json()
+            .map_err(|e| ModuleError::Codec(e.to_string()))
+    }
+
+    /// Upgrades `value` from schema `from` by one or more versions up to
+    /// [`ModuleCodec::schema_version`]. The default accepts only the
+    /// current version.
+    fn migrate(&self, value: Value, from: u32) -> Result<Value, ModuleError> {
+        if from == self.schema_version() {
+            Ok(value)
+        } else {
+            Err(ModuleError::Codec(format!(
+                "no migration from schema {from}"
+            )))
+        }
+    }
+
+    /// Typed data from JSON of the current schema version.
+    fn decode(&self, value: Value) -> Result<Box<dyn ModuleData>, ModuleError>;
+
+    /// Migrates then decodes; data newer than the module is refused (the
+    /// shell keeps it as [`dc_case::OpaqueModuleData`]).
+    fn load(&self, value: Value, schema_version: u32) -> Result<Box<dyn ModuleData>, ModuleError> {
+        let supported = self.schema_version();
+        if schema_version > supported {
+            return Err(ModuleError::SchemaTooNew {
+                found: schema_version,
+                supported,
+            });
+        }
+        self.decode(self.migrate(value, schema_version)?)
+    }
+}
+
+/// A dental module.
+pub trait Module: Send {
+    /// Stable internal id (e.g. `aligners`), also the key of its data in
+    /// the case state and in `.dcprj` files.
+    fn id(&self) -> &'static str;
+
+    /// i18n key of the display name.
+    fn name_key(&self) -> &'static str;
+
+    /// Module version (semver).
+    fn version(&self) -> &'static str;
+
+    /// Menu shown in the workspace's left panel.
+    fn menu(&self) -> MenuTree;
+
+    /// Commands the module offers.
+    fn commands(&self) -> Vec<CommandDesc>;
+
+    /// Runs command `command_id` (menu click or shortcut). The default
+    /// shows the "not available yet" toast for placeholder commands.
+    fn invoke(&mut self, command_id: &str, ctx: &mut ModuleCtx<'_>) -> Result<(), ModuleError> {
+        match self.commands().iter().find(|c| c.id == command_id) {
+            Some(c) if c.status == MenuStatus::Stub => {
+                ctx.toast(Toast::new(ToastLevel::Info, NOT_AVAILABLE_KEY));
+                Ok(())
+            }
+            _ => Err(ModuleError::UnknownCommand(command_id.to_owned())),
+        }
+    }
+
+    /// Draws the inspector panel.
+    fn inspector(&mut self, ui: &mut egui::Ui, ctx: &mut ModuleCtx<'_>);
+
+    /// Items to draw for `state`.
+    fn scene(&self, state: &CaseState) -> Vec<SceneItem>;
+
+    /// Codec of the module data.
+    fn data_codec(&self) -> Box<dyn ModuleCodec>;
+}
+
+/// The compiled-in modules and which of them are enabled.
+#[derive(Default)]
+pub struct ModuleRegistry {
+    modules: Vec<(Box<dyn Module>, bool)>,
+}
+
+impl ModuleRegistry {
+    /// Empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a module (enabled). Ids must be unique.
+    pub fn register(&mut self, module: Box<dyn Module>) -> Result<(), ModuleError> {
+        let id = module.id();
+        if self.get(id).is_some() {
+            return Err(ModuleError::Duplicate(id.to_owned()));
+        }
+        self.modules.push((module, true));
+        Ok(())
+    }
+
+    /// All modules in registration order.
+    pub fn list(&self) -> impl Iterator<Item = &dyn Module> {
+        self.modules.iter().map(|(m, _)| m.as_ref())
+    }
+
+    /// Enabled modules in registration order.
+    pub fn enabled(&self) -> impl Iterator<Item = &dyn Module> {
+        self.modules
+            .iter()
+            .filter(|(_, e)| *e)
+            .map(|(m, _)| m.as_ref())
+    }
+
+    /// Ids of all modules.
+    pub fn ids(&self) -> Vec<&'static str> {
+        self.list().map(|m| m.id()).collect()
+    }
+
+    /// Module by id.
+    pub fn get(&self, id: &str) -> Option<&dyn Module> {
+        self.list().find(|m| m.id() == id)
+    }
+
+    /// Mutable module by id.
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut (dyn Module + 'static)> {
+        self.modules
+            .iter_mut()
+            .find(|(m, _)| m.id() == id)
+            .map(|(m, _)| m.as_mut())
+    }
+
+    /// Enables or disables a module (entitlements).
+    pub fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<(), ModuleError> {
+        let entry = self
+            .modules
+            .iter_mut()
+            .find(|(m, _)| m.id() == id)
+            .ok_or_else(|| ModuleError::UnknownModule(id.to_owned()))?;
+        entry.1 = enabled;
+        Ok(())
+    }
+
+    /// `true` when the module exists and is enabled.
+    pub fn is_enabled(&self, id: &str) -> bool {
+        self.modules.iter().any(|(m, e)| *e && m.id() == id)
+    }
+
+    /// Number of registered modules.
+    pub fn len(&self) -> usize {
+        self.modules.len()
+    }
+
+    /// `true` when no module is registered.
+    pub fn is_empty(&self) -> bool {
+        self.modules.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct DemoData {
+        n: u32,
+    }
+    dc_case::impl_module_data!(DemoData, 2);
+
+    struct DemoCodec;
+
+    impl ModuleCodec for DemoCodec {
+        fn schema_version(&self) -> u32 {
+            2
+        }
+        fn migrate(&self, mut value: Value, from: u32) -> Result<Value, ModuleError> {
+            if from == 1 {
+                value = serde_json::json!({ "n": value["count"] });
+            }
+            Ok(value)
+        }
+        fn decode(&self, value: Value) -> Result<Box<dyn ModuleData>, ModuleError> {
+            let d: DemoData =
+                serde_json::from_value(value).map_err(|e| ModuleError::Codec(e.to_string()))?;
+            Ok(Box::new(d))
+        }
+    }
+
+    struct Demo(&'static str);
+
+    impl Module for Demo {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+        fn name_key(&self) -> &'static str {
+            "demo-name"
+        }
+        fn version(&self) -> &'static str {
+            "0.1.0"
+        }
+        fn menu(&self) -> MenuTree {
+            MenuTree::new(vec![MenuItem::command("demo.run", "demo-run", "demo.run")])
+        }
+        fn commands(&self) -> Vec<CommandDesc> {
+            vec![CommandDesc::new("demo.run", "demo-run").stub()]
+        }
+        fn inspector(&mut self, _ui: &mut egui::Ui, _ctx: &mut ModuleCtx<'_>) {}
+        fn scene(&self, _state: &CaseState) -> Vec<SceneItem> {
+            Vec::new()
+        }
+        fn data_codec(&self) -> Box<dyn ModuleCodec> {
+            Box::new(DemoCodec)
+        }
+    }
+
+    #[test]
+    fn registry_register_get_enable() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(Box::new(Demo("aligners"))).unwrap();
+        reg.register(Box::new(Demo("implants"))).unwrap();
+        assert!(matches!(
+            reg.register(Box::new(Demo("aligners"))),
+            Err(ModuleError::Duplicate(_))
+        ));
+        assert_eq!(reg.ids(), vec!["aligners", "implants"]);
+        assert_eq!(reg.get("implants").unwrap().name_key(), "demo-name");
+        assert!(reg.get("nope").is_none());
+        reg.set_enabled("implants", false).unwrap();
+        assert!(!reg.is_enabled("implants"));
+        assert_eq!(reg.enabled().count(), 1);
+        assert!(reg.set_enabled("nope", true).is_err());
+        assert!(reg.get_mut("aligners").is_some());
+    }
+
+    #[test]
+    fn stub_command_shows_toast() {
+        let jobs = JobSystem::new(1).unwrap();
+        let state = Arc::new(CaseState::default());
+        let mut ctx = ModuleCtx::new(&state, &jobs);
+        let mut m = Demo("aligners");
+        m.invoke("demo.run", &mut ctx).unwrap();
+        assert!(m.invoke("demo.other", &mut ctx).is_err());
+        let (cmds, toasts) = ctx.finish();
+        assert!(cmds.is_empty());
+        assert_eq!(
+            toasts,
+            vec![Toast::new(ToastLevel::Info, NOT_AVAILABLE_KEY)]
+        );
+    }
+
+    #[test]
+    fn codec_migrates_and_refuses_newer() {
+        let c = Demo("x").data_codec();
+        let d = c.load(serde_json::json!({"count": 5}), 1).unwrap();
+        assert_eq!(
+            d.as_any().downcast_ref::<DemoData>(),
+            Some(&DemoData { n: 5 })
+        );
+        assert_eq!(c.encode(d.as_ref()).unwrap(), serde_json::json!({"n": 5}));
+        assert!(matches!(
+            c.load(serde_json::json!({}), 3),
+            Err(ModuleError::SchemaTooNew { .. })
+        ));
+    }
+}
