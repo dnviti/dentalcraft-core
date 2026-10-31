@@ -1,0 +1,21 @@
+[package]
+name = "dc-i18n"
+description = "Fluent localization (English, Italian) with runtime language switch shared by all crates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+i18n-embed.workspace = true
+i18n-embed-fl.workspace = true
+rust-embed.workspace = true
+fluent-syntax.workspace = true
+unic-langid.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
