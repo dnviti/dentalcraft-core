@@ -1,0 +1,28 @@
+[package]
+name = "dc-project"
+description = "The .dcprj project file format: manifest, layout and load/save contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+dc-case.workspace = true
+dc-mesh.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+glam.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
