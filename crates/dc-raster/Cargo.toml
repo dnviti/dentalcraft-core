@@ -10,10 +10,16 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+dc-case.workspace = true
 dc-mesh.workspace = true
+dc-scene.workspace = true
 glam.workspace = true
 png.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
 
 [lints]
 workspace = true
