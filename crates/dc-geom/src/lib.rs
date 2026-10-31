@@ -85,10 +85,6 @@ mod tests {
             holefill::fill_holes(&m, &holefill::HoleFillParams::default()),
             Err(GeomError::NotImplemented(_))
         ));
-        assert!(matches!(
-            sdf::SdfGrid::from_mesh(&m, &sdf::SdfParams::default()),
-            Err(GeomError::NotImplemented(_))
-        ));
         let a = sparse::CsrMatrix::identity(2);
         assert_eq!(
             sparse::pcg_solve(&a, &[1.0, 1.0], &sparse::PcgParams::default()).unwrap(),
