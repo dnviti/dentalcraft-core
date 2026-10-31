@@ -17,6 +17,20 @@ jobs:
     runs-on: golgari-dev
     steps:
       - uses: actions/checkout@v7
+      - name: Install C toolchain
+        run: |
+          if ! command -v cc >/dev/null; then
+            SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+            if command -v apt-get >/dev/null; then
+              $SUDO apt-get update -qq && $SUDO apt-get install -y --no-install-recommends build-essential pkg-config
+            elif command -v dnf >/dev/null; then
+              $SUDO dnf install -y gcc make pkgconf-pkg-config
+            elif command -v apk >/dev/null; then
+              $SUDO apk add --no-cache build-base pkgconf
+            else
+              echo "no supported package manager to install a C compiler" >&2; exit 1
+            fi
+          fi
 
       - name: Install Rust 1.99.1
         if: hashFiles('Cargo.toml') != ''
