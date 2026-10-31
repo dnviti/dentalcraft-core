@@ -20,6 +20,8 @@
 //!   opposite vertex never drops below valence 3 (2 on a boundary);
 //! * no fold-over: no surviving triangle turns its normal by more than about
 //!   87° or becomes degenerate.
+//! * with [`DecimateParams::max_valence`], no vertex ends with more
+//!   neighbours than that.
 //!
 //! Stop criteria (the first one met ends the run): the face target
 //! ([`DecimateParams::target_faces`] or [`DecimateParams::ratio`], Blender's
@@ -67,6 +69,9 @@ const DEGENERATE: f64 = 1e-6;
 const STAMP_MASK: u32 = 0x3fff_ffff;
 /// Rounds of re-seeding the queue with every live edge.
 const MAX_ROUNDS: usize = 8;
+/// Relative slack of the bounding-sphere test of the tolerance check (a
+/// face is skipped only when it is certainly farther than the bound).
+const PRUNE_SLACK: f64 = 1.0 + 1e-9;
 
 /// Decimation parameters.
 #[derive(Debug, Clone, PartialEq)]
@@ -88,6 +93,10 @@ pub struct DecimateParams {
     pub boundary_weight: f64,
     /// Never move or remove a vertex next to another label.
     pub preserve_labels: bool,
+    /// No collapse may leave a vertex with more neighbours than this (0: no
+    /// limit). Large flat regions otherwise end in fans of dozens of thin
+    /// triangles, whose tolerance check dominates the run.
+    pub max_valence: usize,
 }
 
 impl Default for DecimateParams {
@@ -100,6 +109,7 @@ impl Default for DecimateParams {
             preserve_boundary: true,
             boundary_weight: 100.0,
             preserve_labels: true,
+            max_valence: 0,
         }
     }
 }
@@ -360,6 +370,14 @@ struct Plan {
     free: bool,
 }
 
+/// A face around a planned collapse, as it would become.
+struct NewFace {
+    id: u32,
+    c: [DVec3; 3],
+    centre: DVec3,
+    radius: f64,
+}
+
 /// State of the tolerance check.
 struct Tolerance {
     tol2: f64,
@@ -396,6 +414,7 @@ struct Decimator<'a> {
     nk: Vec<u32>,
     ng: Vec<u32>,
     nw: Vec<u32>,
+    max_valence: usize,
 }
 
 /// Sorted distinct neighbours of `v` (excluding `v`) into `out`.
@@ -604,6 +623,7 @@ impl<'a> Decimator<'a> {
             nk: Vec::new(),
             ng: Vec::new(),
             nw: Vec::new(),
+            max_valence: params.max_valence,
         })
     }
 
@@ -810,6 +830,11 @@ impl<'a> Decimator<'a> {
             }
             matches && common == opp.len()
         };
+        // the merged vertex: both rings without the two ends, the opposite
+        // vertices once
+        if ok && self.max_valence > 0 && nk.len() + ng.len() - opp.len() - 2 > self.max_valence {
+            ok = false;
+        }
         if ok {
             for &w in opp.iter() {
                 neighbours(&self.vfaces, &self.tris, w, &mut nw);
@@ -873,24 +898,29 @@ impl<'a> Decimator<'a> {
         {
             return false;
         }
-        // new faces around the merged vertex
-        let mut new_faces: Vec<(u32, [DVec3; 3])> = Vec::new();
+        // new faces around the merged vertex, each with a bounding sphere
+        let mut new_faces: Vec<NewFace> = Vec::new();
         for &v in &[k, g] {
             for &f in &self.vfaces[v as usize] {
                 let t = self.tris[f as usize];
                 if t.contains(&k) && t.contains(&g) {
                     continue;
                 }
-                new_faces.push((
-                    f,
-                    t.map(|w| {
-                        if w == k || w == g {
-                            p.x
-                        } else {
-                            self.pos[w as usize]
-                        }
-                    }),
-                ));
+                let c = t.map(|w| {
+                    if w == k || w == g {
+                        p.x
+                    } else {
+                        self.pos[w as usize]
+                    }
+                });
+                let centre = (c[0] + c[1] + c[2]) / 3.0;
+                let radius = c.iter().map(|q| q.distance(centre)).fold(0.0, f64::max);
+                new_faces.push(NewFace {
+                    id: f,
+                    c,
+                    centre,
+                    radius,
+                });
             }
         }
         tol.scratch.clear();
@@ -899,13 +929,25 @@ impl<'a> Decimator<'a> {
                 if v == g && self.tris[f as usize].contains(&k) {
                     continue; // shared faces are listed once (from k)
                 }
+                // the face that held the points, when it survives, bounds their distance
+                let own = new_faces.iter().find(|nf| nf.id == f);
                 for &pt in &tol.face_pts[f as usize] {
                     let o = tol.orig[pt as usize];
+                    let mut bound = tol.tol2;
+                    if let Some(nf) = own {
+                        bound = bound.min(point_triangle_dist2(o, nf.c[0], nf.c[1], nf.c[2]));
+                    }
+                    // the closest new face (the first one at the smallest distance); a
+                    // face whose sphere lies beyond the bound cannot be it
                     let mut best = (f64::INFINITY, u32::MAX);
-                    for (nf, c) in &new_faces {
-                        let d = point_triangle_dist2(o, c[0], c[1], c[2]);
+                    for nf in &new_faces {
+                        let lb = (o.distance(nf.centre) - nf.radius).max(0.0);
+                        if lb * lb > bound.min(best.0) * PRUNE_SLACK {
+                            continue;
+                        }
+                        let d = point_triangle_dist2(o, nf.c[0], nf.c[1], nf.c[2]);
                         if d < best.0 {
-                            best = (d, *nf);
+                            best = (d, nf.id);
                         }
                     }
                     if best.0 > tol.tol2 {
