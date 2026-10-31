@@ -3,9 +3,11 @@
 use dc_mesh::Aabb;
 use glam::Vec3;
 
-/// Standard dental views. Directions follow the app viewport
-/// (`dc-viewport::StdView`): front = camera on −Y, up = +Z, upper arch
-/// towards +Z, patient's right on −X.
+/// Standard dental views in the case world frame ([`dc_case::WorldFrame`],
+/// the plugin's `worldframe.py`): incisors towards −Y, patient's right on
+/// −X, lower arch with the teeth up (+Z) below the upper arch, whose teeth
+/// point down. Directions match the app viewport (`dc-viewport::StdView`):
+/// front = camera on −Y, up = +Z (the upper arch at the top of the image).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum View {
     /// Occlusal view of the upper arch: camera below (−Z) looking up,
@@ -185,6 +187,51 @@ mod tests {
             min: Vec3::new(-30.0, -25.0, -5.0),
             max: Vec3::new(30.0, 25.0, 15.0),
         }
+    }
+
+    #[test]
+    fn views_follow_the_case_world_frame() {
+        use dc_case::WorldFrame;
+        let anterior = WorldFrame::ANTERIOR.as_vec3();
+        let to_lower = WorldFrame::TOWARDS_LOWER.as_vec3();
+        let lower_teeth = WorldFrame::OCCLUSAL_NORMAL.as_vec3();
+        let cam = |v: View| Camera::new(v, Vec3::ZERO, 10.0, 200, 200);
+        // a lower crown tip below an upper one, a right molar and the incisors
+        let (lower_tip, upper_tip) = (Vec3::new(0.0, -20.0, -1.0), Vec3::new(0.0, -21.0, 1.0));
+        let right_molar = Vec3::new(-20.0, 10.0, 0.0);
+        let f = cam(View::Frontal);
+        assert!(
+            (f.dir + anterior).length() < 1e-6,
+            "front looks from the incisors"
+        );
+        assert!(
+            f.project(upper_tip).y < f.project(lower_tip).y,
+            "upper arch on top"
+        );
+        assert!(
+            f.project(right_molar).x < 100.0,
+            "patient's right on the image left"
+        );
+        let lo = cam(View::OcclusalLower);
+        assert!((lo.dir - to_lower).length() < 1e-6);
+        assert!(lo.dir.dot(lower_teeth) < 0.0, "lower teeth face the camera");
+        let up = cam(View::OcclusalUpper);
+        assert!((up.dir + to_lower).length() < 1e-6);
+        assert!(
+            up.dir.dot(-lower_teeth) < 0.0,
+            "upper teeth face the camera"
+        );
+        for v in [View::OcclusalLower, View::OcclusalUpper] {
+            let c = cam(v);
+            assert!(
+                (c.up - anterior).length() < 1e-6,
+                "{v:?}: incisors at the top"
+            );
+        }
+        assert!(cam(View::Right).dir.x > 0.9 && cam(View::Left).dir.x < -0.9);
+        // the iso view looks from the front, the patient's right and above
+        let iso = cam(View::Iso);
+        assert!(iso.dir.y > 0.0 && iso.dir.x > 0.0 && iso.dir.z < 0.0);
     }
 
     #[test]
