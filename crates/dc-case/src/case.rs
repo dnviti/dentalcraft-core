@@ -1,6 +1,6 @@
 //! Case, scans, world frame and the immutable case state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use glam::DVec3;
@@ -62,6 +62,19 @@ impl WorldFrame {
     pub const TOWARDS_LOWER: DVec3 = DVec3::Z;
 }
 
+/// Which jaws a case treats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Jaws {
+    /// Upper jaw only.
+    Upper,
+    /// Lower jaw only.
+    Lower,
+    /// Both jaws.
+    #[default]
+    Both,
+}
+
 /// A patient case: scans and world frame. Patient identity is a
 /// pseudonymised code only (no names in v1).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -70,6 +83,15 @@ pub struct Case {
     pub id: Uuid,
     /// Pseudonymised patient code.
     pub patient_code: String,
+    /// Practice-side case identifier (free text; empty when not set).
+    #[serde(default)]
+    pub case_id: String,
+    /// Free-form notes about the case.
+    #[serde(default)]
+    pub notes: String,
+    /// Jaws being treated.
+    #[serde(default)]
+    pub jaws: Jaws,
     /// Imported scans.
     pub scans: Vec<Scan>,
     /// Dental world frame.
@@ -141,6 +163,17 @@ impl CaseState {
         self.modules.insert(id.into(), state);
     }
 
+    /// Blobs referenced by the case scans and by the module data.
+    ///
+    /// Anything in [`CaseState::blobs`] outside this set is garbage.
+    pub fn referenced_blobs(&self) -> HashSet<BlobRef> {
+        let mut refs: HashSet<BlobRef> = self.case.scans.iter().map(|s| s.mesh).collect();
+        for module in self.modules.values() {
+            refs.extend(module.data().referenced_blobs());
+        }
+        refs
+    }
+
     /// Approximate memory of everything but the blobs (counted separately,
     /// since they are shared between versions).
     pub fn approx_bytes_without_blobs(&self) -> usize {
@@ -189,5 +222,56 @@ mod tests {
         };
         assert!(state.mesh(&mesh).is_some());
         assert!(state.approx_bytes_without_blobs() > 0);
+    }
+
+    #[test]
+    fn old_case_json_gets_defaults() {
+        let old = serde_json::json!({
+            "id": Uuid::from_u128(1),
+            "patient_code": "P-1",
+            "scans": [],
+            "world_frame": {"from_case": {"t": [0.0, 0.0, 0.0], "q": [0.0, 0.0, 0.0, 1.0]}},
+        });
+        let case: Case = serde_json::from_value(old).unwrap();
+        assert_eq!(case.case_id, "");
+        assert_eq!(case.notes, "");
+        assert_eq!(case.jaws, Jaws::Both);
+        let json = serde_json::to_value(&case).unwrap();
+        assert_eq!(json["jaws"], "both");
+    }
+
+    #[test]
+    fn referenced_blobs_cover_scans_and_modules() {
+        let mut state = CaseState::default();
+        let a = state.blobs.insert(TriMesh::new(
+            vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            vec![[0, 1, 2]],
+        ));
+        let b = state.blobs.insert(TriMesh::new(
+            vec![Vec3::ZERO, Vec3::X, Vec3::Z],
+            vec![[0, 1, 2]],
+        ));
+        let c = state.blobs.insert(TriMesh::new(
+            vec![Vec3::ZERO, Vec3::Y, Vec3::Z],
+            vec![[0, 1, 2]],
+        ));
+        state.case.scans.push(Scan {
+            id: Uuid::from_u128(1),
+            role: ScanRole::Upper,
+            source_name: "u.stl".into(),
+            source_units: Units::Millimeters,
+            import_xform: Pose::IDENTITY,
+            mesh: a,
+        });
+        // an opaque module keeps its blob references alive
+        state.set_module(
+            "future",
+            ModuleState::new(crate::OpaqueModuleData {
+                schema_version: 9,
+                value: serde_json::json!({"deep": [{"mesh": b.to_hex()}, "not a hash"]}),
+            }),
+        );
+        let refs = state.referenced_blobs();
+        assert!(refs.contains(&a) && refs.contains(&b) && !refs.contains(&c));
     }
 }

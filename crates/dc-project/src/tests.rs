@@ -479,6 +479,115 @@ fn migrates_module_state_by_schema_version() {
 }
 
 #[test]
+fn migrates_module_state_across_several_versions() {
+    let d = dir();
+    let a = d.path().join("old.dcprj");
+    let mut manifest = base_manifest(1);
+    manifest["modules"] = json!([{"id": "demo", "version": "0.0.1", "schema_version": 0}]);
+    let state0 = json!({"count": 3, "label": "legacy"});
+    build_zip(
+        &a,
+        manifest,
+        &[
+            (CASE_PATH, case_json()),
+            (
+                &module_state_path("demo"),
+                serde_json::to_vec(&state0).unwrap(),
+            ),
+        ],
+    );
+    let codec = ModuleCodec::typed::<Demo>(2)
+        .with_migration(0, |v| {
+            let o = v.as_object_mut().ok_or("not an object")?;
+            let n = o.remove("count").ok_or("no count")?;
+            o.insert("stages".into(), n);
+            Ok(())
+        })
+        .with_migration(1, |v| {
+            let o = v.as_object_mut().ok_or("not an object")?;
+            let n = o.remove("label").ok_or("no label")?;
+            o.insert("name".into(), n);
+            Ok(())
+        });
+    let mut c = ModuleCodecs::new();
+    c.register("demo", codec.clone());
+    let out = load(&a, &c).unwrap();
+    assert!(out.issues.is_empty(), "{:?}", out.issues);
+    assert_eq!(
+        out.project.case_state.module_data::<Demo>("demo"),
+        Some(&Demo {
+            stages: 3,
+            name: "legacy".into()
+        })
+    );
+    // starting from the middle version only runs the later steps
+    let mid = codec.load(json!({"stages": 5, "label": "mid"}), 1).unwrap();
+    assert_eq!(
+        mid.as_any().downcast_ref::<Demo>(),
+        Some(&Demo {
+            stages: 5,
+            name: "mid".into()
+        })
+    );
+    // newer than the codec is refused
+    assert!(codec.load(json!({}), 3).is_err());
+}
+
+#[test]
+fn old_case_json_without_new_fields_loads() {
+    let d = dir();
+    let a = d.path().join("old.dcprj");
+    // case.json as written before `case_id`, `notes` and `jaws` existed
+    let case = json!({
+        "id": uuid::Uuid::from_u128(5),
+        "patient_code": "P-OLD",
+        "scans": [],
+        "world_frame": {"from_case": {"t": [0.0, 0.0, 0.0], "q": [0.0, 0.0, 0.0, 1.0]}},
+    });
+    build_zip(
+        &a,
+        base_manifest(1),
+        &[(CASE_PATH, serde_json::to_vec(&case).unwrap())],
+    );
+    let out = load(&a, &codecs()).unwrap();
+    assert!(out.issues.is_empty(), "{:?}", out.issues);
+    let c = &out.project.case_state.case;
+    assert_eq!(c.patient_code, "P-OLD");
+    assert_eq!(c.case_id, "");
+    assert_eq!(c.notes, "");
+    assert_eq!(c.jaws, dc_case::Jaws::Both);
+}
+
+#[test]
+fn save_prunes_unreferenced_blobs() {
+    let d = dir();
+    let a = d.path().join("gc.dcprj");
+    let mut p = sample_project();
+    let garbage = p.case_state.blobs.insert(mesh(9.5));
+    // referenced only from an opaque module's JSON
+    let kept = p.case_state.blobs.insert(mesh(7.5));
+    p.case_state.set_module(
+        "future",
+        ModuleState::new(OpaqueModuleData {
+            schema_version: 9,
+            value: json!({"mesh": kept.to_hex()}),
+        }),
+    );
+    assert_eq!(p.case_state.blobs.len(), 4);
+    save(&a, &p).unwrap();
+    let out = load(&a, &codecs()).unwrap();
+    let blobs = &out.project.case_state.blobs;
+    assert_eq!(blobs.len(), 3);
+    assert!(!blobs.contains(&garbage));
+    assert!(blobs.contains(&kept));
+    assert!(
+        out.issues.iter().all(|i| !i.blocks_writing()),
+        "{:?}",
+        out.issues
+    );
+}
+
+#[test]
 fn newer_format_version_is_read_only() {
     let d = dir();
     let a = d.path().join("new.dcprj");
@@ -602,6 +711,17 @@ proptest! {
         let (a, b) = (d.path().join("a.dcprj"), d.path().join("b.dcprj"));
         let mut state = CaseState::new(Case::new("P-prop"));
         let refs: Vec<_> = meshes.iter().cloned().map(|m| state.blobs.insert(m)).collect();
+        // blobs must be referenced to survive a save
+        for (i, r) in refs.iter().enumerate() {
+            state.case.scans.push(Scan {
+                id: uuid::Uuid::from_u128(i as u128 + 1),
+                role: ScanRole::Upper,
+                source_name: format!("s{i}.stl"),
+                source_units: Units::Millimeters,
+                import_xform: Default::default(),
+                mesh: *r,
+            });
+        }
         let mut p = Project::new(app(), "2026-10-31T10:00:00Z", state);
         p.manifest.project_id = uuid::Uuid::from_u128(7);
         save(&a, &p).unwrap();

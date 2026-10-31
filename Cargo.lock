@@ -340,6 +340,7 @@ dependencies = [
  "dc-case",
  "dc-command",
  "dc-jobs",
+ "dc-project",
  "dc-scene",
  "egui",
  "serde",
