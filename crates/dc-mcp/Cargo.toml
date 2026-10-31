@@ -15,5 +15,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+dc-mesh.workspace = true
+glam.workspace = true
+tempfile.workspace = true
+
 [lints]
 workspace = true
