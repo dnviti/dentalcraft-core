@@ -16,11 +16,11 @@ dc-jobs.workspace = true
 dc-project.workspace = true
 dc-scene.workspace = true
 egui.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 serde.workspace = true
-serde_json.workspace = true
 
 [lints]
 workspace = true

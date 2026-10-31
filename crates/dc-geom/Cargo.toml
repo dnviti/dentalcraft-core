@@ -12,6 +12,9 @@ publish.workspace = true
 [dependencies]
 dc-mesh.workspace = true
 glam.workspace = true
+kiddo.workspace = true
+nalgebra.workspace = true
+rayon.workspace = true
 thiserror.workspace = true
 
 [lints]

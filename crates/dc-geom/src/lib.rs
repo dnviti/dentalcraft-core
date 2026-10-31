@@ -5,11 +5,15 @@
 //! (WP36). In this version all kernels are contracts only: they return
 //! [`GeomError::NotImplemented`] until their work package lands
 //! (BVH WP13, ICP WP14, QEM WP15, hole filling WP16, sparse/harmonic WP17,
-//! SDF WP18).
+//! SDF WP18). [`metrics`] holds the comparison measures used by the golden
+//! tests (Hausdorff distance, label agreement).
 
 pub mod bvh;
+pub mod cotan;
 pub mod holefill;
 pub mod icp;
+pub mod knn;
+pub mod metrics;
 pub mod qem;
 pub mod sdf;
 pub mod sparse;

@@ -1,0 +1,19 @@
+[package]
+name = "dc-mcp"
+description = "Hand-rolled JSON-RPC MCP server over stdio, behind a Host trait (headless session or remote app)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+dc-session.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
