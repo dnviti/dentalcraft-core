@@ -600,4 +600,225 @@ fn arch_mesh_to_sdf_offset_and_mesh() {
         "{sizes:?}"
     );
     assert!((t3 - t0).as_secs_f64() < 10.0);
+    // no two triangles of the mesher output cross
+    assert_eq!(crossings(&out), 0);
+}
+
+// ----- regressions: walls on voxel centres, pockets, shells, sweeps ---------
+
+/// Pairs of triangles that share no vertex and cross (an edge of one meets
+/// the other).
+fn crossings(m: &TriMesh) -> usize {
+    let bvh = Bvh::build(m).unwrap();
+    let corner = |t: [u32; 3]| t.map(|i| m.positions[i as usize].as_dvec3());
+    let edge_hits = |p: glam::DVec3, q: glam::DVec3, t: &[glam::DVec3; 3]| {
+        let d = q - p;
+        let (e1, e2) = (t[1] - t[0], t[2] - t[0]);
+        let pv = d.cross(e2);
+        let det = e1.dot(pv);
+        if det.abs() <= 1e-18 {
+            return false;
+        }
+        let s = p - t[0];
+        let u = s.dot(pv) / det;
+        let qv = s.cross(e1);
+        let w = d.dot(qv) / det;
+        let h = e2.dot(qv) / det;
+        u >= 0.0 && w >= 0.0 && u + w <= 1.0 && (0.0..=1.0).contains(&h)
+    };
+    let mut n = 0;
+    for (i, &ta) in m.tris.iter().enumerate() {
+        let a = corner(ta);
+        let lo = a[0].min(a[1]).min(a[2]).as_vec3();
+        let hi = a[0].max(a[1]).max(a[2]).as_vec3();
+        for j in bvh.overlap_aabb(lo, hi) {
+            let tb = m.tris[j as usize];
+            if j as usize <= i || ta.iter().any(|v| tb.contains(v)) {
+                continue;
+            }
+            let b = corner(tb);
+            if (0..3)
+                .any(|k| edge_hits(a[k], a[(k + 1) % 3], &b) || edge_hits(b[k], b[(k + 1) % 3], &a))
+            {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+#[test]
+fn walls_through_voxel_centres_stay_inside() {
+    // two overlapping boxes; the inner wall of each lies on voxel centres
+    // (an exact multiple of the voxel), where the distance is exactly zero
+    let vs = 0.125;
+    let parts = concat(&[
+        cuboid(Vec3::ZERO, Vec3::new(2.0, 2.0, 2.0)),
+        cuboid(Vec3::new(1.0, 0.0, 0.0), Vec3::new(3.0, 2.0, 2.0)),
+    ]);
+    let g = SdfGrid::from_mesh(&parts, &params(vs, 4.0 * vs)).unwrap();
+    for (j, k) in [(4, 4), (8, 8), (12, 4)] {
+        for i in [8, 16] {
+            let v = g.voxel(IVec3::new(i, j, k));
+            assert!(v < 0.0, "voxel ({i}, {j}, {k}) on an inner wall reads {v}");
+        }
+    }
+    let m = g.to_mesh().unwrap();
+    assert_clean(&m, 1);
+    let lo = Vec3::ZERO;
+    let hi = Vec3::new(3.0, 2.0, 2.0);
+    for p in &m.positions {
+        assert!(box_sdf(*p, lo, hi).abs() < 0.01, "vertex {p} off the union");
+    }
+}
+
+/// A box with a pocket: a floor, four walls and a lid with a slit of width
+/// `slit` along y, built from overlapping closed boxes and a prism standing
+/// in a corner of the pocket (a soup like the parts of a model).
+fn pocket_soup(slit: f32) -> TriMesh {
+    let (w, h) = (4.0, 3.0);
+    let s = 0.5 * (w - slit);
+    let prism = TriMesh::new(
+        vec![
+            Vec3::new(0.3, 0.3, 0.3),
+            Vec3::new(1.4, 0.3, 0.3),
+            Vec3::new(0.3, 1.4, 0.3),
+            Vec3::new(0.3, 0.3, 2.7),
+            Vec3::new(1.4, 0.3, 2.7),
+            Vec3::new(0.3, 1.4, 2.7),
+        ],
+        vec![
+            [0, 2, 1],
+            [3, 4, 5],
+            [0, 1, 4],
+            [0, 4, 3],
+            [1, 2, 5],
+            [1, 5, 4],
+            [2, 0, 3],
+            [2, 3, 5],
+        ],
+    );
+    concat(&[
+        cuboid(Vec3::ZERO, Vec3::new(w, w, 0.6)),
+        cuboid(Vec3::ZERO, Vec3::new(0.6, w, h)),
+        cuboid(Vec3::new(w - 0.6, 0.0, 0.0), Vec3::new(w, w, h)),
+        cuboid(Vec3::ZERO, Vec3::new(w, 0.6, h)),
+        cuboid(Vec3::new(0.0, w - 0.6, 0.0), Vec3::new(w, w, h)),
+        cuboid(Vec3::new(0.0, 0.0, h - 0.6), Vec3::new(s, w, h)),
+        cuboid(Vec3::new(w - s, 0.0, h - 0.6), Vec3::new(w, w, h)),
+        prism,
+    ])
+}
+
+#[test]
+fn blockout_closing_fills_a_pocket_behind_a_narrow_mouth() {
+    let (vs, r) = (0.1, 0.3);
+    let centre = Vec3::new(2.0, 2.0, 1.5);
+    let mouth = Vec3::new(2.0, 2.0, 2.7);
+    // the union of the parts: an open pocket
+    let soup = pocket_soup(0.4);
+    let union = SdfGrid::from_mesh(&soup, &params(vs, 0.6)).unwrap();
+    assert!(!union.contains(centre) && !union.contains(mouth));
+    // the add-on's closing: the slit (narrower than 2r) sealed, the pocket
+    // behind it filled, one surface around the outside only
+    let g = SdfGrid::from_mesh_closed(&soup, &params(vs, 0.6), r).unwrap();
+    assert!(g.contains(centre), "pocket left open: {}", g.sample(centre));
+    assert!(g.contains(mouth), "slit left open: {}", g.sample(mouth));
+    let m = g.to_mesh().unwrap();
+    assert_clean(&m, 1);
+    // every vertex on the outer box (the ball dips 0.08 mm into the slit)
+    for p in &m.positions {
+        assert!(
+            box_sdf(*p, Vec3::ZERO, Vec3::new(4.0, 4.0, 3.0)).abs() < 0.1,
+            "vertex {p} inside the solid"
+        );
+    }
+    // outside the closed surface the values are the exact distance to it
+    for q in [Vec3::new(-0.4, 2.0, 1.5), Vec3::new(2.0, 2.0, 3.45)] {
+        let d = box_sdf(q, Vec3::ZERO, Vec3::new(4.0, 4.0, 3.0));
+        assert!(
+            (g.sample(q) - d).abs() < 0.5 * vs,
+            "{q}: {} vs {d}",
+            g.sample(q)
+        );
+    }
+    // the exact morphological closing keeps the pocket (a ball of radius r fits)
+    let mut exact = union.clone();
+    exact.close(r).unwrap();
+    assert!(!exact.contains(centre));
+    // a slit wider than 2r stays open
+    let open = SdfGrid::from_mesh_closed(&pocket_soup(0.9), &params(vs, 0.6), r).unwrap();
+    assert!(!open.contains(centre) && !open.contains(mouth));
+    assert_clean(&open.to_mesh().unwrap(), 1);
+}
+
+#[test]
+fn shell_and_shift_read_the_level_sets() {
+    let (vs, r) = (0.1, 2.0);
+    let g = SdfGrid::from_mesh(&sphere(Vec3::ZERO, r), &params(vs, 1.2)).unwrap();
+    let s = g.shell(0.2, 0.8).unwrap();
+    let m = s.to_mesh().unwrap();
+    assert_clean(&m, 2);
+    for p in &m.positions {
+        let d = p.length() - r;
+        assert!(
+            (d - 0.2).abs() < 0.03 || (d - 0.8).abs() < 0.03,
+            "shell vertex {d} mm from the sphere"
+        );
+    }
+    assert!(s.contains(Vec3::new(r + 0.5, 0.0, 0.0)));
+    assert!(!s.contains(Vec3::ZERO) && !s.contains(Vec3::new(r + 1.0, 0.0, 0.0)));
+    assert!(g.shell(0.2, 1.2).is_err() && g.shell(0.5, 0.2).is_err());
+    let mut moved = g.clone();
+    moved.shift(0.3).unwrap();
+    for p in &moved.to_mesh().unwrap().positions {
+        assert!((p.length() - r - 0.3).abs() < 0.03);
+    }
+}
+
+#[test]
+fn sweep_down_fills_what_the_solid_hides_from_above() {
+    // a mushroom: a cap on a stem on a base
+    let vs = 0.1;
+    let parts = concat(&[
+        cuboid(Vec3::new(-3.0, -3.0, 0.0), Vec3::new(3.0, 3.0, 0.6)),
+        cuboid(Vec3::new(-0.5, -0.5, 0.3), Vec3::new(0.5, 0.5, 2.6)),
+        cuboid(Vec3::new(-1.5, -1.5, 2.4), Vec3::new(1.5, 1.5, 3.0)),
+    ]);
+    let mut g = SdfGrid::from_mesh(&parts, &params(vs, 0.6)).unwrap();
+    let under = Vec3::new(1.0, 0.3, 1.5);
+    assert!(!g.contains(under));
+    g.sweep_down(0.0).unwrap();
+    assert!(g.contains(under));
+    assert!(!g.contains(Vec3::new(2.0, 0.3, 1.5)));
+    assert!(!g.contains(Vec3::new(0.3, 0.3, 3.2)));
+    assert!(!g.contains(Vec3::new(1.0, 0.3, -0.2)));
+    let m = g.to_mesh().unwrap();
+    assert_clean(&m, 1);
+    // the swept solid is the cap's footprint over the base: every vertex on it
+    for p in &m.positions {
+        let d = box_sdf(*p, Vec3::new(-3.0, -3.0, 0.0), Vec3::new(3.0, 3.0, 0.6)).min(box_sdf(
+            *p,
+            Vec3::new(-1.5, -1.5, 0.0),
+            Vec3::new(1.5, 1.5, 3.0),
+        ));
+        assert!(d.abs() < 0.03, "vertex {p} {d} mm off the sweep");
+    }
+}
+
+#[test]
+fn meshes_do_not_cross_themselves() {
+    // overlapping parts, offsets and a closing: no two triangles cross
+    let parts = concat(&[
+        sphere(Vec3::ZERO, 2.0),
+        sphere(Vec3::new(2.2, 0.0, 0.3), 1.7),
+        ellipsoid(Vec3::new(1.1, 0.0, -1.0), Vec3::new(3.0, 1.0, 1.0), 96, 48),
+        pocket_soup(0.4),
+    ]);
+    let mut g = SdfGrid::from_mesh(&parts, &params(0.1, 0.6)).unwrap();
+    assert_eq!(crossings(&g.to_mesh().unwrap()), 0);
+    g.offset(0.25).unwrap();
+    assert_eq!(crossings(&g.to_mesh().unwrap()), 0);
+    let c = SdfGrid::from_mesh_closed(&parts, &params(0.1, 0.6), 0.3).unwrap();
+    assert_eq!(crossings(&c.to_mesh().unwrap()), 0);
 }

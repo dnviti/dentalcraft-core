@@ -14,9 +14,16 @@
 //! * [`SdfGrid::from_mesh`] (`meshToLevelSet`): exact distances through the
 //!   BVH, sign by a flood fill from outside (holes in scans narrower than
 //!   about a voxel stay closed; overlapping closed meshes give their union);
+//! * [`SdfGrid::from_mesh_closed`] is the blockout closing of the add-on
+//!   (`_sdf_group`: the level set at `+r` meshed and sampled again, then read
+//!   at `−r`): enclosed cavities of the dilated solid are filled and gaps
+//!   narrower than about a voxel bridged, like [`SdfGrid::from_mesh`];
 //! * [`SdfGrid::offset`] moves the level set and rebuilds the band with exact
 //!   distances to the new surface, so [`SdfGrid::close`] (dilate then erode)
-//!   is the exact morphological closing that the blockout needs;
+//!   is the exact morphological closing (cavities kept, as OpenVDB's
+//!   level-set offsets); [`SdfGrid::shift`] moves it without re-distancing;
+//! * [`SdfGrid::shell`] keeps the solid between two level sets and
+//!   [`SdfGrid::sweep_down`] sweeps the solid along `−Z`;
 //! * [`SdfGrid::csg`] combines two grids with sharp or smooth min / max;
 //! * [`SdfGrid::to_mesh`] (`volumeToMesh`) gives a closed, manifold,
 //!   outward-oriented triangle mesh, deterministic for any thread count.
@@ -126,6 +133,23 @@ impl SdfGrid {
         build::from_mesh(mesh, params.voxel_size, params.band)
     }
 
+    /// The solid of `mesh` (as [`SdfGrid::from_mesh`]) closed by `radius`
+    /// (mm) as the add-on's blockout does it with OpenVDB: the level set at
+    /// `+radius` is meshed and sampled again from that surface, so the
+    /// cavities the dilation encloses are filled and its gaps narrower than
+    /// about a voxel bridged, then the surface is moved back by `radius`
+    /// without re-distancing. Crevices narrower than `2 * radius` are filled.
+    /// The values are the distance to the dilated surface minus `radius`:
+    /// exact outside the closed surface (its outward offsets beyond
+    /// `radius` are exact level sets), within `params.band` of it. The
+    /// band is not marked exact: [`SdfGrid::offset`] re-distances first.
+    ///
+    /// # Errors
+    /// As [`SdfGrid::from_mesh`], and for a negative or non-finite radius.
+    pub fn from_mesh_closed(mesh: &TriMesh, params: &SdfParams, radius: f32) -> Result<Self> {
+        build::closed(mesh, params.voxel_size, params.band, radius)
+    }
+
     /// Empty grid (no solid) with the given parameters.
     ///
     /// # Errors
@@ -207,6 +231,48 @@ impl SdfGrid {
     /// [`crate::GeomError::InvalidInput`] for a distance that is not finite.
     pub fn offset(&mut self, distance: f32) -> Result<()> {
         ops::offset(self, distance)
+    }
+
+    /// Moves the surface by `distance` (mm, positive = outwards) without
+    /// re-distancing: every value minus `distance`, clamped to the band. Only
+    /// the levels farther than `|distance|` from the band edge stay exact.
+    ///
+    /// # Errors
+    /// [`crate::GeomError::InvalidInput`] for a distance that is not finite.
+    pub fn shift(&mut self, distance: f32) -> Result<()> {
+        if !distance.is_finite() {
+            return Err(crate::GeomError::InvalidInput(format!(
+                "shift must be finite, got {distance}"
+            )));
+        }
+        let band = self.band;
+        ops::shift_to(self, distance, band);
+        Ok(())
+    }
+
+    /// The solid between the level sets `inner` and `outer` (mm,
+    /// `inner < outer`), `max(v − outer, inner − v)` voxel by voxel: the
+    /// material between two offsets of the surface (a shell of thickness
+    /// `outer − inner`). Both levels must lie a voxel and a half inside the
+    /// band.
+    ///
+    /// # Errors
+    /// [`crate::GeomError::InvalidInput`] for levels that are not ordered or
+    /// not inside the band.
+    pub fn shell(&self, inner: f32, outer: f32) -> Result<SdfGrid> {
+        ops::shell(self, inner, outer)
+    }
+
+    /// Sweeps the solid downwards: the union with its translates along `−Z`,
+    /// cut by the plane `z = floor` (world). Every voxel takes the smallest
+    /// value at or above it in its column (exact outside, a lower bound of the
+    /// depth inside), then at least `floor − z`. What the solid hides from
+    /// `+Z` (its undercuts) is filled.
+    ///
+    /// # Errors
+    /// [`crate::GeomError::InvalidInput`] for a floor that is not finite.
+    pub fn sweep_down(&mut self, floor: f32) -> Result<()> {
+        ops::sweep_down(self, floor)
     }
 
     /// Morphological closing (dilate then erode) by `radius` (mm): crevices

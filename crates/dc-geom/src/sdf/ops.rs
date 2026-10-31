@@ -41,7 +41,7 @@ pub(crate) fn redistance(grid: &mut SdfGrid, band: f32) -> Result<()> {
             scan_block(&bvh, key, dc, origin, vs, band, |i, _, d, _| {
                 any |= d < band;
                 let inside = src.map_or(bg, |v| v[i]) < 0.0;
-                vals[i] = if inside { -d } else { d };
+                vals[i] = store::signed(d, inside);
             });
             any.then_some((key, vals))
         })
@@ -88,6 +88,169 @@ pub(crate) fn offset(grid: &mut SdfGrid, distance: f32) -> Result<()> {
     }
     grid.store.data.par_iter_mut().for_each(|v| *v -= distance);
     redistance(grid, grid.band)
+}
+
+/// Rebuilds the store from per-block results: blocks that hold a value
+/// inside `band` are kept, uniform ones become interior tiles or are
+/// dropped (outside). `blocks` must be in storage order.
+fn store_from(blocks: Vec<(IVec3, Combined)>, mut tiles: Vec<IVec3>) -> Store {
+    let mut kept = Vec::new();
+    let mut data = Vec::new();
+    for (key, res) in blocks {
+        match res {
+            Combined::Block(v) => {
+                kept.push(key);
+                data.extend_from_slice(&v[..]);
+            }
+            Combined::Inside => tiles.push(key),
+            Combined::Outside => {}
+        }
+    }
+    Store::new(kept, data, tiles)
+}
+
+/// Classifies one block of values clamped to `band`.
+fn classify(out: Box<[f32; VOXELS]>, band: f32) -> Combined {
+    if out.iter().any(|v| v.abs() < band) {
+        Combined::Block(out)
+    } else if out[0] < 0.0 {
+        Combined::Inside
+    } else {
+        Combined::Outside
+    }
+}
+
+/// Moves the surface by `distance` (positive outwards) without
+/// re-distancing: every value minus `distance`, clamped to the new half
+/// width `band` (at most the old one).
+pub(crate) fn shift_to(grid: &mut SdfGrid, distance: f32, band: f32) {
+    let band = band.min(grid.band);
+    let store = &grid.store;
+    let blocks: Vec<(IVec3, Combined)> = store
+        .keys
+        .par_iter()
+        .enumerate()
+        .map(|(bi, &key)| {
+            let src = store.block(bi);
+            let mut out = Box::new([0f32; VOXELS]);
+            for (o, &v) in out.iter_mut().zip(src) {
+                *o = (v - distance).clamp(-band, band);
+            }
+            (key, classify(out, band))
+        })
+        .collect();
+    grid.store = store_from(blocks, store.sorted_tiles());
+    grid.band = band;
+    grid.exact = false;
+}
+
+/// The solid between the level sets `inner` and `outer` (`inner < outer`):
+/// `max(v − outer, inner − v)`.
+pub(crate) fn shell(grid: &SdfGrid, inner: f32, outer: f32) -> Result<SdfGrid> {
+    let band = grid.band;
+    let reach = outer.max(-inner) + super::MIN_BAND_VOXELS * grid.voxel_size;
+    if !(inner.is_finite() && outer.is_finite() && inner < outer) || reach > band {
+        return Err(GeomError::InvalidInput(format!(
+            "shell levels {inner}..{outer} must be ordered and inside the band {band}"
+        )));
+    }
+    let store = &grid.store;
+    // outside the stored blocks the result is outside (band > outer, band > -inner)
+    let blocks: Vec<(IVec3, Combined)> = store
+        .keys
+        .par_iter()
+        .enumerate()
+        .map(|(bi, &key)| {
+            let src = store.block(bi);
+            let mut out = Box::new([0f32; VOXELS]);
+            for (o, &v) in out.iter_mut().zip(src) {
+                *o = (v - outer).max(inner - v).clamp(-band, band);
+            }
+            (key, classify(out, band))
+        })
+        .collect();
+    let mut g = SdfGrid::from_store(
+        grid.voxel_size,
+        grid.origin,
+        band,
+        store_from(blocks, Vec::new()),
+    );
+    g.exact = false;
+    Ok(g)
+}
+
+/// The union of the solid with its translates along `−Z` (the sweep of the
+/// solid downwards), cut by the plane `z = floor` (world): every voxel takes
+/// the smallest value at or above it in its column, then at least
+/// `floor − z`.
+pub(crate) fn sweep_down(grid: &mut SdfGrid, floor: f32) -> Result<()> {
+    if !floor.is_finite() {
+        return Err(GeomError::InvalidInput(format!(
+            "sweep floor must be finite, got {floor}"
+        )));
+    }
+    let (band, vs, origin) = (grid.band, grid.voxel_size, grid.origin);
+    let store = &grid.store;
+    let mut items: Vec<IVec3> = store
+        .keys
+        .iter()
+        .copied()
+        .chain(store.sorted_tiles())
+        .collect();
+    if items.is_empty() {
+        return Ok(());
+    }
+    // columns of blocks, top down
+    items.sort_unstable_by_key(|k| (k.x, k.y, std::cmp::Reverse(k.z)));
+    let mut columns: Vec<&[IVec3]> = Vec::new();
+    let mut s = 0;
+    while s < items.len() {
+        let mut e = s + 1;
+        while e < items.len() && items[e].x == items[s].x && items[e].y == items[s].y {
+            e += 1;
+        }
+        columns.push(&items[s..e]);
+        s = e;
+    }
+    // voxels farther than the band below the floor are outside: the lowest block
+    let low = (((floor - band - origin.z) / vs).floor() as i32).max(-store::MAX_BLOCK * SIDE) >> 3;
+    let blocks: Vec<(IVec3, Combined)> = columns
+        .par_iter()
+        .flat_map_iter(|col| {
+            let (x, y) = (col[0].x, col[0].y);
+            let mut run = [f32::INFINITY; 64];
+            let mut out_blocks = Vec::new();
+            let lowest = col[col.len() - 1].z;
+            let mut z = col[0].z;
+            while z >= low {
+                let key = IVec3::new(x, y, z);
+                // nothing inside above and no stored block below: the rest is outside
+                if z < lowest && run.iter().all(|&r| r >= band) {
+                    break;
+                }
+                let src = store.find(key).map(|i| store.block(i));
+                let bg = store.background(key, band);
+                let mut out = Box::new([0f32; VOXELS]);
+                for lz in (0..SIDE as usize).rev() {
+                    let zw = origin.z + ((z * SIDE) as f32 + lz as f32) * vs;
+                    let cut = floor - zw;
+                    for (xy, r) in run.iter_mut().enumerate() {
+                        let i = lz * 64 + xy;
+                        *r = r.min(src.map_or(bg, |b| b[i]));
+                        out[i] = r.max(cut).clamp(-band, band);
+                    }
+                }
+                out_blocks.push((key, classify(out, band)));
+                z -= 1;
+            }
+            out_blocks
+        })
+        .collect();
+    let mut blocks = blocks;
+    blocks.sort_unstable_by_key(|(k, _)| store::pack(*k));
+    grid.store = store_from(blocks, Vec::new());
+    grid.exact = false;
+    Ok(())
 }
 
 #[inline]
@@ -173,24 +336,12 @@ pub(crate) fn csg(grid: &mut SdfGrid, other: &SdfGrid, op: CsgOp) -> Result<()> 
     let mut tiles: Vec<IVec3> = a.sorted_tiles();
     tiles.extend(b.sorted_tiles());
     store::sort_keys(&mut tiles);
-    let mut tiles: Vec<IVec3> = tiles
+    let tiles: Vec<IVec3> = tiles
         .into_iter()
         .filter(|&t| a.find(t).is_none() && b.find(t).is_none())
         .filter(|&t| op.apply(a.background(t, ba), b.background(t, bb)) < 0.0)
         .collect();
-    let mut kept = Vec::new();
-    let mut data = Vec::new();
-    for (key, res) in blocks {
-        match res {
-            Combined::Block(v) => {
-                kept.push(key);
-                data.extend_from_slice(&v[..]);
-            }
-            Combined::Inside => tiles.push(key),
-            Combined::Outside => {}
-        }
-    }
-    grid.store = Store::new(kept, data, tiles);
+    grid.store = store_from(blocks, tiles);
     grid.band = band;
     grid.exact = false;
     Ok(())
