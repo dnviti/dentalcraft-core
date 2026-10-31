@@ -1,0 +1,21 @@
+name: release-please
+
+# Versioning with release-please: Conventional Commits on main (feat:, fix:,
+# feat!: ...) open or update a release PR that bumps the CHANGELOG (and the
+# version file). Merging it tags vX.Y.Z and publishes the GitHub release.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: golgari-dev
+    steps:
+      - uses: googleapis/release-please-action@v5
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
