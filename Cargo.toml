@@ -13,16 +13,16 @@ publish = false
 
 [workspace.dependencies]
 # internal crates
-dc-mesh = { path = "crates/dc-mesh", version = "0.1.0" }
-dc-geom = { path = "crates/dc-geom", version = "0.1.0" }
-dc-case = { path = "crates/dc-case", version = "0.1.0" }
-dc-command = { path = "crates/dc-command", version = "0.1.0" }
-dc-jobs = { path = "crates/dc-jobs", version = "0.1.0" }
-dc-scene = { path = "crates/dc-scene", version = "0.1.0" }
-dc-project = { path = "crates/dc-project", version = "0.1.0" }
-dc-module-api = { path = "crates/dc-module-api", version = "0.1.0" }
-dc-i18n = { path = "crates/dc-i18n", version = "0.1.0" }
-dc-theme = { path = "crates/dc-theme", version = "0.1.0" }
+dc-mesh = { path = "crates/dc-mesh" }
+dc-geom = { path = "crates/dc-geom" }
+dc-case = { path = "crates/dc-case" }
+dc-command = { path = "crates/dc-command" }
+dc-jobs = { path = "crates/dc-jobs" }
+dc-scene = { path = "crates/dc-scene" }
+dc-project = { path = "crates/dc-project" }
+dc-module-api = { path = "crates/dc-module-api" }
+dc-i18n = { path = "crates/dc-i18n" }
+dc-theme = { path = "crates/dc-theme" }
 
 # GUI: egui, eframe and egui-wgpu must always share the same version
 egui = { version = "=0.37.0", default-features = false, features = ["default_fonts"] }

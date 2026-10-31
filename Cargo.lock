@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "dc-case"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "dc-mesh",
@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "dc-command"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dc-case",
  "dc-jobs",
@@ -296,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "dc-geom"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dc-mesh",
  "glam",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "dc-i18n"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fluent-syntax",
  "i18n-embed",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "dc-jobs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rayon",
  "thiserror 2.0.21",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "dc-mesh"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam",
  "serde",
@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "dc-module-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dc-case",
  "dc-command",
@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "dc-project"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "dc-case",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "dc-scene"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dc-case",
  "glam",
@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "dc-theme"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "egui",
  "serde",
