@@ -95,8 +95,14 @@ fn write_tmp(tmp: &Path, project: &Project) -> Result<(), DcprjError> {
     }
 
     // Pass 1: size every blob (the manifest comes before them in the archive).
+    // Blobs that no scan and no module references are garbage: not written.
+    let referenced = state.referenced_blobs();
     let mut blobs: Vec<(BlobRef, u64)> = Vec::new();
-    let mut refs: Vec<_> = state.blobs.iter().collect();
+    let mut refs: Vec<_> = state
+        .blobs
+        .iter()
+        .filter(|(r, _)| referenced.contains(*r))
+        .collect();
     refs.sort_by_key(|(r, _)| **r);
     for (r, mesh) in refs {
         let enc = dcm::encode(mesh);

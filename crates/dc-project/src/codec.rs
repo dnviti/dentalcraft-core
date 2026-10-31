@@ -57,8 +57,21 @@ impl ModuleCodec {
         self.current
     }
 
-    /// Migrates `value` from schema `from` to the current one and decodes it.
-    /// The error is the schema version at which it failed and the reason.
+    /// Migrates `value` from schema version `from` (stepping one version at a
+    /// time up to [`ModuleCodec::current_version`]) and decodes it. Data
+    /// newer than the codec is refused.
+    pub fn load(&self, value: Value, from: u32) -> Result<Box<dyn ModuleData>, String> {
+        if from > self.current {
+            return Err(format!(
+                "schema version {from} is newer than the supported {}",
+                self.current
+            ));
+        }
+        self.decode_from(value, from).map_err(|(_, reason)| reason)
+    }
+
+    /// Like [`ModuleCodec::load`]; the error is the schema version at which
+    /// it failed and the reason.
     pub(crate) fn decode_from(
         &self,
         mut value: Value,

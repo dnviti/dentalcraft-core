@@ -25,6 +25,10 @@
 //! * [`save`] is atomic: it writes `<path>.tmp`, fsyncs it, hard-links the
 //!   previous file to `<path>.bak` (one backup is kept), renames the
 //!   temporary file over `<path>` and fsyncs the directory.
+//! * Garbage collection: [`save`] only writes the blobs referenced by a case
+//!   scan or by a module ([`dc_case::ModuleData::referenced_blobs`]); the
+//!   others are dropped. State of modules kept opaque is scanned for blob
+//!   hashes, so their meshes survive.
 //! * [`load`] only fails hard when the container, the manifest or `case.json`
 //!   are unusable. Any other problem (corrupt or missing blob, hash mismatch,
 //!   newer module schema, ...) is reported in [`LoadOutcome::issues`] and
@@ -229,8 +233,8 @@ impl Manifest {
 pub struct Project {
     /// The manifest.
     pub manifest: Manifest,
-    /// Case, meshes and module states. Only the blobs in the store are
-    /// written: drop unreferenced ones first ([`dc_case::BlobStore::retain_only`]).
+    /// Case, meshes and module states. Only the blobs referenced by a scan
+    /// or a module ([`CaseState::referenced_blobs`]) are written.
     pub case_state: CaseState,
     /// Step history (JSON); `[]` when empty. The undo stack is not saved.
     pub history: Value,

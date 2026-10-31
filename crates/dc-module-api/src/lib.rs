@@ -3,7 +3,8 @@
 //! A module (e.g. `aligners`) implements [`Module`]: it declares its menu
 //! ([`MenuTree`]), its commands ([`CommandDesc`]), draws its inspector with
 //! egui, describes what the viewport shows ([`dc_scene::SceneItem`]) and
-//! provides a [`ModuleCodec`] for its data in `.dcprj` files. Modules are
+//! provides a [`ModuleCodec`] (the one of `dc-project`) for its data in
+//! `.dcprj` files. Modules are
 //! compiled in and collected in a [`ModuleRegistry`]; which ones are usable
 //! depends on the user's entitlements.
 
@@ -11,13 +12,13 @@ mod menu;
 
 use std::sync::Arc;
 
+pub use dc_project::{ModuleCodec, ModuleCodecs};
 pub use menu::{MenuItem, MenuKind, MenuStatus, MenuTree};
 
-use dc_case::{CaseState, ModuleData};
+use dc_case::CaseState;
 use dc_command::Command;
 use dc_jobs::JobSystem;
 use dc_scene::SceneItem;
-use serde_json::Value;
 
 /// Errors of the module layer.
 #[derive(Debug, thiserror::Error)]
@@ -31,17 +32,6 @@ pub enum ModuleError {
     /// The module has no command with this id.
     #[error("unknown command {0}")]
     UnknownCommand(String),
-    /// Module data could not be encoded or decoded.
-    #[error("codec error: {0}")]
-    Codec(String),
-    /// The stored data has a newer schema than the module understands.
-    #[error("schema version {found} is newer than the supported {supported}")]
-    SchemaTooNew {
-        /// Version in the data.
-        found: u32,
-        /// Newest version the module understands.
-        supported: u32,
-    },
 }
 
 /// Describes a command a module offers.
@@ -169,47 +159,6 @@ impl<'a> ModuleCtx<'a> {
     }
 }
 
-/// Encodes and decodes a module's data for `.dcprj` files.
-pub trait ModuleCodec: Send + Sync {
-    /// Newest schema version (written on save).
-    fn schema_version(&self) -> u32;
-
-    /// JSON of the data (defaults to [`ModuleData::to_json`]).
-    fn encode(&self, data: &dyn ModuleData) -> Result<Value, ModuleError> {
-        data.to_json()
-            .map_err(|e| ModuleError::Codec(e.to_string()))
-    }
-
-    /// Upgrades `value` from schema `from` by one or more versions up to
-    /// [`ModuleCodec::schema_version`]. The default accepts only the
-    /// current version.
-    fn migrate(&self, value: Value, from: u32) -> Result<Value, ModuleError> {
-        if from == self.schema_version() {
-            Ok(value)
-        } else {
-            Err(ModuleError::Codec(format!(
-                "no migration from schema {from}"
-            )))
-        }
-    }
-
-    /// Typed data from JSON of the current schema version.
-    fn decode(&self, value: Value) -> Result<Box<dyn ModuleData>, ModuleError>;
-
-    /// Migrates then decodes; data newer than the module is refused (the
-    /// shell keeps it as [`dc_case::OpaqueModuleData`]).
-    fn load(&self, value: Value, schema_version: u32) -> Result<Box<dyn ModuleData>, ModuleError> {
-        let supported = self.schema_version();
-        if schema_version > supported {
-            return Err(ModuleError::SchemaTooNew {
-                found: schema_version,
-                supported,
-            });
-        }
-        self.decode(self.migrate(value, schema_version)?)
-    }
-}
-
 /// A dental module.
 pub trait Module: Send {
     /// Stable internal id (e.g. `aligners`), also the key of its data in
@@ -240,14 +189,21 @@ pub trait Module: Send {
         }
     }
 
+    /// The user selected menu row `id` (a group or a command item). The
+    /// shell calls this on every click, before [`Module::invoke`] for
+    /// commands. The default ignores it.
+    fn select(&mut self, _id: &str) {}
+
     /// Draws the inspector panel.
     fn inspector(&mut self, ui: &mut egui::Ui, ctx: &mut ModuleCtx<'_>);
 
     /// Items to draw for `state`.
     fn scene(&self, state: &CaseState) -> Vec<SceneItem>;
 
-    /// Codec of the module data.
-    fn data_codec(&self) -> Box<dyn ModuleCodec>;
+    /// Codec of the module data: its current schema version, the migrations
+    /// from older versions (one step each, chained) and the decoder. Register
+    /// it under [`Module::id`] in a [`ModuleCodecs`] to load projects.
+    fn data_codec(&self) -> ModuleCodec;
 }
 
 /// The compiled-in modules and which of them are enabled.
@@ -340,25 +296,6 @@ mod tests {
     }
     dc_case::impl_module_data!(DemoData, 2);
 
-    struct DemoCodec;
-
-    impl ModuleCodec for DemoCodec {
-        fn schema_version(&self) -> u32 {
-            2
-        }
-        fn migrate(&self, mut value: Value, from: u32) -> Result<Value, ModuleError> {
-            if from == 1 {
-                value = serde_json::json!({ "n": value["count"] });
-            }
-            Ok(value)
-        }
-        fn decode(&self, value: Value) -> Result<Box<dyn ModuleData>, ModuleError> {
-            let d: DemoData =
-                serde_json::from_value(value).map_err(|e| ModuleError::Codec(e.to_string()))?;
-            Ok(Box::new(d))
-        }
-    }
-
     struct Demo(&'static str);
 
     impl Module for Demo {
@@ -381,8 +318,11 @@ mod tests {
         fn scene(&self, _state: &CaseState) -> Vec<SceneItem> {
             Vec::new()
         }
-        fn data_codec(&self) -> Box<dyn ModuleCodec> {
-            Box::new(DemoCodec)
+        fn data_codec(&self) -> ModuleCodec {
+            ModuleCodec::typed::<DemoData>(2).with_migration(1, |v| {
+                *v = serde_json::json!({ "n": v["count"] });
+                Ok(())
+            })
         }
     }
 
@@ -424,15 +364,20 @@ mod tests {
     #[test]
     fn codec_migrates_and_refuses_newer() {
         let c = Demo("x").data_codec();
+        assert_eq!(c.current_version(), 2);
         let d = c.load(serde_json::json!({"count": 5}), 1).unwrap();
         assert_eq!(
             d.as_any().downcast_ref::<DemoData>(),
             Some(&DemoData { n: 5 })
         );
-        assert_eq!(c.encode(d.as_ref()).unwrap(), serde_json::json!({"n": 5}));
-        assert!(matches!(
-            c.load(serde_json::json!({}), 3),
-            Err(ModuleError::SchemaTooNew { .. })
-        ));
+        assert!(c.load(serde_json::json!({}), 3).is_err());
+        // no step registered from version 0
+        assert!(c.load(serde_json::json!({}), 0).is_err());
+    }
+
+    #[test]
+    fn select_defaults_to_a_no_op() {
+        let mut m = Demo("x");
+        m.select("anything");
     }
 }

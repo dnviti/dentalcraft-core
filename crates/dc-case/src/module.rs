@@ -3,6 +3,8 @@
 use std::any::Any;
 use std::fmt;
 
+use crate::BlobRef;
+
 /// Data owned by one module inside a [`crate::CaseState`].
 ///
 /// Implementors are usually plain serde structs; the trait gives the core
@@ -28,6 +30,13 @@ pub trait ModuleData: Any + Send + Sync + fmt::Debug {
     /// data holds large buffers.
     fn approx_bytes(&self) -> usize {
         std::mem::size_of_val(self)
+    }
+
+    /// Blobs the data refers to. Saving a project drops the blobs that
+    /// neither the case scans nor any module data reference, so modules
+    /// that store meshes in the blob store must report them here.
+    fn referenced_blobs(&self) -> Vec<BlobRef> {
+        Vec::new()
     }
 }
 
@@ -98,6 +107,26 @@ impl ModuleData for OpaqueModuleData {
 
     fn approx_bytes(&self) -> usize {
         self.value.to_string().len()
+    }
+
+    /// Every string that is a blob hash: the structure is unknown, so be
+    /// conservative and keep everything that could be a reference.
+    fn referenced_blobs(&self) -> Vec<BlobRef> {
+        fn walk(v: &serde_json::Value, out: &mut Vec<BlobRef>) {
+            match v {
+                serde_json::Value::String(s) if s.len() == 64 => {
+                    if let Ok(r) = BlobRef::from_hex(s) {
+                        out.push(r);
+                    }
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                serde_json::Value::Object(o) => o.values().for_each(|x| walk(x, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.value, &mut out);
+        out
     }
 }
 
