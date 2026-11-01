@@ -19,6 +19,23 @@ pub enum MenuKind {
     Submenu(Vec<MenuItem>),
 }
 
+/// What a menu leaf needs from the user before it can run. The shell asks for
+/// it (a folder or file dialog) and runs the command with the answer as the
+/// string parameter `param`; invoking such a leaf runs nothing by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafInput {
+    /// A folder.
+    Folder {
+        /// Parameter of the command that receives the path.
+        param: &'static str,
+    },
+    /// A scan file (STL, OBJ, PLY).
+    ScanFile {
+        /// Parameter of the command that receives the path.
+        param: &'static str,
+    },
+}
+
 /// One menu entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuItem {
@@ -32,6 +49,11 @@ pub struct MenuItem {
     pub kind: MenuKind,
     /// Implemented or placeholder.
     pub status: MenuStatus,
+    /// What the shell asks the user before running a leaf, if anything.
+    pub input: Option<LeafInput>,
+    /// The leaf is a step of the workflow, counted in the progress. `false`
+    /// for what is not one: a shortcut over the steps, an optional tool.
+    pub counts_as_step: bool,
 }
 
 impl MenuItem {
@@ -43,6 +65,8 @@ impl MenuItem {
             icon: None,
             kind: MenuKind::Command(command),
             status: MenuStatus::Ready,
+            input: None,
+            counts_as_step: true,
         }
     }
 
@@ -54,6 +78,8 @@ impl MenuItem {
             icon: None,
             kind: MenuKind::Submenu(children),
             status: MenuStatus::Ready,
+            input: None,
+            counts_as_step: true,
         }
     }
 
@@ -66,6 +92,18 @@ impl MenuItem {
     /// Same entry marked as a placeholder.
     pub fn stub(mut self) -> Self {
         self.status = MenuStatus::Stub;
+        self
+    }
+
+    /// Same entry asking the user for `input` before running.
+    pub fn with_input(mut self, input: LeafInput) -> Self {
+        self.input = Some(input);
+        self
+    }
+
+    /// Same entry left out of the workflow progress.
+    pub fn not_a_step(mut self) -> Self {
+        self.counts_as_step = false;
         self
     }
 
@@ -82,6 +120,20 @@ impl MenuItem {
         match self.kind {
             MenuKind::Command(c) => Some(c),
             MenuKind::Submenu(_) => None,
+        }
+    }
+
+    /// Command ids of the workflow steps at or under this entry.
+    pub fn step_ids(&self) -> Vec<&'static str> {
+        match self.kind {
+            MenuKind::Command(c) => {
+                if self.counts_as_step {
+                    vec![c]
+                } else {
+                    Vec::new()
+                }
+            }
+            MenuKind::Submenu(_) => self.children().iter().flat_map(Self::step_ids).collect(),
         }
     }
 }
@@ -131,6 +183,11 @@ impl MenuTree {
     /// Command ids of all command entries, in traversal order.
     pub fn command_ids(&self) -> Vec<&'static str> {
         self.iter().filter_map(|(_, i)| i.command_id()).collect()
+    }
+
+    /// Command ids of the workflow steps, in traversal order.
+    pub fn step_ids(&self) -> Vec<&'static str> {
+        self.roots.iter().flat_map(MenuItem::step_ids).collect()
     }
 
     /// Ids appearing more than once (should be empty).
@@ -223,6 +280,38 @@ mod tests {
         );
         assert!(t.duplicate_ids().is_empty());
         assert!(t.find("case").unwrap().command_id().is_none());
+    }
+
+    #[test]
+    fn a_leaf_starts_without_input_and_as_a_step() {
+        let item = MenuItem::command("a", "menu-a", "a");
+        assert_eq!(item.input, None);
+        assert!(item.counts_as_step);
+        let input = LeafInput::Folder { param: "dir" };
+        assert_eq!(item.with_input(input).input, Some(input));
+    }
+
+    #[test]
+    fn step_ids_leave_out_what_is_not_a_step() {
+        let t = MenuTree::new(vec![
+            MenuItem::submenu(
+                "g",
+                "menu-g",
+                vec![
+                    MenuItem::command("auto", "menu-auto", "auto").not_a_step(),
+                    MenuItem::command("one", "menu-one", "one"),
+                    MenuItem::submenu(
+                        "tools",
+                        "menu-tools",
+                        vec![MenuItem::command("two", "menu-two", "two").not_a_step()],
+                    ),
+                ],
+            ),
+            MenuItem::command("three", "menu-three", "three"),
+        ]);
+        assert_eq!(t.step_ids(), vec!["one", "three"]);
+        assert_eq!(t.roots[0].step_ids(), vec!["one"]);
+        assert_eq!(t.command_ids().len(), 4);
     }
 
     #[test]
