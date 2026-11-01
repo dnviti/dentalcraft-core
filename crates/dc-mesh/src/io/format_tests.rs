@@ -406,3 +406,72 @@ fn teeth3ds_obj_loads_when_available() {
         u
     );
 }
+
+const TWO_OBJECTS: &str = "\
+o upper
+v 0 0 0
+v 1 0 0
+v 0 1 0
+f 1 2 3
+o lower
+v 0 0 1
+f 1 2 3 4
+f 1 3 4
+";
+
+#[test]
+fn read_scan_counts_obj_objects_with_faces() {
+    let opts = ReadOptions::default();
+    let two = TWO_OBJECTS;
+    let scan = read_scan_bytes(two.as_bytes(), MeshFormat::Obj, &opts).unwrap();
+    assert_eq!(scan.format, MeshFormat::Obj);
+    assert_eq!(scan.obj_object_count, Some(2));
+    assert_eq!(scan.mesh.face_count(), 4);
+    assert_eq!(
+        scan.mesh,
+        read_bytes(two.as_bytes(), MeshFormat::Obj, &opts).unwrap()
+    );
+}
+
+#[test]
+fn read_scan_ignores_objects_without_faces() {
+    let obj = "o empty\no a\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\no trailing\nv 5 5 5\n";
+    let scan = read_scan_bytes(obj.as_bytes(), MeshFormat::Obj, &ReadOptions::default()).unwrap();
+    assert_eq!(scan.obj_object_count, Some(1));
+}
+
+#[test]
+fn read_scan_plain_obj_is_one_implicit_object() {
+    let opts = ReadOptions::default();
+    let plain = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+    let scan = read_scan_bytes(plain.as_bytes(), MeshFormat::Obj, &opts).unwrap();
+    assert_eq!(scan.obj_object_count, Some(1));
+    // faces before the first `o` plus a named object with faces make two
+    let mixed = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\no b\nf 3 2 1\n";
+    let scan = read_scan_bytes(mixed.as_bytes(), MeshFormat::Obj, &opts).unwrap();
+    assert_eq!(scan.obj_object_count, Some(2));
+    // no faces at all
+    let scan = read_scan_bytes(b"v 0 0 0\n", MeshFormat::Obj, &opts).unwrap();
+    assert_eq!(scan.obj_object_count, Some(0));
+}
+
+#[test]
+fn read_scan_from_file_reports_format_and_no_count_for_stl() {
+    let mesh = tetra();
+    let opts = ReadOptions::default();
+    for (fmt, file) in [(MeshFormat::Stl, "scan.stl"), (MeshFormat::Ply, "scan.ply")] {
+        let path = tmp(file);
+        write(&path, &mesh, fmt).unwrap();
+        let scan = read_scan(&path, &opts).unwrap();
+        assert_eq!(scan.format, fmt);
+        assert_eq!(scan.obj_object_count, None);
+        assert_eq!(scan.mesh, read(&path).unwrap());
+        rm(&path);
+    }
+    let path = tmp("scan.obj");
+    write(&path, &mesh, MeshFormat::Obj).unwrap();
+    let scan = read_scan(&path, &opts).unwrap();
+    assert_eq!(scan.obj_object_count, Some(1));
+    rm(&path);
+    assert!(read_scan("nope.xyz", &opts).is_err());
+}
