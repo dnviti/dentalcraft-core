@@ -115,11 +115,13 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "import_scan",
             "Import scans",
-            "Imports STL, OBJ or PLY scans into the case (converted to millimetres) as one undoable step. \
-Give exactly one of `path` (one file) or `paths` (several files). Without a role the import decides: \
-the file name, then a free arch, marked provisional when it is a guess. A scan replaces the one with \
-the same role; a case holds at most 2 bite scans. Runs the module's `*.import-scans` command when one \
-is registered (it can also recognise the arch from the geometry), otherwise `case.import`. The result \
+            "Imports STL, OBJ or PLY scans into the case as one undoable step. Arches are converted to \
+millimetres; a bite scan stays as it is in the file, with a `units_suspect` warning when its size fits \
+another unit. Give exactly one of `path` (one file) or `paths` (several files). Without a role the import \
+decides: the file name, then a free arch, marked provisional when it is a guess. A scan with a role or a \
+name hint replaces the one with the same role; a scan with neither never replaces a confirmed one and \
+fails with `needs_role` when it finds no place; a case holds at most 2 bite scans. Runs the module's \
+`*.import-scans` command when one is registered (it can also recognise the arch from the geometry), otherwise `case.import`. The result \
 lists the imported scans with their `role_source`, the `warnings` (code and message) and the `failed` files; \
 it is an error when nothing was imported.",
             obj(
@@ -134,7 +136,7 @@ it is an error when nothing was imported.",
                     "role": {
                         "type": "string",
                         "enum": ["auto", "upper", "lower", "bite"],
-                        "description": "Arch or bite for the file or files (for `paths`, the ones that are not told apart by name); `auto` or missing lets the import decide."
+                        "description": "Arch or bite for the file; with `paths`, for every file, whatever its name. So `upper` or `lower` on two or more files fails with `role_clash` for all of them, and only the first 2 stay with `bite`. `auto` or missing lets the import decide, file by file."
                     }
                 }),
                 &[],

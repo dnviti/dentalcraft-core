@@ -5,7 +5,7 @@ use std::any::Any;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use dc_case::{CaseState, ModuleData, ModuleState, Pose, ScanRole};
+use dc_case::{Case, CaseState, ModuleData, ModuleState, OpaqueModuleData, Pose, ScanRole};
 use dc_command::{CommandError, JobCtx, StepDef, StepGraph};
 use dc_i18n::Lang;
 use dc_mesh::TriMesh;
@@ -811,6 +811,126 @@ fn import_params_need_exactly_one_of_path_and_files() {
     assert!(err.to_string().contains("Indica esattamente uno"), "{err}");
     assert!(s.state().case.scans.is_empty());
     assert_eq!(s.undo_stack().undo_depth(), 0);
+}
+
+/// An upper or lower role on several files is a clash whatever the names say,
+/// and nothing is imported; bite keeps the first two.
+#[test]
+fn a_batch_role_applies_to_every_file() {
+    let _guard = lang(Lang::En);
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session();
+    let files = json!([
+        {"path": tetra(dir.path(), "a.stl")},
+        {"path": tetra(dir.path(), "lower.stl")},
+    ]);
+    let err = import(&mut s, json!({"files": files, "role": "upper"})).unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("a.stl:") && text.contains("lower.stl:"),
+        "{text}"
+    );
+    assert!(text.contains("more than one file"), "{text}");
+    assert!(scans(&s).is_empty());
+
+    let out = import(&mut s, json!({"files": files, "role": "bite"})).unwrap();
+    assert_eq!(out["imported"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        scans(&s),
+        [
+            row("bite", "explicit", "a.stl"),
+            row("bite", "explicit", "lower.stl"),
+        ]
+    );
+}
+
+/// A bite scan keeps its size: the tetrahedron measures 10, which looks like
+/// centimetres, and an arch of the same size grows.
+#[test]
+fn a_bite_keeps_its_size_with_a_units_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session();
+    let out = import(
+        &mut s,
+        json!({"path": tetra(dir.path(), "a.stl"), "role": "bite"}),
+    )
+    .unwrap();
+    assert_eq!(out["source_units"], "mm");
+    assert_eq!(out["warnings"][0]["code"], "units_suspect");
+    assert_eq!(out["warnings"][0]["args"]["units"], "cm");
+    let out = import(
+        &mut s,
+        json!({"path": tetra(dir.path(), "b.stl"), "role": "upper"}),
+    )
+    .unwrap();
+    assert_eq!(out["source_units"], "cm");
+    assert_eq!(out["warnings"][0]["code"], "rescaled");
+}
+
+/// The state of a module this build cannot read, on a case with both arches.
+fn locked_state(dir: &Path) -> (CaseState, CommandSpec, CommandSpec) {
+    let specs = dc_session::builtins::specs();
+    let find = |id: &str| *specs.iter().find(|s| s.id == id).unwrap();
+    let (import, set_role) = (find("case.import"), find("case.set-role"));
+    let params = json!({"files": [
+        {"path": tetra(dir, "upper.stl")},
+        {"path": tetra(dir, "lower.stl")},
+    ]});
+    let state = CaseState::new(Case::new("T"));
+    let (mut state, _) = import
+        .execute(&state, &params, &JobCtx::detached())
+        .unwrap();
+    state.set_module(
+        "future",
+        ModuleState::new(OpaqueModuleData {
+            schema_version: 9,
+            value: json!({"results": true}),
+        }),
+    );
+    (state, import, set_role)
+}
+
+#[test]
+fn an_opaque_module_stops_set_role_on_the_arches() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, set_role) = locked_state(dir.path());
+    let ctx = JobCtx::detached();
+    for params in [
+        json!({"from": "upper", "to": "lower"}),
+        json!({"from": "upper", "to": "bite"}),
+    ] {
+        let err = set_role.execute(&state, &params, &ctx).unwrap_err();
+        assert!(
+            matches!(&err, CommandError::Invalid(m) if m.contains("future")),
+            "{err}"
+        );
+    }
+    // a role confirmed where it is moves nothing
+    let params = json!({"from": "upper", "to": "upper"});
+    let (next, out) = set_role.execute(&state, &params, &ctx).unwrap();
+    assert_eq!(out["role_source"], "explicit");
+    assert_eq!(next.case.scans.len(), 2);
+}
+
+#[test]
+fn an_opaque_module_fails_an_import_that_replaces_an_arch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, import, _) = locked_state(dir.path());
+    let ctx = JobCtx::detached();
+    let params = json!({"files": [
+        {"path": tetra(dir.path(), "upper2.stl")},
+        {"path": tetra(dir.path(), "lower2.stl")},
+    ]});
+    let err = import.execute(&state, &params, &ctx).unwrap_err();
+    let CommandError::Failed(text) = err else {
+        panic!("{err}")
+    };
+    // the reason is about the project: once, not once per file
+    assert_eq!(text.matches("future").count(), 1, "{text}");
+    // a bite goes in
+    let params = json!({"path": tetra(dir.path(), "morso.stl")});
+    let (next, _) = import.execute(&state, &params, &ctx).unwrap();
+    assert_eq!(next.case.scans.len(), 3);
 }
 
 // -------------------------------------------------------------- set-role

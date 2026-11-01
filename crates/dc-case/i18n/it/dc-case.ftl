@@ -11,6 +11,7 @@ case-import-role = { $role ->
 }
 
 case-import-warn-rescaled = { $name }: riscalato × { $factor } in millimetri (il file era in { $units }).
+case-import-warn-units-suspect = { $name }: le dimensioni fanno pensare a { $units }, ma le scansioni del morso e di controllo non vengono mai riscalate: è stato letto in millimetri. Verifica il file.
 case-import-warn-tiny = { $name }: il modello misura solo { $size } mm. Verifica che il file sia in millimetri.
 case-import-warn-low-polygons = { $name }: solo { $faces } facce, troppo poche per una scansione clinica. Verifica che sia il file giusto.
 case-import-warn-obj-objects-merged = { $name }: i { $objects } oggetti del file OBJ sono stati uniti in un'unica scansione.
@@ -29,3 +30,4 @@ case-import-error-invalid = { $name }: il file è danneggiato o non è una scans
 case-import-error-empty = { $name }: il file non contiene facce utilizzabili.
 case-import-error-needs-role = { $name }: entrambe le arcate sono già occupate. Indica quale ruolo ha questa scansione.
 case-import-error-role-clash = { $name }: più di un file di questa importazione è indicato come { case-import-role }. Indica quale file va assegnato.
+case-import-error-arches-locked = Questo progetto contiene dati del modulo { $module } che questa versione non sa leggere, quindi le arcate non si possono sostituire né spostare: aggiorna DentalCraft. Una scansione può comunque andare su un'arcata libera e le scansioni del morso possono cambiare.

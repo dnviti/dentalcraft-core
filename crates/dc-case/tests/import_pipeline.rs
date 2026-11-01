@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 
 use dc_case::import::{
     Allocation, Decision, Detection, FileClaim, ImportError, ImportFile, ImportReport,
-    ImportRequest, ImportWarning, Resolver, WarningCode, allocate, import_files, prepare,
+    ImportRequest, ImportWarning, Placement, PrepareOptions, Resolver, WarningCode, allocate,
+    allocate_with, commit, import_files, prepare, prepare_with, roles_changed,
 };
 use dc_case::{
-    BlobRef, Case, CaseState, ModuleData, ModuleState, Pose, RoleSource, Scan, ScanRole,
-    WorldFrame, role_from_name,
+    BlobRef, Case, CaseState, ModuleData, ModuleState, OpaqueModuleData, Pose, RoleSource, Scan,
+    ScanRole, WorldFrame, role_from_name,
 };
 use dc_i18n::Lang;
 use dc_jobs::JobCtx;
@@ -244,7 +245,7 @@ fn rule_3_without_a_free_arch_the_provisional_scan_is_replaced() {
 }
 
 #[test]
-fn rule_4_detected_files_take_their_arch_then_the_other_then_replace() {
+fn rule_4_detected_files_take_their_arch_then_the_other_then_fail() {
     // free
     let a = allocate(&[], &[detected("a.stl", Upper, 0.8)]);
     check(&a, &[put(Upper, Detected)], &[]);
@@ -258,7 +259,55 @@ fn rule_4_detected_files_take_their_arch_then_the_other_then_replace() {
         old(2, Lower, Explicit, "l.stl"),
     ];
     let a = allocate(&case, &[detected("a.stl", Lower, 0.8)]);
-    check(&a, &[over(Lower, Detected, &[2])], &[WarningCode::Replaced]);
+    check(&a, &[needs_role("a.stl")], &[]);
+}
+
+#[test]
+fn rule_4_a_detection_never_clears_a_confirmed_arch() {
+    for (upper, lower) in [
+        (FileName, Explicit),
+        (Explicit, Detected),
+        (Detected, FileName),
+    ] {
+        let case = [old(1, Upper, upper, "u.stl"), old(2, Lower, lower, "l.stl")];
+        for arch in [Upper, Lower] {
+            let a = allocate(&case, &[detected("a.stl", arch, 0.99)]);
+            check(&a, &[needs_role("a.stl")], &[]);
+            assert!(a.moves.is_empty());
+        }
+    }
+    // a file without a detection does no more than that
+    let case = [
+        old(1, Upper, FileName, "u.stl"),
+        old(2, Lower, FileName, "l.stl"),
+    ];
+    check(
+        &allocate(&case, &[file("a.stl")]),
+        &[needs_role("a.stl")],
+        &[],
+    );
+}
+
+#[test]
+fn rule_4_only_a_provisional_scan_gives_way() {
+    // the other arch is taken: it cannot step aside, so it is replaced
+    let case = [
+        old(1, Lower, Provisional, "a.stl"),
+        old(2, Upper, FileName, "u.stl"),
+    ];
+    let a = allocate(&case, &[detected("b.stl", Lower, 0.9)]);
+    check(&a, &[over(Lower, Detected, &[1])], &[WarningCode::Replaced]);
+    assert!(a.moves.is_empty());
+    // the guess on the other arch is not touched by a file that wants this one
+    let a = allocate(&case, &[detected("b.stl", Upper, 0.9)]);
+    check(&a, &[needs_role("b.stl")], &[]);
+    // both arches are guesses
+    let case = [
+        old(1, Lower, Provisional, "a.stl"),
+        old(2, Upper, Provisional, "b.stl"),
+    ];
+    let a = allocate(&case, &[detected("c.stl", Upper, 0.9)]);
+    check(&a, &[over(Upper, Detected, &[2])], &[WarningCode::Replaced]);
 }
 
 #[test]
@@ -312,6 +361,74 @@ fn rule_4_runs_after_the_named_files() {
         &a,
         &[put(Lower, Provisional), put(Upper, FileName)],
         &[WarningCode::ArchConflict],
+    );
+}
+
+/// The scan steps aside for the first file, then a second one wants the arch
+/// it went to: it is replaced, by the file that took its place, and never moved.
+#[test]
+fn a_scan_moved_and_then_replaced_is_only_replaced() {
+    let case = [old(1, Lower, Provisional, "p.stl")];
+    for files in [
+        [file("lower.stl"), detected("seen.stl", Upper, 0.9)],
+        [detected("seen.stl", Upper, 0.9), file("lower.stl")],
+    ] {
+        let a = allocate(&case, &files);
+        assert!(a.moves.is_empty());
+        assert_eq!(codes(&a.warnings), [WarningCode::Replaced]);
+        let i = files.iter().position(|f| f.name == "lower.stl").unwrap();
+        assert_eq!(a.decisions[i], over(Lower, FileName, &[1]));
+        assert_eq!(a.decisions[1 - i], put(Upper, Detected));
+        let w = &a.warnings[0];
+        assert_eq!(w.args["name"], "lower.stl");
+        assert_eq!(w.args["old"], "p.stl");
+        assert_eq!(w.args["role"], "lower");
+    }
+    // two detections, the surer one first
+    let a = allocate(
+        &case,
+        &[detected("a.stl", Lower, 0.9), detected("b.stl", Upper, 0.8)],
+    );
+    check(
+        &a,
+        &[over(Lower, Detected, &[1]), put(Upper, Detected)],
+        &[WarningCode::Replaced],
+    );
+    assert!(a.moves.is_empty());
+}
+
+#[test]
+fn locked_arches_refuse_to_replace_or_move() {
+    let locked = |case: &[Scan], files: &[FileClaim]| allocate_with(case, files, Some("future"));
+    let fail = || {
+        Decision::Fail(ImportError::ArchesLocked {
+            module: "future".into(),
+        })
+    };
+    // a claim on an occupied arch, provisional or not
+    let case = [old(1, Upper, FileName, "u.stl")];
+    check(&locked(&case, &[file("upper.stl")]), &[fail()], &[]);
+    let case = [old(1, Lower, Provisional, "p.stl")];
+    let a = locked(&case, &[explicit("a.stl", Lower)]);
+    check(&a, &[fail()], &[]);
+    assert!(a.moves.is_empty());
+    // a detection leaves the provisional scan and takes the free arch
+    let a = locked(&case, &[detected("b.stl", Lower, 0.9)]);
+    check(&a, &[put(Upper, Provisional)], &[WarningCode::ArchConflict]);
+    // free arches and bites work as usual, in the same batch as a refused file
+    let case = [
+        old(1, Upper, FileName, "u.stl"),
+        old(2, Bite, Explicit, "a.stl"),
+        old(3, Bite, Explicit, "b.stl"),
+    ];
+    let a = locked(
+        &case,
+        &[file("upper.stl"), file("lower.stl"), file("bite.stl")],
+    );
+    check(
+        &a,
+        &[fail(), put(Lower, FileName), over(Bite, FileName, &[3])],
+        &[WarningCode::BiteLimit],
     );
 }
 
@@ -574,6 +691,78 @@ fn the_tiny_warning_looks_at_the_rescaled_mesh() {
     assert_eq!(codes(&scan.warnings), [WarningCode::Tiny]);
     let scan = prepare(&d.stl("b.stl", &arch(20.5)), &ctx).unwrap();
     assert!(scan.warnings.is_empty());
+}
+
+/// Largest extent of the mesh of a scan of the case, in mm.
+fn extent(state: &CaseState, name: &str) -> f32 {
+    let scan = state.case.scans.iter().find(|s| s.source_name == name);
+    let mesh = state.blobs.get(&scan.unwrap().mesh).unwrap();
+    mesh.aabb().unwrap().size().max_element()
+}
+
+#[test]
+fn keeping_the_units_leaves_the_coordinates_and_warns() {
+    let d = Dir::new();
+    let ctx = JobCtx::detached();
+    let keep = PrepareOptions::KEEP_UNITS;
+    let path = d.stl("visit.stl", &arch(15.0));
+    // the default is what `prepare` does: 15 looks like centimetres
+    let scan = prepare(&path, &ctx).unwrap();
+    assert_eq!(scan.source_units, Units::Centimeters);
+    assert_eq!(codes(&scan.warnings), [WarningCode::Rescaled]);
+    assert!(PrepareOptions::default().normalize_units);
+
+    let scan = prepare_with(&path, &keep, &ctx).unwrap();
+    assert_eq!(scan.source_units, Units::Millimeters);
+    assert_eq!(scan.mesh.aabb().unwrap().size().max_element(), 15.0);
+    assert_eq!(codes(&scan.warnings), [WarningCode::UnitsSuspect]);
+    assert_eq!(scan.warnings[0].args["units"], "cm");
+
+    // metres and micrometres are suspect as well; a size in millimetres is not
+    let scan = prepare_with(&d.stl("m.stl", &arch(0.06)), &keep, &ctx).unwrap();
+    assert_eq!(scan.warnings[0].args["units"], "m");
+    assert!(codes(&scan.warnings).contains(&WarningCode::Tiny));
+    let scan = prepare_with(&d.stl("um.stl", &arch(60_000.0)), &keep, &ctx).unwrap();
+    assert_eq!(codes(&scan.warnings), [WarningCode::UnitsSuspect]);
+    assert_eq!(scan.warnings[0].args["units"], "um");
+    let scan = prepare_with(&d.stl("mm.stl", &arch(30.0)), &keep, &ctx).unwrap();
+    assert!(scan.warnings.is_empty());
+
+    // the axes still change
+    let obj = "v 1 2 3\nv 4 2 3\nv 1 9 3\nf 1 2 3\n";
+    let scan = prepare_with(&d.text("v.obj", obj), &keep, &ctx).unwrap();
+    assert_eq!(scan.mesh.positions[0], Vec3::new(1.0, -3.0, 2.0));
+}
+
+#[test]
+fn a_bite_in_a_centimetre_size_is_not_rescaled() {
+    let d = Dir::new();
+    let mesh = arch(15.0);
+    let mut state = CaseState::new(Case::new("T"));
+    // from the name token
+    let report = import(&mut state, &[d.stl("bite_left.stl", &mesh)]);
+    assert_eq!(report.imported[0].role, Bite);
+    assert_eq!(report.imported[0].source_units, Units::Millimeters);
+    assert_eq!(codes(&report.warnings), [WarningCode::UnitsSuspect]);
+    assert_eq!(report.warnings[0].args["units"], "cm");
+    assert_eq!(extent(&state, "bite_left.stl"), 15.0);
+    // from the explicit choice, whatever the name says
+    let report = import_as(&mut state, d.stl("upper.stl", &mesh), Bite);
+    assert_eq!(report.imported[0].role, Bite);
+    assert_eq!(codes(&report.warnings), [WarningCode::UnitsSuspect]);
+    assert_eq!(extent(&state, "upper.stl"), 15.0);
+
+    // an explicit arch beats the bite token: a whole arch, rescaled
+    let mut state = CaseState::new(Case::new("T"));
+    let report = import_as(&mut state, d.stl("bite.stl", &mesh), Upper);
+    assert_eq!(report.imported[0].source_units, Units::Centimeters);
+    assert_eq!(codes(&report.warnings), [WarningCode::Rescaled]);
+    assert_eq!(extent(&state, "bite.stl"), 150.0);
+    // and an unhinted file is treated as an arch
+    let mut state = CaseState::new(Case::new("T"));
+    let report = import(&mut state, &[d.stl("scan.stl", &mesh)]);
+    assert_eq!(report.imported[0].source_units, Units::Centimeters);
+    assert_eq!(extent(&state, "scan.stl"), 150.0);
 }
 
 #[test]
@@ -904,6 +1093,211 @@ fn moving_a_provisional_scan_counts_as_a_change_of_both_arches() {
     assert_eq!(hook_calls(&state), [Upper, Lower]);
 }
 
+/// A detector that always answers `arch`.
+fn import_detected(state: &mut CaseState, paths: &[PathBuf], arch: ScanRole) -> ImportReport {
+    let mut detect = |_: &dc_case::import::PreparedScan| {
+        Some(Detection {
+            arch,
+            confidence: 0.9,
+        })
+    };
+    let resolver: &mut Resolver<'_> = &mut detect;
+    let request = ImportRequest::from_paths(paths.iter().cloned());
+    import_files(state, &request, Some(resolver), &JobCtx::detached())
+}
+
+#[test]
+fn an_unhinted_file_with_both_arches_confirmed_changes_nothing() {
+    let d = Dir::new();
+    let (mut state, _, _) = labelled_case(&d);
+    let (case, blobs) = (state.case.clone(), state.blobs.len());
+    for arch_ in [Upper, Lower] {
+        let report = import_detected(&mut state, &[d.stl("scan.stl", &arch(70.0))], arch_);
+        assert!(report.imported.is_empty());
+        let failed: Vec<&str> = report.failed.iter().map(|f| f.code).collect();
+        assert_eq!(failed, ["needs_role"]);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(report.replaced_roles.is_empty() && report.moved.is_empty());
+        assert!(report.module_cleared.is_empty());
+    }
+    assert_eq!(state.case, case);
+    assert_eq!(state.blobs.len(), blobs);
+    assert!(hook_calls(&state).is_empty());
+}
+
+#[test]
+fn an_unhinted_file_detected_on_a_provisional_slot_still_works() {
+    let d = Dir::new();
+    // the other arch is confirmed: the guess is replaced
+    let mut state = CaseState::new(Case::new("T"));
+    import(
+        &mut state,
+        &[
+            d.stl("scan.stl", &arch(60.0)),
+            d.stl("upper.stl", &arch(61.0)),
+        ],
+    );
+    assert_eq!(state.case.scan(Lower).unwrap().role_source, Provisional);
+    let report = import_detected(&mut state, &[d.stl("new.stl", &arch(62.0))], Lower);
+    assert_eq!(report.imported[0].role, Lower);
+    assert_eq!(report.imported[0].role_source, Detected);
+    assert_eq!(codes(&report.warnings), [WarningCode::Replaced]);
+    assert_eq!(report.replaced_roles, [Lower]);
+    assert_eq!(roles(&state), [(Upper, "upper.stl"), (Lower, "new.stl")]);
+
+    // the other arch is free: the guess steps aside
+    let mut state = CaseState::new(Case::new("T"));
+    import(&mut state, &[d.stl("scan.stl", &arch(60.0))]);
+    let report = import_detected(&mut state, &[d.stl("new.stl", &arch(62.0))], Lower);
+    assert_eq!(report.moved.len(), 1);
+    assert_eq!(roles(&state), [(Upper, "scan.stl"), (Lower, "new.stl")]);
+}
+
+#[test]
+fn the_report_never_says_a_scan_was_moved_and_replaced() {
+    let d = Dir::new();
+    let mut state = CaseState::new(Case::new("T"));
+    import(&mut state, &[d.stl("scan.stl", &arch(60.0))]);
+    let gone = state.case.scan(Lower).unwrap().clone();
+    state.set_module(
+        "m",
+        ModuleState::new(Labels {
+            labels: Vec::new(),
+            calls: Vec::new(),
+        }),
+    );
+    let batch = [
+        d.stl("lower.stl", &arch(61.0)),
+        d.stl("seen.stl", &arch(62.0)),
+    ];
+    let report = import_detected(&mut state, &batch, Upper);
+    assert!(report.moved.is_empty(), "{:?}", report.moved);
+    assert_eq!(codes(&report.warnings), [WarningCode::Replaced]);
+    let message = report.warnings[0].message();
+    assert!(message.contains("lower.stl") && message.contains("scan.stl"));
+    // only the arch that held the scan changed: the other one was free
+    assert_eq!(report.replaced_roles, [Lower]);
+    assert_eq!(hook_calls(&state), [Lower]);
+    assert_eq!(roles(&state), [(Upper, "seen.stl"), (Lower, "lower.stl")]);
+    assert!(state.case.scan_by_id(gone.id).is_none());
+    assert!(!state.blobs.contains(&gone.mesh));
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["moved"], serde_json::json!([]));
+}
+
+/// A module state this build cannot read, with a world frame to watch.
+fn lock(state: &mut CaseState) {
+    state.set_module(
+        "future",
+        ModuleState::new(OpaqueModuleData {
+            schema_version: 9,
+            value: serde_json::json!({"results": "of the old scans"}),
+        }),
+    );
+    state.case.world_frame.from_case = Pose::from_translation(DVec3::X);
+}
+
+#[test]
+fn an_opaque_module_refuses_replacing_or_moving_an_arch() {
+    let d = Dir::new();
+    let refused = |state: &mut CaseState, name: &str| {
+        let (case, blobs) = (state.case.clone(), state.blobs.len());
+        let report = import(state, &[d.stl(name, &arch(70.0))]);
+        assert!(report.imported.is_empty(), "{name}");
+        assert_eq!(report.failed.len(), 1, "{name}");
+        assert_eq!(report.failed[0].code, "arches_locked", "{name}");
+        assert!(report.failed[0].reason.contains("future"), "{name}");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(report.replaced_roles.is_empty() && report.moved.is_empty());
+        assert_eq!(state.case, case, "{name}");
+        assert_eq!(state.blobs.len(), blobs, "{name}");
+    };
+    // replacing
+    let mut state = CaseState::new(Case::new("T"));
+    import(&mut state, &[d.stl("upper.stl", &arch(60.0))]);
+    lock(&mut state);
+    refused(&mut state, "upper_new.stl");
+    // moving a provisional scan
+    let mut state = CaseState::new(Case::new("T"));
+    import(&mut state, &[d.stl("scan.stl", &arch(60.0))]);
+    lock(&mut state);
+    refused(&mut state, "lower.stl");
+}
+
+#[test]
+fn an_opaque_module_leaves_free_arches_and_bite_scans_alone() {
+    let d = Dir::new();
+    let mut state = CaseState::new(Case::new("T"));
+    import(
+        &mut state,
+        &[
+            d.stl("upper.stl", &arch(60.0)),
+            d.stl("bite1.stl", &arch(30.0)),
+            d.stl("bite2.stl", &arch(31.0)),
+        ],
+    );
+    lock(&mut state);
+    let frame = state.case.world_frame;
+    // a first scan on the empty arch, a bite replacement, and a refused file
+    // in the same batch: only that one fails
+    let report = import(
+        &mut state,
+        &[
+            d.stl("lower.stl", &arch(61.0)),
+            d.stl("bite3.stl", &arch(32.0)),
+            d.stl("upper_new.stl", &arch(62.0)),
+        ],
+    );
+    assert_eq!(report.imported.len(), 2);
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(report.failed[0].code, "arches_locked");
+    assert!(report.failed[0].path.ends_with("upper_new.stl"));
+    assert_eq!(report.replaced_roles, [Bite]);
+    assert_eq!(state.case.world_frame, frame);
+    assert_eq!(state.case.scan(Upper).unwrap().source_name, "upper.stl");
+    assert_eq!(state.case.scan(Lower).unwrap().source_name, "lower.stl");
+}
+
+#[test]
+fn commit_and_roles_changed_refuse_on_their_own() {
+    let d = Dir::new();
+    let mut state = CaseState::new(Case::new("T"));
+    import(
+        &mut state,
+        &[
+            d.stl("upper.stl", &arch(60.0)),
+            d.stl("bite.stl", &arch(30.0)),
+        ],
+    );
+    lock(&mut state);
+    let (case, blobs) = (state.case.clone(), state.blobs.len());
+    let scan = prepare(&d.stl("new.stl", &arch(62.0)), &JobCtx::detached()).unwrap();
+    let placement = |role: ScanRole, old: &Scan| Placement {
+        scan: scan.clone(),
+        role,
+        source: Explicit,
+        replaces: vec![old.id],
+    };
+    let upper = state.case.scan(Upper).unwrap().clone();
+    let error = commit(&mut state, &[placement(Upper, &upper)], &[]).unwrap_err();
+    assert_eq!(error.code(), "arches_locked");
+    assert_eq!(state.case, case);
+    assert_eq!(state.blobs.len(), blobs);
+
+    let before = state.referenced_blobs();
+    let touched = [Upper].into();
+    assert!(roles_changed(&mut state, &touched, &before).is_err());
+    assert_eq!(state.case, case);
+
+    // the bite replacement goes through both
+    let bite = state.case.scan(Bite).unwrap().clone();
+    let done = commit(&mut state, &[placement(Bite, &bite)], &[]).unwrap();
+    assert_eq!(done.replaced_roles, [Bite]);
+    assert_eq!(state.case.world_frame, case.world_frame);
+    let touched = [Bite].into();
+    assert!(roles_changed(&mut state, &touched, &before).is_ok());
+}
+
 #[test]
 fn two_bite_scans_live_in_the_state_and_the_third_replaces_the_second() {
     let d = Dir::new();
@@ -982,6 +1376,8 @@ fn every_warning(d: &Dir) -> Vec<ImportWarning> {
         .map(|i| d.stl(&format!("bite{i}.stl"), &arch(30.0 + i as f32)))
         .collect();
     run(&mut s, batch); // bite limit, skipped and replaced
+    let mut s = CaseState::new(Case::new("T"));
+    run(&mut s, vec![d.stl("bite_cm.stl", &arch(15.0))]); // units suspect
 
     // arch conflict
     let mut s = CaseState::new(Case::new("T"));
@@ -1014,6 +1410,7 @@ fn warnings_and_errors_read_well_in_both_languages() {
     let warnings = every_warning(&d);
     for code in [
         WarningCode::Rescaled,
+        WarningCode::UnitsSuspect,
         WarningCode::Tiny,
         WarningCode::LowPolygons,
         WarningCode::ObjObjectsMerged,
@@ -1040,6 +1437,11 @@ fn warnings_and_errors_read_well_in_both_languages() {
             "case-import-warn-rescaled",
             "m.stl: rescaled × 1000 to millimetres (the file was in m).",
             "m.stl: riscalato × 1000 in millimetri (il file era in m).",
+        ),
+        (
+            "case-import-warn-units-suspect",
+            "bite_cm.stl: the size looks like cm, but bite and follow-up scans are never rescaled: it was read as millimetres. Check the file.",
+            "bite_cm.stl: le dimensioni fanno pensare a cm, ma le scansioni del morso e di controllo non vengono mai riscalate: è stato letto in millimetri. Verifica il file.",
         ),
         (
             "case-import-warn-tiny",
@@ -1131,6 +1533,13 @@ fn warnings_and_errors_read_well_in_both_languages() {
             },
             "a.stl: more than one file of this import is meant as upper arch. Say which file goes there.",
             "a.stl: più di un file di questa importazione è indicato come arcata superiore. Indica quale file va assegnato.",
+        ),
+        (
+            ImportError::ArchesLocked {
+                module: "aligners".into(),
+            },
+            "This project holds data of the aligners module that this version cannot read, so the arches cannot be replaced or moved: update DentalCraft. A scan can still go on a free arch, and the bite scans can change.",
+            "Questo progetto contiene dati del modulo aligners che questa versione non sa leggere, quindi le arcate non si possono sostituire né spostare: aggiorna DentalCraft. Una scansione può comunque andare su un'arcata libera e le scansioni del morso possono cambiare.",
         ),
         (
             ImportError::Invalid {

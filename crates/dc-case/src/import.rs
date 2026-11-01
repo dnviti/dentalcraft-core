@@ -1,7 +1,8 @@
 //! The scan import pipeline, shared by every surface (app, CLI, MCP, modules).
 //!
 //! * [`prepare`] reads one file: cleanup, units, axes, warnings. It touches no
-//!   state, so a background job can run it.
+//!   state, so a background job can run it. [`prepare_with`] does the same
+//!   without the unit conversion, for bite and visit scans.
 //! * [`allocate`] decides the roles of a batch. It is pure: no geometry, no I/O.
 //! * [`commit`] applies the result as one state transition.
 //! * [`import_files`] chains the three and is the single entry point.
@@ -15,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dc_jobs::{Cancelled, JobCtx};
-use dc_mesh::io::{ReadOptions, normalize_units};
+use dc_mesh::io::{ReadOptions, detect_units, normalize_units};
 use dc_mesh::{
     BadFaceReport, MeshError, MeshFormat, ScanFile, TriMesh, Units, read_scan, remove_bad_faces,
     rotate_y_up_to_z_up,
@@ -37,6 +38,12 @@ pub const LOW_POLYGON_FACES: usize = 1000;
 /// i18n key of the progress message of [`import_files`].
 pub const PROGRESS_KEY: &str = "case-import-progress-reading";
 
+/// Exact weld, as in the plugin: only corners with the same coordinates merge.
+/// A tolerance can collapse the real small triangles of a dense scan.
+const SCAN_READ: ReadOptions = ReadOptions {
+    weld_tolerance: 0.0,
+};
+
 /// Arch slots in the order a provisional scan fills them (lower first, as in
 /// the plugin).
 const ARCHES: [ScanRole; 2] = [ScanRole::Lower, ScanRole::Upper];
@@ -47,6 +54,8 @@ const ARCHES: [ScanRole; 2] = [ScanRole::Lower, ScanRole::Upper];
 pub enum WarningCode {
     /// The file was not in millimetres.
     Rescaled,
+    /// A bite or visit scan, never rescaled, has the size of another unit.
+    UnitsSuspect,
     /// Largest extent under [`TINY_EXTENT_MM`].
     Tiny,
     /// Fewer faces than [`LOW_POLYGON_FACES`].
@@ -150,6 +159,12 @@ pub enum ImportError {
         /// The arch claimed.
         role: ScanRole,
     },
+    /// Replacing or moving an arch would leave old results next to the new
+    /// mesh: the state of a module cannot be cleared by this build.
+    ArchesLocked {
+        /// Id of the module.
+        module: String,
+    },
 }
 
 impl ImportError {
@@ -163,6 +178,7 @@ impl ImportError {
             Self::Empty { .. } => "empty",
             Self::NeedsRole { .. } => "needs_role",
             Self::RoleClash { .. } => "role_clash",
+            Self::ArchesLocked { .. } => "arches_locked",
         }
     }
 
@@ -176,6 +192,7 @@ impl ImportError {
             Self::Empty { .. } => "case-import-error-empty",
             Self::NeedsRole { .. } => "case-import-error-needs-role",
             Self::RoleClash { .. } => "case-import-error-role-clash",
+            Self::ArchesLocked { .. } => "case-import-error-arches-locked",
         }
     }
 
@@ -194,6 +211,7 @@ impl ImportError {
             Self::RoleClash { name, role } => {
                 translate(self.key(), &[("name", name), ("role", role_id(*role))])
             }
+            Self::ArchesLocked { module } => translate(self.key(), &[("module", module)]),
             Self::Unsupported { name }
             | Self::Unreadable { name, .. }
             | Self::Invalid { name, .. }
@@ -263,7 +281,7 @@ pub struct PreparedScan {
     pub mesh: Arc<TriMesh>,
     /// Format of the file.
     pub format: MeshFormat,
-    /// Unit detected for the file.
+    /// Unit the file was read in: millimetres when the units were left alone.
     pub source_units: Units,
     /// Faces dropped by the cleanup.
     pub cleanup: BadFaceReport,
@@ -271,28 +289,80 @@ pub struct PreparedScan {
     pub warnings: Vec<ImportWarning>,
 }
 
+/// How [`prepare_with`] reads a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrepareOptions {
+    /// Convert to millimetres, with the unit guessed from the size. The guess
+    /// fits a whole arch: a partial scan of 2 to 20 mm would look like
+    /// centimetres and grow ten times. With `false` the coordinates stay as
+    /// they are, taken as millimetres, and a size that fits another unit gives
+    /// [`WarningCode::UnitsSuspect`].
+    pub normalize_units: bool,
+}
+
+impl PrepareOptions {
+    /// For a bite or visit scan: the plugin never rescales those.
+    pub const KEEP_UNITS: Self = Self {
+        normalize_units: false,
+    };
+}
+
+impl Default for PrepareOptions {
+    fn default() -> Self {
+        Self {
+            normalize_units: true,
+        }
+    }
+}
+
+/// Reads one arch scan: [`prepare_with`] with the default options.
+pub fn prepare(path: &Path, ctx: &JobCtx) -> Result<PreparedScan, ImportError> {
+    prepare_with(path, &PrepareOptions::default(), ctx)
+}
+
 /// Reads one scan file: read, drop bad faces, reject an empty mesh, convert to
-/// millimetres, turn OBJ files from Y up to Z up, collect the warnings.
+/// millimetres (see [`PrepareOptions`]), turn OBJ files from Y up to Z up,
+/// collect the warnings.
 ///
 /// Touches no state and no UI. The OBJ rotation is baked into the positions.
-pub fn prepare(path: &Path, ctx: &JobCtx) -> Result<PreparedScan, ImportError> {
+pub fn prepare_with(
+    path: &Path,
+    options: &PrepareOptions,
+    ctx: &JobCtx,
+) -> Result<PreparedScan, ImportError> {
     let name = file_name(path);
     ctx.check_cancelled()?;
     let ScanFile {
         mut mesh,
         format,
         obj_object_count,
-    } = read_scan(path, &ReadOptions::default()).map_err(|e| ImportError::of_mesh(&name, e))?;
+    } = read_scan(path, &SCAN_READ).map_err(|e| ImportError::of_mesh(&name, e))?;
     ctx.check_cancelled()?;
     let cleanup = remove_bad_faces(&mut mesh);
     if mesh.is_empty() {
         return Err(ImportError::Empty { name });
     }
-    let source_units = normalize_units(&mut mesh).map_err(|e| ImportError::of_mesh(&name, e))?;
+    let of_mesh = |e| ImportError::of_mesh(&name, e);
+    let (source_units, suspect) = if options.normalize_units {
+        (normalize_units(&mut mesh).map_err(of_mesh)?, None)
+    } else {
+        let looks = detect_units(&mesh).map_err(of_mesh)?;
+        (
+            Units::Millimeters,
+            (looks != Units::Millimeters).then_some(looks),
+        )
+    };
     if format == MeshFormat::Obj {
         rotate_y_up_to_z_up(&mut mesh);
     }
-    let warnings = file_warnings(&name, &mesh, source_units, cleanup, obj_object_count);
+    let warnings = file_warnings(
+        &name,
+        &mesh,
+        source_units,
+        suspect,
+        cleanup,
+        obj_object_count,
+    );
     ctx.check_cancelled()?;
     Ok(PreparedScan {
         path: path.to_owned(),
@@ -310,6 +380,7 @@ fn file_warnings(
     name: &str,
     mesh: &TriMesh,
     units: Units,
+    suspect: Option<Units>,
     cleanup: BadFaceReport,
     obj_objects: Option<usize>,
 ) -> Vec<ImportWarning> {
@@ -323,6 +394,13 @@ fn file_warnings(
                 ("factor", &units.to_mm().to_string()),
                 ("units", units.symbol()),
             ],
+        ));
+    }
+    if let Some(looks) = suspect {
+        out.push(ImportWarning::new(
+            WarningCode::UnitsSuspect,
+            "case-import-warn-units-suspect",
+            &[("name", name), ("units", looks.symbol())],
         ));
     }
     let extent = mesh.aabb().map_or(0.0, |b| b.size().max_element());
@@ -435,6 +513,8 @@ enum Holder<'a> {
 
 struct Slots<'a> {
     files: &'a [FileClaim],
+    /// Module whose state keeps the arches as they are.
+    locked: Option<&'a str>,
     held: BTreeMap<ScanRole, Holder<'a>>,
     /// Arch slots claimed by name or explicitly, not yet placed.
     reserved: Vec<ScanRole>,
@@ -448,60 +528,100 @@ fn other_arch(role: ScanRole) -> ScanRole {
     }
 }
 
+fn moved_warning(scan: &Scan, to: ScanRole) -> ImportWarning {
+    ImportWarning::new(
+        WarningCode::Provisional,
+        "case-import-warn-provisional-moved",
+        &[("name", &scan.source_name), ("role", role_id(to))],
+    )
+}
+
 impl<'a> Slots<'a> {
     fn free(&self, role: ScanRole) -> bool {
         !self.held.contains_key(&role) && !self.reserved.contains(&role)
     }
 
+    /// A scan of the case holds `role`, and it is only a guess.
+    fn provisional(&self, role: ScanRole) -> bool {
+        matches!(self.held.get(&role), Some(Holder::Case(olds))
+            if olds.iter().all(|s| s.role_source == RoleSource::Provisional))
+    }
+
     /// The scan on `role` can step aside: it is provisional and the other
     /// arch is free.
     fn movable(&self, role: ScanRole) -> bool {
-        self.free(other_arch(role))
-            && matches!(self.held.get(&role), Some(Holder::Case(olds))
-                if olds.iter().all(|s| s.role_source == RoleSource::Provisional))
+        self.free(other_arch(role)) && self.provisional(role)
     }
 
     /// Puts file `i` on the arch `role`, moving a provisional occupant away
-    /// or replacing the occupant.
+    /// or replacing the occupant. With the arches locked, a file that would
+    /// do either fails.
     fn place(&mut self, i: usize, role: ScanRole, source: RoleSource) {
-        let mut replaces = Vec::new();
-        if let Some(Holder::Case(olds)) = self.held.get(&role).cloned() {
-            if self.movable(role) {
-                let to = other_arch(role);
-                for s in &olds {
-                    self.out.moves.push(ScanMove {
-                        scan: s.id,
-                        from: role,
-                        to,
-                    });
-                    self.out.warnings.push(ImportWarning::new(
-                        WarningCode::Provisional,
-                        "case-import-warn-provisional-moved",
-                        &[("name", &s.source_name), ("role", role_id(to))],
-                    ));
-                }
-                self.held.insert(to, Holder::Case(olds));
-            } else {
-                for s in olds {
-                    replaces.push(s.id);
-                    self.out.warnings.push(ImportWarning::new(
-                        WarningCode::Replaced,
-                        "case-import-warn-replaced",
-                        &[
-                            ("name", &self.files[i].name),
-                            ("old", &s.source_name),
-                            ("role", role_id(role)),
-                        ],
-                    ));
-                }
-            }
+        let olds = match self.held.get(&role) {
+            Some(Holder::Case(olds)) => olds.clone(),
+            _ => Vec::new(),
+        };
+        if let Some(module) = self.locked.filter(|_| !olds.is_empty()) {
+            let module = module.to_owned();
+            return self.fail(i, ImportError::ArchesLocked { module });
         }
+        let movable = self.movable(role);
         self.held.insert(role, Holder::Batch);
         self.out.decisions[i] = Decision::Place {
             role,
             source,
-            replaces,
+            replaces: Vec::new(),
         };
+        if movable {
+            let to = other_arch(role);
+            for s in &olds {
+                self.out.moves.push(ScanMove {
+                    scan: s.id,
+                    from: role,
+                    to,
+                });
+                self.out.warnings.push(moved_warning(s, to));
+            }
+            self.held.insert(to, Holder::Case(olds));
+        } else {
+            for s in olds {
+                self.replace(i, role, s);
+            }
+        }
+    }
+
+    /// File `i` replaces `s` on `role`. A scan moved earlier in this batch
+    /// never gets there: see [`Slots::undo_move`].
+    fn replace(&mut self, i: usize, role: ScanRole, s: &Scan) {
+        let (i, role) = self.undo_move(s).unwrap_or((i, role));
+        if let Decision::Place { replaces, .. } = &mut self.out.decisions[i] {
+            replaces.push(s.id);
+        }
+        self.out.warnings.push(ImportWarning::new(
+            WarningCode::Replaced,
+            "case-import-warn-replaced",
+            &[
+                ("name", &self.files[i].name),
+                ("old", &s.source_name),
+                ("role", role_id(role)),
+            ],
+        ));
+    }
+
+    /// Cancels the move of `s`, which is going away. It leaves from where it
+    /// is in the case, so what replaces it is the file that took that arch:
+    /// returns that file and the arch.
+    fn undo_move(&mut self, s: &Scan) -> Option<(usize, ScanRole)> {
+        let k = self.out.moves.iter().position(|m| m.scan == s.id)?;
+        let m = self.out.moves.remove(k);
+        let moved = moved_warning(s, m.to);
+        self.out.warnings.retain(|w| *w != moved);
+        let by = self
+            .out
+            .decisions
+            .iter()
+            .position(|d| matches!(d, Decision::Place { role, .. } if *role == m.from))?;
+        Some((by, m.from))
     }
 
     fn warn_file(&mut self, i: usize, code: WarningCode, key: &'static str, role: ScanRole) {
@@ -610,7 +730,8 @@ impl<'a> Slots<'a> {
     }
 
     /// Rule 4: unhinted files with a detection, surest first, ties in file
-    /// order. A file of the batch is never replaced.
+    /// order. Only a provisional scan gives way to them: never a confirmed
+    /// scan, never a file of the batch.
     fn detected(&mut self, unhinted: &[usize]) {
         let mut files: Vec<(usize, Detection)> = unhinted
             .iter()
@@ -620,7 +741,7 @@ impl<'a> Slots<'a> {
         files.sort_by(|a, b| b.1.confidence.total_cmp(&a.1.confidence));
         for (i, d) in files {
             let (want, other) = (d.arch, other_arch(d.arch));
-            if self.free(want) || self.movable(want) {
+            if self.free(want) || (self.locked.is_none() && self.provisional(want)) {
                 self.place(i, want, RoleSource::Detected);
             } else if self.free(other) {
                 self.place(i, other, RoleSource::Provisional);
@@ -630,8 +751,6 @@ impl<'a> Slots<'a> {
                     "case-import-warn-arch-conflict",
                     other,
                 );
-            } else if matches!(self.held.get(&want), Some(Holder::Case(_))) {
-                self.place(i, want, RoleSource::Detected);
             } else {
                 let name = self.files[i].name.clone();
                 self.fail(i, ImportError::NeedsRole { name });
@@ -671,16 +790,37 @@ impl<'a> Slots<'a> {
 ///    does not depend on the file order.
 /// 2. An explicit role ignores name and detection, and may replace.
 /// 3. A provisional occupant moves to the free arch instead of being replaced.
-/// 4. Unhinted files with a detection go by descending confidence: the
-///    detected arch when free; else the other one with an arch conflict
-///    warning; else they replace the detected arch.
+/// 4. Unhinted files with a detection go by descending confidence. A guess
+///    from the geometry never clears a confirmed arch, so only a provisional
+///    scan gives way to them:
+///
+///    | Detected arch holds  | Other arch | Result                                  |
+///    | -------------------- | ---------- | --------------------------------------- |
+///    | nothing              | any        | taken, detected                         |
+///    | a provisional scan   | free       | taken, detected; the scan moves there   |
+///    | a provisional scan   | not free   | taken, detected; the scan is replaced   |
+///    | anything else        | free       | other arch, provisional, arch conflict  |
+///    | anything else        | not free   | [`ImportError::NeedsRole`]              |
+///
 /// 5. Unhinted files without a detection take a free arch as provisional,
 ///    lower first; with both arches taken they fail with
 ///    [`ImportError::NeedsRole`].
 /// 6. Only an explicit choice or a name token makes a bite. The role holds
 ///    [`MAX_BITE_SCANS`] scans: a third one replaces the second, and a batch
 ///    with more keeps the first ones.
+///
+/// A scan moved by one file and replaced by a later one of the batch is simply
+/// replaced, by the file that took its arch: [`Allocation::moves`] never lists
+/// a scan that goes away.
 pub fn allocate(existing: &[Scan], files: &[FileClaim]) -> Allocation {
+    allocate_with(existing, files, None)
+}
+
+/// [`allocate`] with the arches locked by the state of the module `locked`
+/// (see [`roles_changed`]): a file that would replace or move an arch fails
+/// with [`ImportError::ArchesLocked`], and a provisional scan counts as
+/// confirmed for rule 4. Free arches and bite scans work as usual.
+pub fn allocate_with(existing: &[Scan], files: &[FileClaim], locked: Option<&str>) -> Allocation {
     let mut held = BTreeMap::new();
     for role in ARCHES {
         let olds: Vec<&Scan> = existing.iter().filter(|s| s.role == role).collect();
@@ -690,6 +830,7 @@ pub fn allocate(existing: &[Scan], files: &[FileClaim]) -> Allocation {
     }
     let mut slots = Slots {
         files,
+        locked,
         held,
         reserved: Vec::new(),
         out: Allocation {
@@ -734,7 +875,7 @@ pub struct ImportedScan {
     pub role_source: RoleSource,
     /// File name without directory.
     pub source_name: String,
-    /// Unit detected for the file.
+    /// Unit the file was read in.
     pub source_units: Units,
     /// The mesh blob.
     pub mesh: BlobRef,
@@ -761,8 +902,27 @@ pub struct Committed {
 /// [`ModuleData::scan_replaced`](crate::ModuleData::scan_replaced) once per
 /// role replaced or moved, then drops the blobs that became unreferenced.
 ///
-/// Without placements it does nothing.
-pub fn commit(state: &mut CaseState, placements: &[Placement], moves: &[ScanMove]) -> Committed {
+/// Without placements it does nothing. Fails with `state` unchanged when the
+/// allocation changes an arch and they are locked (see [`roles_changed`]).
+pub fn commit(
+    state: &mut CaseState,
+    placements: &[Placement],
+    moves: &[ScanMove],
+) -> Result<Committed, ImportError> {
+    let scans = &state.case.scans;
+    let moved = moves.iter().any(|m| scans.iter().any(|s| s.id == m.scan));
+    let replaced = placements.iter().flat_map(|p| &p.replaces).any(|id| {
+        scans
+            .iter()
+            .any(|s| s.id == *id && s.role != ScanRole::Bite)
+    });
+    if !placements.is_empty() && (moved || replaced) {
+        check_arches(state)?;
+    }
+    Ok(apply(state, placements, moves))
+}
+
+fn apply(state: &mut CaseState, placements: &[Placement], moves: &[ScanMove]) -> Committed {
     if placements.is_empty() {
         return Committed::default();
     }
@@ -814,7 +974,7 @@ pub fn commit(state: &mut CaseState, placements: &[Placement], moves: &[ScanMove
     }
     state.case.scans.sort_by_key(|s| s.role);
 
-    let module_cleared = roles_changed(state, &touched, &before);
+    let module_cleared = settle_roles(state, &touched, &before);
 
     Committed {
         imported,
@@ -831,9 +991,40 @@ pub fn commit(state: &mut CaseState, placements: &[Placement], moves: &[ScanMove
 /// longer referenced. Returns what the modules cleared, sorted, without
 /// repeats.
 ///
-/// [`commit`] ends with it; so does any other command that moves or replaces
-/// scans (e.g. `case.set-role`).
+/// [`commit`] does the same; any other command that moves or replaces scans
+/// (e.g. `case.set-role`) ends with this.
+///
+/// An opaque module state (schema newer than this build, or module not
+/// installed) has no [`ModuleData::scan_replaced`](crate::ModuleData::scan_replaced)
+/// of its own, so its results would stay next to the new mesh. With an arch
+/// among `touched` that is refused with [`ImportError::ArchesLocked`], before
+/// `state` changes: the caller drops the changes it made so far. Bite scans
+/// stay free, and so does adding a scan to an empty arch, which touches no role.
 pub fn roles_changed(
+    state: &mut CaseState,
+    touched: &BTreeSet<ScanRole>,
+    before: &HashSet<BlobRef>,
+) -> Result<Vec<&'static str>, ImportError> {
+    if touched.iter().any(|r| *r != ScanRole::Bite) {
+        check_arches(state)?;
+    }
+    Ok(settle_roles(state, touched, before))
+}
+
+/// The module that locks the arches, if any.
+fn opaque_module(state: &CaseState) -> Option<&str> {
+    let mut modules = state.modules.iter();
+    modules.find_map(|(id, m)| m.is_opaque().then_some(id.as_str()))
+}
+
+fn check_arches(state: &CaseState) -> Result<(), ImportError> {
+    opaque_module(state).map_or(Ok(()), |module| {
+        let module = module.to_owned();
+        Err(ImportError::ArchesLocked { module })
+    })
+}
+
+fn settle_roles(
     state: &mut CaseState,
     touched: &BTreeSet<ScanRole>,
     before: &HashSet<BlobRef>,
@@ -961,6 +1152,9 @@ impl ImportReport {
 /// A failed file does not stop the batch. When nothing is imported or the job
 /// is cancelled, `state` stays as it was. Callers holding a shared state clone
 /// it first and keep the old one for undo.
+///
+/// A bite scan, known from the explicit role or the file name, is read with
+/// [`PrepareOptions::KEEP_UNITS`].
 pub fn import_files(
     state: &mut CaseState,
     request: &ImportRequest,
@@ -973,7 +1167,13 @@ pub fn import_files(
     let total = request.files.len().max(1) as f32;
     for (i, file) in request.files.iter().enumerate() {
         ctx.set_progress(i as f32 / total, Some(PROGRESS_KEY));
-        match prepare(&file.path, ctx) {
+        let role = file.role.or_else(|| role_from_name(&file_name(&file.path)));
+        let options = if role == Some(ScanRole::Bite) {
+            PrepareOptions::KEEP_UNITS
+        } else {
+            PrepareOptions::default()
+        };
+        match prepare_with(&file.path, &options, ctx) {
             Ok(scan) => prepared.push((scan, file.role)),
             Err(ImportError::Cancelled) => return ImportReport::cancelled(),
             Err(e) => report.failed.push(FailedImport::new(&file.path, &e)),
@@ -998,7 +1198,7 @@ pub fn import_files(
         });
     }
 
-    let allocation = allocate(&state.case.scans, &claims);
+    let allocation = allocate_with(&state.case.scans, &claims, opaque_module(state));
     let mut placements = Vec::with_capacity(prepared.len());
     for ((scan, _), decision) in prepared.into_iter().zip(allocation.decisions) {
         match decision {
@@ -1022,7 +1222,8 @@ pub fn import_files(
         }
     }
     report.warnings.extend(allocation.warnings);
-    let done = commit(state, &placements, &allocation.moves);
+    // `allocate_with` has already kept the files off the locked arches
+    let done = apply(state, &placements, &allocation.moves);
     report.imported = done.imported;
     report.replaced_roles = done.replaced_roles;
     report.module_cleared = done.module_cleared;

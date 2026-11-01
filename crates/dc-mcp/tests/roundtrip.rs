@@ -427,6 +427,61 @@ fn import_scan_takes_paths_auto_and_returns_the_warnings() {
     );
 }
 
+/// With `paths`, the role goes to every file, whatever its name.
+#[test]
+fn import_scan_role_applies_to_every_path() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a.stl", "lower.stl", "c.stl"] {
+        write_tetra(&dir.path().join(name));
+    }
+    let path = |n: &str| dir.path().join(n).to_str().unwrap().to_owned();
+    let mut server = Server::new(Session::new());
+
+    // both files claim the upper arch, so both fail and nothing is imported
+    let r = tool_result(
+        &mut server,
+        1,
+        "import_scan",
+        json!({ "paths": [path("a.stl"), path("lower.stl")], "role": "upper" }),
+    );
+    assert_eq!(r["isError"], true);
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("a.stl") && text.contains("lower.stl"),
+        "{text}"
+    );
+    assert_eq!(server_scans(&mut server), 0);
+
+    // a bite role goes to all of them, and the case keeps two
+    let r = tool_result(
+        &mut server,
+        2,
+        "import_scan",
+        json!({ "paths": [path("a.stl"), path("lower.stl"), path("c.stl")], "role": "bite" }),
+    );
+    assert_eq!(r.get("isError"), None, "{r}");
+    let imported = r["structuredContent"]["imported"].as_array().unwrap();
+    assert_eq!(imported.len(), 2);
+    assert!(imported.iter().all(|s| s["role"] == "bite"));
+    let codes = r["structuredContent"]["warnings"].to_string();
+    assert!(codes.contains("bite_limit"), "{codes}");
+
+    // and the tool says so
+    let line = server
+        .handle_line(&request(3, "tools/list", json!({})))
+        .unwrap();
+    let list: Value = serde_json::from_str(&line).unwrap();
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let tool = tools.iter().find(|t| t["name"] == "import_scan").unwrap();
+    let doc = tool["inputSchema"]["properties"]["role"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(
+        doc.contains("every file") && doc.contains("role_clash"),
+        "{doc}"
+    );
+}
+
 fn server_scans(server: &mut Server<impl Host>) -> usize {
     let r = tool_result(server, 90, "inspect", json!({ "path": "scans" }));
     let text = r["content"][0]["text"].as_str().unwrap();
