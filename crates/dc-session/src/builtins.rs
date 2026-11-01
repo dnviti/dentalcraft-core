@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use dc_case::{CaseState, Pose, Scan, ScanRole};
+use dc_case::{CaseState, Pose, RoleSource, Scan, ScanRole};
 use dc_command::{CommandError, JobCtx};
 use dc_module_api::{CommandOutput, CommandSpec};
 use schemars::JsonSchema;
@@ -269,6 +269,7 @@ fn run_import(
     next.case.scans.push(Scan {
         id,
         role,
+        role_source: RoleSource::Explicit,
         source_name: name.clone(),
         source_units: units,
         import_xform: Pose::default(),

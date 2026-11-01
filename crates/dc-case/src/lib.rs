@@ -10,20 +10,25 @@
 //!
 //! Teeth are identified by their FDI number ([`Fdi`]) and positioned with
 //! rigid [`Pose`]s (millimetres, double precision).
+//!
+//! Scan files enter a case through one pipeline, [`import`].
 
 mod blob;
 mod case;
 mod fdi;
+pub mod import;
 mod module;
 mod names;
 mod pose;
 
 pub use blob::{BlobRef, BlobStore};
-pub use case::{Case, CaseState, Jaws, Scan, ScanRole, WorldFrame};
+pub use case::{Case, CaseState, Jaws, MAX_BITE_SCANS, RoleSource, Scan, ScanRole, WorldFrame};
 pub use fdi::Fdi;
 pub use module::{ModuleData, ModuleState, OpaqueModuleData};
 pub use names::{arch_hint, role_from_name};
 pub use pose::Pose;
+
+dc_i18n::bundle!(pub fn loader);
 
 /// Errors of the case model.
 #[derive(Debug, thiserror::Error)]
@@ -47,3 +52,12 @@ pub type Result<T, E = CaseError> = std::result::Result<T, E>;
 
 #[doc(hidden)]
 pub use serde_json as __serde_json;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn translations_are_complete() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("i18n");
+        dc_i18n::parity::check_dir(&dir).unwrap();
+    }
+}
