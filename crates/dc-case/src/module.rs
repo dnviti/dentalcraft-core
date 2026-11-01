@@ -3,7 +3,7 @@
 use std::any::Any;
 use std::fmt;
 
-use crate::BlobRef;
+use crate::{BlobRef, ScanRole};
 
 /// Data owned by one module inside a [`crate::CaseState`].
 ///
@@ -36,6 +36,14 @@ pub trait ModuleData: Any + Send + Sync + fmt::Debug {
     /// neither the case scans nor any module data reference, so modules
     /// that store meshes in the blob store must report them here.
     fn referenced_blobs(&self) -> Vec<BlobRef> {
+        Vec::new()
+    }
+
+    /// The scan of `role` was replaced or moved to another role: drop what
+    /// was computed from it and return ids of what was cleared (shown in the
+    /// import report). The blobs no longer referenced afterwards are dropped
+    /// by the import. Runs on the state alone, with no module registry.
+    fn scan_replaced(&mut self, _role: ScanRole) -> Vec<&'static str> {
         Vec::new()
     }
 }
@@ -147,6 +155,11 @@ impl ModuleState {
     /// The type-erased data.
     pub fn data(&self) -> &dyn ModuleData {
         self.0.as_ref()
+    }
+
+    /// The type-erased data, mutable.
+    pub fn data_mut(&mut self) -> &mut dyn ModuleData {
+        self.0.as_mut()
     }
 
     /// Concrete data, when of type `T`.

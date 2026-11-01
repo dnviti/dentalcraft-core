@@ -1,7 +1,9 @@
 use std::io::{Read, Write};
 use std::path::Path;
 
-use dc_case::{BlobRef, Case, CaseState, ModuleState, OpaqueModuleData, Scan, ScanRole};
+use dc_case::{
+    BlobRef, Case, CaseState, ModuleState, OpaqueModuleData, RoleSource, Scan, ScanRole,
+};
 use dc_mesh::{TriMesh, Units};
 use glam::Vec3;
 use proptest::prelude::*;
@@ -54,6 +56,7 @@ fn sample_project() -> Project {
         state.case.scans.push(Scan {
             id: uuid::Uuid::from_u128(i as u128 + 1),
             role,
+            role_source: RoleSource::Explicit,
             source_name: format!("scan{i}.stl"),
             source_units: Units::Millimeters,
             import_xform: Default::default(),
@@ -157,6 +160,38 @@ fn case_json() -> Vec<u8> {
 fn blob_entry_of(project: &Project) -> String {
     let r = project.case_state.case.scans[0].mesh;
     blob_path(&r)
+}
+
+#[test]
+fn two_bite_scans_round_trip_in_order() {
+    let d = dir();
+    let path = d.path().join("bites.dcprj");
+    let mut p = sample_project();
+    for (i, side) in ["left", "right"].into_iter().enumerate() {
+        let state = &mut p.case_state;
+        let mesh = state.blobs.insert(mesh(i as f32 + 5.0));
+        state.case.scans.push(Scan {
+            id: uuid::Uuid::from_u128(i as u128 + 100),
+            role: ScanRole::Bite,
+            role_source: RoleSource::FileName,
+            source_name: format!("bite_{side}.stl"),
+            source_units: Units::Millimeters,
+            import_xform: Default::default(),
+            mesh,
+        });
+    }
+    save(&path, &p).unwrap();
+    let out = load(&path, &codecs()).unwrap();
+    assert!(!out.read_only, "{:?}", out.issues);
+    let case = &out.project.case_state.case;
+    assert_eq!(*case, p.case_state.case);
+    let bites: Vec<&str> = case
+        .scans_of(ScanRole::Bite)
+        .map(|s| s.source_name.as_str())
+        .collect();
+    assert_eq!(bites, ["bite_left.stl", "bite_right.stl"]);
+    assert_eq!(case.scan(ScanRole::Bite).unwrap().id.as_u128(), 100);
+    assert_eq!(out.project.case_state.blobs.len(), 4);
 }
 
 #[test]
@@ -716,6 +751,7 @@ proptest! {
             state.case.scans.push(Scan {
                 id: uuid::Uuid::from_u128(i as u128 + 1),
                 role: ScanRole::Upper,
+                role_source: RoleSource::Explicit,
                 source_name: format!("s{i}.stl"),
                 source_units: Units::Millimeters,
                 import_xform: Default::default(),

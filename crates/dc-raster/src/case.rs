@@ -83,6 +83,7 @@ mod tests {
             s.case.scans.push(Scan {
                 id: uuid_like(z),
                 role,
+                role_source: Default::default(),
                 source_name: format!("{role:?}.stl"),
                 source_units: Units::Millimeters,
                 import_xform: Pose::from_translation(DVec3::new(10.0, 0.0, 0.0)),
@@ -107,6 +108,27 @@ mod tests {
         let only = case_items(&s, &BTreeMap::new(), Some(&[ScanRole::Lower]));
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].mesh.positions[0].z, -1.0);
+    }
+
+    #[test]
+    fn both_bite_scans_are_drawn() {
+        let mut s = state();
+        for z in [3.0, 4.0] {
+            let blob = s.blobs.insert(tri(z));
+            s.case.scans.push(Scan {
+                id: uuid_like(z),
+                role: ScanRole::Bite,
+                role_source: Default::default(),
+                source_name: format!("bite{z}.stl"),
+                source_units: Units::Millimeters,
+                import_xform: Pose::default(),
+                mesh: blob,
+            });
+        }
+        let only = case_items(&s, &BTreeMap::new(), Some(&[ScanRole::Bite]));
+        assert_eq!(only.len(), 2);
+        assert_eq!(only[0].mesh.positions[0].z, 3.0);
+        assert_eq!(only[1].mesh.positions[0].z, 4.0);
     }
 
     #[test]
