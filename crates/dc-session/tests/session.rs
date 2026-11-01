@@ -5,7 +5,9 @@ use std::any::Any;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use dc_case::{Case, CaseState, ModuleData, ModuleState, OpaqueModuleData, Pose, ScanRole};
+use dc_case::{
+    Case, CaseState, ModuleData, ModuleState, OpaqueModuleData, Pose, RoleSource, ScanRole,
+};
 use dc_command::{CommandError, JobCtx, StepDef, StepGraph};
 use dc_i18n::Lang;
 use dc_mesh::TriMesh;
@@ -1026,6 +1028,28 @@ fn set_role_moves_to_a_free_arch_and_confirms_a_guess() {
     assert_eq!(out["module_cleared"], json!(["dummy.count"]));
     assert_eq!(scans(&s), [row("upper", "explicit", "scan.stl")]);
     assert!(frame_is_default(&s));
+}
+
+#[test]
+fn set_role_with_the_same_role_confirms_a_detected_unsure_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let specs = dc_session::builtins::specs();
+    let find = |id: &str| *specs.iter().find(|s| s.id == id).unwrap();
+    let ctx = JobCtx::detached();
+    let state = CaseState::new(Case::new("T"));
+    let params = json!({"path": tetra(dir.path(), "scan_a.stl"), "role": "lower"});
+    let (mut state, _) = find("case.import").execute(&state, &params, &ctx).unwrap();
+    state.case.scans[0].role_source = RoleSource::DetectedUnsure;
+
+    let params = json!({"from": "lower", "to": "lower"});
+    let (next, out) = find("case.set-role")
+        .execute(&state, &params, &ctx)
+        .unwrap();
+    assert_eq!(out["role_source"], "explicit");
+    assert_eq!(out["world_frame_reset"], false);
+    assert_eq!(out["module_cleared"], json!([]));
+    assert_eq!(next.case.scans[0].role_source, RoleSource::Explicit);
+    assert_eq!(next.case.scans[0].id, state.case.scans[0].id);
 }
 
 #[test]

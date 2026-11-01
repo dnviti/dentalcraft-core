@@ -38,6 +38,13 @@ pub enum RoleSource {
     FileName,
     /// Recognised from the geometry.
     Detected,
+    /// Recognised from the geometry, from a cue the old plugin marks "to be
+    /// checked": the arch is chosen and settled (nothing moves it, as for
+    /// [`RoleSource::Detected`]) but the user should look at it. A
+    /// `case.set-role` with the same role on both sides confirms it, which
+    /// makes it [`RoleSource::Explicit`]. Files written before this variant
+    /// never contain it.
+    DetectedUnsure,
     /// A guess to be checked: the import may move the scan to the other arch.
     Provisional,
 }
@@ -285,6 +292,25 @@ mod tests {
         });
         let scan: Scan = serde_json::from_value(old).unwrap();
         assert_eq!(scan.role_source, RoleSource::Explicit);
+    }
+
+    #[test]
+    fn detected_unsure_has_its_own_name_and_old_names_still_read() {
+        let json = |name: &str| serde_json::json!(name);
+        assert_eq!(
+            serde_json::to_value(RoleSource::DetectedUnsure).unwrap(),
+            json("detected_unsure")
+        );
+        for (name, source) in [
+            ("explicit", RoleSource::Explicit),
+            ("file_name", RoleSource::FileName),
+            ("detected", RoleSource::Detected),
+            ("detected_unsure", RoleSource::DetectedUnsure),
+            ("provisional", RoleSource::Provisional),
+        ] {
+            let back: RoleSource = serde_json::from_value(json(name)).unwrap();
+            assert_eq!(back, source);
+        }
     }
 
     #[test]
