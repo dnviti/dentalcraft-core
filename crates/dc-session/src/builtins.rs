@@ -221,8 +221,11 @@ macro_rules! session_spec {
     };
 }
 
-/// Every built-in command, in listing order.
+/// Every built-in command, in listing order. Registers the bundle of their
+/// labels and docs: the desktop app takes the specs from here and never builds
+/// a [`Session`](crate::Session).
 pub fn specs() -> Vec<CommandSpec> {
+    crate::loader();
     vec![
         session_spec!(PROJECT_NEW, "project-new", NewParams),
         session_spec!(PROJECT_OPEN, "project-open", OpenParams),
@@ -288,8 +291,13 @@ pub(crate) fn role_source_str(source: RoleSource) -> &'static str {
     }
 }
 
+fn translate(key: &str, args: &[(&str, &str)]) -> String {
+    crate::loader();
+    dc_i18n::tr_args(key, args)
+}
+
 fn invalid(key: &str, args: &[(&str, &str)]) -> CommandError {
-    CommandError::Invalid(dc_i18n::tr_args(key, args))
+    CommandError::Invalid(translate(key, args))
 }
 
 /// The files of an import, from exactly one of `path` and `files`.
@@ -315,7 +323,7 @@ fn import_request(p: &ImportParams) -> Result<ImportRequest, CommandError> {
 
 /// The reasons of the failed files, one sentence each.
 fn failure_text(report: &ImportReport) -> String {
-    let reasons: Vec<String> = report
+    let mut reasons: Vec<String> = report
         .failed
         .iter()
         .map(|f| match &f.detail {
@@ -323,7 +331,8 @@ fn failure_text(report: &ImportReport) -> String {
             None => f.reason.clone(),
         })
         .collect();
-    dc_i18n::tr_args("session-import-nothing", &[("reasons", &reasons.join(" "))])
+    reasons.dedup(); // a reason about the project is the same for every file
+    translate("session-import-nothing", &[("reasons", &reasons.join(" "))])
 }
 
 fn to_value(v: impl serde::Serialize) -> Result<Value, CommandError> {
@@ -445,6 +454,7 @@ fn run_set_role(
         Vec::new()
     } else {
         roles_changed(&mut next, &touched, &before)
+            .map_err(|e| CommandError::Invalid(e.to_string()))?
     };
     let swapped = occupant.map(|(id, name)| {
         json!({

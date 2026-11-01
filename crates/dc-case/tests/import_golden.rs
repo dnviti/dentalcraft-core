@@ -23,18 +23,15 @@
 //!   upper scan.
 //! * A multi-object OBJ becomes one scan with the `ObjObjectsMerged` warning.
 //!   The add-on takes the first object and leaves the others in the scene.
-//! * Weld. STL corners are welded within 1e-6 of the bounding box diagonal
-//!   (the add-on welds only bit-identical corners). A weld can collapse a
-//!   triangle onto repeated indices, and the cleanup then removes it: on the
-//!   demo arch of group A that gives 166390 faces where the add-on has
-//!   166392 (two source vertices 7.4e-5 mm apart merge, 83171 vertices
-//!   against 83172). The same cleanup removes the 50 repeated-index faces and
-//!   the 300 duplicate faces of group D, as Blender's own importers do, so
-//!   those rows now agree.
 //! * Roles. Same words as the add-on, plus the bite words (`bite`, `morso`).
 //!   With no hint the first free arch is taken, lower first, as provisional.
 //!   One scan per role: importing a second scan of a role replaces the first
 //!   (the add-on keeps every object as its own case).
+//!
+//! The STL weld agrees with the add-on: only corners with the same coordinates
+//! merge, so the demo arch of group A keeps its 83172 vertices and 166392
+//! faces. The cleanup removes the 50 repeated-index faces and the 300
+//! duplicate faces of group D, as Blender's own importers do.
 //!
 //! The meshes are generated here, so the numbers are exact. Rows already
 //! covered one by one in `import_pipeline.rs` (the allocation rules, the
@@ -716,12 +713,13 @@ fn d_duplicate_and_reversed_faces_are_removed() {
     }
 }
 
-/// The weld takes bit-identical corners always, and corners within 1e-6 of
-/// the bounding box diagonal. DIVERGES: the add-on welds only bit-identical
-/// ones, so a triangle of that size stays there and collapses here, and the
-/// cleanup removes it (the 166390 against 166392 faces of group A).
+/// The weld is exact, as in the add-on: corners with the same coordinates
+/// merge and any others stay apart, however close. A small real triangle
+/// survives, which is the demo arch of group A: two of its vertices are
+/// 7.4e-5 mm apart, and a tolerance took them for one, lost 2 of its 166392
+/// faces and reported them as bad.
 #[test]
-fn d_the_stl_weld_and_the_faces_it_collapses() {
+fn d_the_stl_weld_is_exact() {
     let d = Dir::new();
     let mesh = grid(48, 60.0);
     // a soup: every face with its own three corners
@@ -750,25 +748,35 @@ fn d_the_stl_weld_and_the_faces_it_collapses() {
     let got = shape(&d.mesh("exact.stl", &soup(&[], 0.0)));
     assert_eq!((got.0, got.1), (2401, 4608));
 
-    // one triangle a hundred times smaller than the weld tolerance
-    // (1e-6 * 85 mm), far from the grid: its corners merge, the face goes
-    let tiny = [
-        Vec3::new(30.0, 30.0, 50.0),
-        Vec3::new(30.0 + 1e-7, 30.0, 50.0),
-        Vec3::new(30.0, 30.0 + 1e-7, 50.0),
-    ];
+    // one triangle 4e-5 mm across, far from the grid: its corners stay apart,
+    // the face stays and nothing is reported
+    let at = Vec3::new(30.0, 30.0, 50.0);
+    let tiny = [at, at + Vec3::X * 4e-5, at + Vec3::Y * 4e-5];
     let path = d.mesh("tiny.stl", &soup(&[tiny], 0.0));
+    let scan = prepare(&path, &JobCtx::detached()).unwrap();
+    assert_eq!(scan.cleanup.removed(), 0);
+    assert_eq!(scan.mesh.face_count(), 4608 + 1);
+    assert_eq!(scan.mesh.positions.len(), 2401 + 3);
+    assert!(!codes_of(&scan).contains(&WarningCode::BadFacesRemoved));
+
+    // a triangle with two identical corners collapses, and the cleanup says so
+    let flat = [at, at, at + Vec3::Y];
+    let path = d.mesh("flat.stl", &soup(&[flat], 0.0));
     let scan = prepare(&path, &JobCtx::detached()).unwrap();
     assert_eq!(scan.cleanup.degenerate, 1);
     assert_eq!(scan.mesh.face_count(), 4608);
-    assert_eq!(scan.mesh.positions.len(), 2401 + 1);
     assert!(codes_of(&scan).contains(&WarningCode::BadFacesRemoved));
 
-    // corners a thousand times farther apart than the tolerance do not merge
-    // (bar a coincidence): the mesh stays a soup
+    // corners that differ a little all stay apart: the mesh stays a soup
     let apart = shape(&d.mesh("apart.stl", &soup(&[], 1e-2)));
     assert_eq!(apart.1, 4608);
     assert!(apart.0 > 3 * 4608 - 20, "{} vertices", apart.0);
+}
+
+/// Other callers of the reader keep the default tolerance.
+#[test]
+fn d_the_default_read_options_still_weld_with_a_tolerance() {
+    assert_eq!(dc_mesh::io::ReadOptions::default().weld_tolerance, 1e-6);
 }
 
 /// An OBJ with two objects is one scan, with the merge warning: both objects'
