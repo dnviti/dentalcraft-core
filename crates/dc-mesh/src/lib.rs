@@ -10,6 +10,7 @@
 //! the canonical `DCM1` blob encoding ([`dcm`]) and the mesh file I/O
 //! readers and writers ([`io`]: STL, OBJ, PLY, unit detection).
 
+pub mod cleanup;
 pub mod dcm;
 pub mod io;
 mod topology;
@@ -17,7 +18,8 @@ mod validate;
 
 use glam::Vec3;
 
-pub use io::{MeshFormat, Units};
+pub use cleanup::{BadFaceReport, remove_bad_faces, rotate_y_up_to_z_up};
+pub use io::{MeshFormat, ScanFile, Units, read_scan};
 pub use topology::{EdgeAdjacency, EdgeKey};
 pub use validate::ValidationReport;
 

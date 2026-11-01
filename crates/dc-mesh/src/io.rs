@@ -169,6 +169,49 @@ pub fn read_bytes(bytes: &[u8], format: MeshFormat, options: &ReadOptions) -> Re
     Ok(mesh)
 }
 
+/// Result of [`read_scan`]: the raw mesh plus what the reader learnt about the file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanFile {
+    /// Mesh as stored in the file (no unit conversion, no rotation, no cleanup).
+    pub mesh: TriMesh,
+    /// Format detected from the file extension.
+    pub format: MeshFormat,
+    /// For OBJ: number of `o` objects that own at least one face. Faces before
+    /// the first `o` count as one implicit object, so a plain OBJ with faces
+    /// gives `Some(1)` and one without faces `Some(0)`. `None` for STL and PLY.
+    pub obj_object_count: Option<usize>,
+}
+
+/// Reads a scan file like [`read_with`] (format from the extension) and also
+/// reports the detected format and, for OBJ, the object count. The mesh is
+/// raw: callers apply cleanup, unit and axis conversion themselves.
+pub fn read_scan(path: impl AsRef<Path>, options: &ReadOptions) -> Result<ScanFile> {
+    let format = MeshFormat::from_path(path.as_ref())?;
+    let bytes = std::fs::read(path)?;
+    read_scan_bytes(&bytes, format, options)
+}
+
+/// In-memory variant of [`read_scan`].
+pub fn read_scan_bytes(
+    bytes: &[u8],
+    format: MeshFormat,
+    options: &ReadOptions,
+) -> Result<ScanFile> {
+    let (mesh, obj_object_count) = match format {
+        MeshFormat::Obj => {
+            let (mesh, count) = obj::read_counted(bytes)?;
+            (mesh, Some(count))
+        }
+        _ => (read_bytes(bytes, format, options)?, None),
+    };
+    mesh.check()?;
+    Ok(ScanFile {
+        mesh,
+        format,
+        obj_object_count,
+    })
+}
+
 /// Writes `mesh` to `path` in the given format (STL: binary).
 pub fn write(path: impl AsRef<Path>, mesh: &TriMesh, format: MeshFormat) -> Result<()> {
     let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);

@@ -36,11 +36,23 @@ fn index(tok: &str, nv: usize, ln: usize) -> Result<u32> {
 }
 
 pub(super) fn read(bytes: &[u8]) -> Result<TriMesh> {
+    read_counted(bytes).map(|(mesh, _)| mesh)
+}
+
+/// Reads an OBJ and also returns the number of objects that own faces.
+///
+/// An object starts at each `o` line; faces before the first `o` belong to an
+/// implicit object. Only objects with at least one `f` line are counted, so an
+/// OBJ with faces and no `o` line gives 1 and an OBJ without faces gives 0.
+/// `g` groups are not objects.
+pub(super) fn read_counted(bytes: &[u8]) -> Result<(TriMesh, usize)> {
     let text = String::from_utf8_lossy(bytes);
     let mut positions: Vec<Vec3> = Vec::new();
     let mut colors: Vec<Option<[u8; 4]>> = Vec::new();
     let mut tris: Vec<[u32; 3]> = Vec::new();
     let mut poly: Vec<u32> = Vec::new();
+    let mut objects_with_faces = 0usize;
+    let mut current_has_faces = false;
     for (i, raw) in text.lines().enumerate() {
         let ln = i + 1;
         let line = raw.split('#').next().unwrap_or("");
@@ -66,7 +78,12 @@ pub(super) fn read(bytes: &[u8]) -> Result<TriMesh> {
                     None
                 });
             }
+            Some("o") => current_has_faces = false,
             Some("f") => {
+                if !current_has_faces {
+                    current_has_faces = true;
+                    objects_with_faces += 1;
+                }
                 poly.clear();
                 for t in tok {
                     poly.push(index(t, positions.len(), ln)?);
@@ -88,7 +105,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<TriMesh> {
     if colors.iter().any(Option::is_some) {
         mesh.vertex_colors = Some(colors.into_iter().map(|c| c.unwrap_or([255; 4])).collect());
     }
-    Ok(mesh)
+    Ok((mesh, objects_with_faces))
 }
 
 pub(super) fn write(w: &mut impl Write, mesh: &TriMesh) -> Result<()> {
