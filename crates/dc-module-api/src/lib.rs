@@ -15,7 +15,7 @@ mod spec;
 use std::sync::Arc;
 
 pub use dc_project::{ModuleCodec, ModuleCodecs};
-pub use menu::{MenuItem, MenuKind, MenuStatus, MenuTree};
+pub use menu::{LeafInput, MenuItem, MenuKind, MenuStatus, MenuTree};
 pub use spec::{CommandOutput, CommandRunFn, CommandSpec, SpecCommand};
 
 use dc_case::CaseState;
@@ -212,6 +212,13 @@ pub trait Module: Send {
             }
             _ => Err(ModuleError::UnknownCommand(command_id.to_owned())),
         }
+    }
+
+    /// `true` when the case already holds what menu leaf `leaf_id` produces,
+    /// read from the data of `state`. The default knows of nothing; so does
+    /// a module for a leaf that leaves no trace in the case.
+    fn leaf_done(&self, _state: &CaseState, _leaf_id: &str) -> bool {
+        false
     }
 
     /// The user selected menu row `id` (a group or a command item). The
@@ -412,6 +419,11 @@ mod tests {
     #[test]
     fn command_specs_default_to_none() {
         assert!(Demo("x").command_specs().is_empty());
+    }
+
+    #[test]
+    fn leaf_done_defaults_to_false() {
+        assert!(!Demo("x").leaf_done(&CaseState::default(), "demo.run"));
     }
 
     #[test]
