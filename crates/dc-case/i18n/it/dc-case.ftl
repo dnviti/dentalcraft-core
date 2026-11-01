@@ -28,6 +28,6 @@ case-import-error-unsupported = { $name }: formato di file non supportato. Usa S
 case-import-error-unreadable = { $name }: impossibile leggere il file.
 case-import-error-invalid = { $name }: il file è danneggiato o non è una scansione valida.
 case-import-error-empty = { $name }: il file non contiene facce utilizzabili.
-case-import-error-needs-role = { $name }: entrambe le arcate sono già occupate. Indica quale ruolo ha questa scansione.
+case-import-error-needs-role = { $name }: entrambe le arcate sono già occupate. Scegli il ruolo nel pannello Importa scansioni, sotto Ruolo delle prossime scansioni, e importa di nuovo il file (in un comando va nel parametro role).
 case-import-error-role-clash = { $name }: più di un file di questa importazione è indicato come { case-import-role }. Indica quale file va assegnato.
 case-import-error-arches-locked = Questo progetto contiene dati del modulo { $module } che questa versione non sa leggere, quindi le arcate non si possono sostituire né spostare: aggiorna DentalCraft. Una scansione può comunque andare su un'arcata libera e le scansioni del morso possono cambiare.

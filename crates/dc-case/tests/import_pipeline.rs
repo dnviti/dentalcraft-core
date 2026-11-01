@@ -1545,8 +1545,8 @@ fn warnings_and_errors_read_well_in_both_languages() {
         ),
         (
             ImportError::NeedsRole { name: name.clone() },
-            "a.stl: both arches are already taken. Say which role this scan has.",
-            "a.stl: entrambe le arcate sono già occupate. Indica quale ruolo ha questa scansione.",
+            "a.stl: both arches are already taken. Choose its role in the Import scans panel, under Role of the next scans, and import it again (a command takes it in the role parameter).",
+            "a.stl: entrambe le arcate sono già occupate. Scegli il ruolo nel pannello Importa scansioni, sotto Ruolo delle prossime scansioni, e importa di nuovo il file (in un comando va nel parametro role).",
         ),
         (
             ImportError::RoleClash {

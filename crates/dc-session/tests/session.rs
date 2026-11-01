@@ -718,8 +718,9 @@ fn nothing_imported_is_an_error_and_leaves_the_state_unchanged() {
     let depth = s.undo_stack().undo_depth();
     let err = import(&mut s, json!({"path": tetra(dir.path(), "scan.stl")})).unwrap_err();
     assert!(
-        err.to_string()
-            .contains("scan.stl: both arches are already taken. Say which role this scan has."),
+        err.to_string().contains(
+            "scan.stl: both arches are already taken. Choose its role in the Import scans panel"
+        ),
         "{err}"
     );
     assert_eq!(s.undo_stack().undo_depth(), depth);
