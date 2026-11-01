@@ -15,12 +15,14 @@ mod blob;
 mod case;
 mod fdi;
 mod module;
+mod names;
 mod pose;
 
 pub use blob::{BlobRef, BlobStore};
 pub use case::{Case, CaseState, Jaws, Scan, ScanRole, WorldFrame};
 pub use fdi::Fdi;
 pub use module::{ModuleData, ModuleState, OpaqueModuleData};
+pub use names::{arch_hint, role_from_name};
 pub use pose::Pose;
 
 /// Errors of the case model.
