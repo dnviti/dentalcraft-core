@@ -19,7 +19,7 @@ use glam::{DVec3, Vec3};
 use serde::Serialize;
 use uuid::Uuid;
 
-use RoleSource::{Detected, Explicit, FileName, Provisional};
+use RoleSource::{Detected, DetectedUnsure, Explicit, FileName, Provisional};
 use ScanRole::{Bite, Lower, Upper};
 
 /// Faceted square of `2 * cells * cells` faces and side `size`.
@@ -220,6 +220,28 @@ fn rule_3_a_provisional_occupant_moves_to_the_free_arch() {
     let a = allocate(&case, &[detected("b.stl", Lower, 0.9)]);
     check(&a, &[put(Lower, Detected)], &[WarningCode::Provisional]);
     assert_eq!(a.moves.len(), 1);
+}
+
+#[test]
+fn rule_4_a_detected_unsure_scan_is_settled_and_never_displaced() {
+    // an unhinted file with a surer detection does not move it away: the
+    // scan holds its arch like a detected one, the file goes to the other arch
+    let case = [old(1, Lower, DetectedUnsure, "a.stl")];
+    let a = allocate(&case, &[detected("b.stl", Lower, 0.99)]);
+    check(&a, &[put(Upper, Provisional)], &[WarningCode::ArchConflict]);
+    assert!(a.moves.is_empty());
+    // with the other arch held as well there is no place left
+    let case = [
+        old(1, Lower, DetectedUnsure, "a.stl"),
+        old(2, Upper, Explicit, "u.stl"),
+    ];
+    let a = allocate(&case, &[detected("b.stl", Lower, 0.99)]);
+    check(&a, &[needs_role("b.stl")], &[]);
+    assert!(a.moves.is_empty());
+    // an unhinted file without detection does not take its slot either
+    let a = allocate(&case[..1], &[file("c.stl")]);
+    check(&a, &[put(Upper, Provisional)], &[WarningCode::Provisional]);
+    assert!(a.moves.is_empty());
 }
 
 #[test]

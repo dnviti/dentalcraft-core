@@ -799,8 +799,11 @@ impl<'a> Slots<'a> {
 ///    | nothing              | any        | taken, detected                         |
 ///    | a provisional scan   | free       | taken, detected; the scan moves there   |
 ///    | a provisional scan   | not free   | taken, detected; the scan is replaced   |
-///    | anything else        | free       | other arch, provisional, arch conflict  |
-///    | anything else        | not free   | [`ImportError::NeedsRole`]              |
+///    | anything else (a)    | free       | other arch, provisional, arch conflict  |
+///    | anything else (a)    | not free   | [`ImportError::NeedsRole`]              |
+///
+///    (a) A [`RoleSource::DetectedUnsure`] scan is settled like a detected
+///    one: the plugin warns about it, it does not give the arch away.
 ///
 /// 5. Unhinted files without a detection take a free arch as provisional,
 ///    lower first; with both arches taken they fail with

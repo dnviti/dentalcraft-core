@@ -287,6 +287,7 @@ pub(crate) fn role_source_str(source: RoleSource) -> &'static str {
         RoleSource::Explicit => "explicit",
         RoleSource::FileName => "file_name",
         RoleSource::Detected => "detected",
+        RoleSource::DetectedUnsure => "detected_unsure",
         RoleSource::Provisional => "provisional",
     }
 }
@@ -496,6 +497,19 @@ mod tests {
                 is_session_command(s.id),
                 s.id != CASE_IMPORT && s.id != CASE_SET_ROLE
             );
+        }
+    }
+
+    #[test]
+    fn role_source_names_match_the_serde_names() {
+        for source in [
+            RoleSource::Explicit,
+            RoleSource::FileName,
+            RoleSource::Detected,
+            RoleSource::DetectedUnsure,
+            RoleSource::Provisional,
+        ] {
+            assert_eq!(json!(source), json!(role_source_str(source)));
         }
     }
 

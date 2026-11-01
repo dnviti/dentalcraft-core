@@ -195,6 +195,36 @@ fn two_bite_scans_round_trip_in_order() {
 }
 
 #[test]
+fn detected_unsure_survives_save_and_load() {
+    let d = dir();
+    let path = d.path().join("unsure.dcprj");
+    let mut p = sample_project();
+    for (scan, source) in p
+        .case_state
+        .case
+        .scans
+        .iter_mut()
+        .zip([RoleSource::DetectedUnsure, RoleSource::Detected])
+    {
+        scan.role_source = source;
+    }
+    save(&path, &p).unwrap();
+    let out = load(&path, &codecs()).unwrap();
+    assert!(!out.read_only, "{:?}", out.issues);
+    let case = &out.project.case_state.case;
+    assert_eq!(*case, p.case_state.case);
+    let sources: Vec<RoleSource> = case.scans.iter().map(|s| s.role_source).collect();
+    assert_eq!(sources, [RoleSource::DetectedUnsure, RoleSource::Detected]);
+    let mut zip = ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+    let mut text = String::new();
+    zip.by_name("case.json")
+        .unwrap()
+        .read_to_string(&mut text)
+        .unwrap();
+    assert!(text.contains("\"detected_unsure\""), "{text}");
+}
+
+#[test]
 fn round_trip_is_byte_identical() {
     let d = dir();
     let (a, b) = (d.path().join("a.dcprj"), d.path().join("b.dcprj"));
