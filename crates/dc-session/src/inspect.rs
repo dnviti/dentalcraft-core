@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use dc_mesh::TriMesh;
 use serde_json::{Map, Value, json};
 
-use crate::builtins::role_str;
+use crate::builtins::{role_source_str, role_str};
 use crate::{Result, Session, SessionError};
 
 /// Arrays longer than this are abbreviated in the top-level summary.
@@ -46,6 +46,7 @@ fn full(s: &Session) -> Value {
             let base = json!({
                 "id": scan.id,
                 "role": role_str(scan.role),
+                "role_source": role_source_str(scan.role_source),
                 "source_name": scan.source_name,
                 "source_units": scan.source_units.symbol(),
                 "mesh": scan.mesh.to_hex(),

@@ -114,18 +114,30 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "import_scan",
-            "Import scan",
-            "Imports an STL, OBJ or PLY scan into the case (converted to millimetres). A scan replaces the one with the same role.",
+            "Import scans",
+            "Imports STL, OBJ or PLY scans into the case (converted to millimetres) as one undoable step. \
+Give exactly one of `path` (one file) or `paths` (several files). Without a role the import decides: \
+the file name, then a free arch, marked provisional when it is a guess. A scan replaces the one with \
+the same role; a case holds at most 2 bite scans. Runs the module's `*.import-scans` command when one \
+is registered (it can also recognise the arch from the geometry), otherwise `case.import`. The result \
+lists the imported scans with their `role_source`, the `warnings` (code and message) and the `failed` files; \
+it is an error when nothing was imported.",
             obj(
                 json!({
-                    "path": path("Path of the mesh file."),
+                    "path": path("Path of one mesh file. Give this or `paths`."),
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "Paths of several mesh files. Give this or `path`."
+                    },
                     "role": {
                         "type": "string",
-                        "enum": ["upper", "lower", "bite"],
-                        "description": "Arch or bite; guessed from the file name when missing."
+                        "enum": ["auto", "upper", "lower", "bite"],
+                        "description": "Arch or bite for the file or files (for `paths`, the ones that are not told apart by name); `auto` or missing lets the import decide."
                     }
                 }),
-                &["path"],
+                &[],
             ),
         ),
         tool(
@@ -211,13 +223,7 @@ pub(crate) fn call<H: Host>(host: &mut H, name: &str, args: &Value) -> Option<Va
                 json!({ "patient_code": code.unwrap_or_default() }),
             )
         }),
-        "import_scan" => str_arg(args, "path").and_then(|p| {
-            let mut params = json!({ "path": p });
-            if let Some(role) = opt_str_arg(args, "role")? {
-                params["role"] = json!(role);
-            }
-            host.execute("case.import", params)
-        }),
+        "import_scan" => import_scan(host, args),
         "undo" => host.undo(),
         "redo" => host.redo(),
         "steps" => opt_str_arg(args, "rewind").and_then(|step| match step {
@@ -231,6 +237,61 @@ pub(crate) fn call<H: Host>(host: &mut H, name: &str, args: &Value) -> Option<Va
         Ok(v) => text_result(&v),
         Err(e) => error_result(&e.0),
     })
+}
+
+/// Id of the command that imports scans: the one a module registers with the
+/// [`IMPORT_SCANS_SUFFIX`](dc_module_api::IMPORT_SCANS_SUFFIX) convention
+/// (it can recognise the arch from the geometry), else `case.import`.
+fn import_command<H: Host>(host: &mut H) -> String {
+    host.list()
+        .ok()
+        .and_then(|list| {
+            list.as_array()?
+                .iter()
+                .filter_map(|c| c.get("id").and_then(Value::as_str).or_else(|| c.as_str()))
+                .find(|id| dc_module_api::is_import_scans_command(id))
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "case.import".to_owned())
+}
+
+/// The `import_scan` tool: `path` or `paths`, and a role.
+fn import_scan<H: Host>(host: &mut H, args: &Value) -> HostResult {
+    let path = opt_str_arg(args, "path")?;
+    let paths = match args.get("paths") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(items)) => Some(
+            items
+                .iter()
+                .map(|p| {
+                    p.as_str().ok_or_else(|| {
+                        HostError::new("argument `paths` must be an array of strings")
+                    })
+                })
+                .collect::<HostResult<Vec<&str>>>()?,
+        ),
+        Some(_) => {
+            return Err(HostError::new(
+                "argument `paths` must be an array of strings",
+            ));
+        }
+    };
+    let mut params = match (path, paths) {
+        (Some(p), None) => json!({ "path": p }),
+        (None, Some(paths)) if !paths.is_empty() => {
+            json!({ "files": paths.iter().map(|p| json!({ "path": p })).collect::<Vec<_>>() })
+        }
+        _ => {
+            return Err(HostError::new(
+                "give exactly one of `path` (one file) or `paths` (a non-empty list of files)",
+            ));
+        }
+    };
+    if let Some(role) = opt_str_arg(args, "role")? {
+        params["role"] = json!(role);
+    }
+    let id = import_command(host);
+    host.execute(&id, params)
 }
 
 fn parse_batch(args: &Value) -> HostResult<Vec<(String, Value)>> {

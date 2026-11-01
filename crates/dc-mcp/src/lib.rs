@@ -36,7 +36,7 @@ pub const SERVER_NAME: &str = "dentalcraft";
 pub const INSTRUCTIONS: &str = "DentalCraft is a digital dentistry application (clear aligner planning). \
 Every action is a command with an id and JSON parameters: list_commands shows the ids, describe_command \
 gives the parameter schema and the docs, execute runs one (batch runs several in order). Typical flow: \
-new_project or open (.dcprj) -> import_scan (STL/OBJ/PLY, role upper/lower/bite) -> execute module \
+new_project or open (.dcprj) -> import_scan (STL/OBJ/PLY, one path or several paths, role auto/upper/lower/bite) -> execute module \
 commands (aligners.*) -> inspect to read the case back (scans, meshes, module state, steps; pass a path \
 such as `scans.0` or `modules.aligners` for details) -> save. Changes to the case are undoable (undo, \
 redo). Coordinates are millimetres.";
@@ -71,8 +71,9 @@ pub type HostResult<T = Value> = Result<T, HostError>;
 /// What the MCP server drives: a headless session or a running app.
 ///
 /// Every method returns JSON for the agent. `new_project`, `import_scan`
-/// and `steps` are run through [`Host::execute`] with the built-in command
-/// ids (`project.new`, `case.import`, `steps.list`, `steps.rewind`).
+/// and `steps` are run through [`Host::execute`]: with the built-in command
+/// ids (`project.new`, `steps.list`, `steps.rewind`), and `import_scan` with
+/// the `*.import-scans` command that [`Host::list`] shows, else `case.import`.
 pub trait Host {
     /// Runs command `id` with `params`; returns its output.
     fn execute(&mut self, id: &str, params: Value) -> HostResult;

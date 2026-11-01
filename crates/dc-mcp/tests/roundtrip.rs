@@ -203,7 +203,10 @@ fn errors_tool_errors_and_protocol_errors() {
         json!({ "id": "case.import" }),
     ));
     ok(&r);
-    assert_eq!(payload(&r)["params_schema"]["required"], json!(["path"]));
+    assert_eq!(
+        payload(&r)["params_schema"]["oneOf"],
+        json!([{"required": ["path"]}, {"required": ["files"]}])
+    );
     ok(&send(&call(
         11,
         "new_project",
@@ -335,4 +338,211 @@ fn render_hook_returns_an_image() {
     assert_eq!(c["type"], "image");
     assert_eq!(c["mimeType"], "image/png");
     assert_eq!(c["data"], "Zm9vYmFy");
+}
+
+fn tool_result(server: &mut Server<impl Host>, id: u64, name: &str, args: Value) -> Value {
+    let line = server.handle_line(&call(id, name, args)).unwrap();
+    serde_json::from_str::<Value>(&line).unwrap()["result"].clone()
+}
+
+#[test]
+fn import_scan_takes_paths_auto_and_returns_the_warnings() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, c) = ("scan.stl", "upper.stl", "morso.stl");
+    for name in [a, b, c] {
+        write_tetra(&dir.path().join(name));
+    }
+    let path = |n: &str| dir.path().join(n).to_str().unwrap().to_owned();
+    let mut server = Server::new(Session::new());
+
+    // one file, role auto: the import decides and says it is a guess
+    let r = tool_result(
+        &mut server,
+        1,
+        "import_scan",
+        json!({ "path": path(a), "role": "auto" }),
+    );
+    assert_eq!(r.get("isError"), None, "{r}");
+    let out = &r["structuredContent"];
+    assert_eq!(out["role"], "lower");
+    assert_eq!(out["role_source"], "provisional");
+    let warnings = out["warnings"].as_array().unwrap();
+    let codes: Vec<&str> = warnings
+        .iter()
+        .map(|w| w["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"provisional"), "{codes:?}");
+    assert!(
+        warnings
+            .iter()
+            .all(|w| !w["message"].as_str().unwrap().is_empty())
+    );
+    // the text content carries the same JSON
+    let text: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text["warnings"], out["warnings"]);
+
+    // several files: the provisional one moves aside for the named upper arch
+    let r = tool_result(
+        &mut server,
+        2,
+        "import_scan",
+        json!({ "paths": [path(b), path(c)] }),
+    );
+    assert_eq!(r.get("isError"), None, "{r}");
+    let out = &r["structuredContent"];
+    let names: Vec<&str> = out["imported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["source_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, [b, c]);
+    assert_eq!(out["role"], "upper");
+    assert_eq!(out["role_source"], "file_name");
+    assert_eq!(out["failed"], json!([]));
+    assert_eq!(out["imported"][1]["role"], "bite");
+    assert_eq!(server_scans(&mut server), 3);
+
+    // a partial batch succeeds and lists the failure; nothing imported is an error
+    let r = tool_result(
+        &mut server,
+        3,
+        "import_scan",
+        json!({ "paths": [path("missing.stl"), path(c)] }),
+    );
+    assert_eq!(r.get("isError"), None, "{r}");
+    assert_eq!(r["structuredContent"]["failed"][0]["code"], "unreadable");
+    let r = tool_result(
+        &mut server,
+        4,
+        "import_scan",
+        json!({ "paths": [path("missing.stl")] }),
+    );
+    assert_eq!(r["isError"], true);
+    assert!(
+        r["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("missing.stl")
+    );
+}
+
+fn server_scans(server: &mut Server<impl Host>) -> usize {
+    let r = tool_result(server, 90, "inspect", json!({ "path": "scans" }));
+    let text = r["content"][0]["text"].as_str().unwrap();
+    serde_json::from_str::<Value>(text)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .len()
+}
+
+#[test]
+fn import_scan_rejects_path_and_paths_together_or_neither() {
+    let mut server = Server::new(Session::new());
+    for args in [
+        json!({}),
+        json!({ "path": "a.stl", "paths": ["b.stl"] }),
+        json!({ "paths": [] }),
+        json!({ "paths": "a.stl" }),
+        json!({ "paths": [1] }),
+        json!({ "path": "a.stl", "role": 3 }),
+    ] {
+        let r = tool_result(&mut server, 1, "import_scan", args.clone());
+        assert_eq!(r["isError"], true, "{args}");
+    }
+    let r = tool_result(&mut server, 2, "inspect", json!({ "path": "scans" }));
+    assert_eq!(r.get("isError"), None);
+}
+
+/// Records what the tools execute and lists the commands it is given.
+struct Recorder {
+    commands: Vec<&'static str>,
+    executed: Vec<(String, Value)>,
+}
+
+impl Host for Recorder {
+    fn execute(&mut self, id: &str, params: Value) -> HostResult {
+        self.executed.push((id.to_owned(), params));
+        Ok(json!({ "warnings": [] }))
+    }
+    fn batch(&mut self, _: Vec<(String, Value)>) -> HostResult {
+        Ok(json!([]))
+    }
+    fn list(&mut self) -> HostResult {
+        Ok(json!(
+            self.commands
+                .iter()
+                .map(|id| json!({ "id": id, "source": "x", "label": "x" }))
+                .collect::<Vec<_>>()
+        ))
+    }
+    fn describe(&mut self, _: &str) -> HostResult {
+        Ok(json!({}))
+    }
+    fn inspect(&mut self, _: Option<&str>) -> HostResult {
+        Ok(json!({}))
+    }
+    fn undo(&mut self) -> HostResult {
+        Ok(json!({}))
+    }
+    fn redo(&mut self) -> HostResult {
+        Ok(json!({}))
+    }
+    fn open(&mut self, _: &str) -> HostResult {
+        Ok(json!({}))
+    }
+    fn save(&mut self, _: Option<&str>) -> HostResult {
+        Ok(json!({}))
+    }
+}
+
+#[test]
+fn import_scan_prefers_the_module_import_scans_command() {
+    let mut with_module = Server::new(Recorder {
+        commands: vec!["case.import", "aligners.case.import-scans", "aligners.auto"],
+        executed: Vec::new(),
+    });
+    tool_result(
+        &mut with_module,
+        1,
+        "import_scan",
+        json!({ "paths": ["a.stl", "b.stl"], "role": "bite" }),
+    );
+    tool_result(
+        &mut with_module,
+        2,
+        "import_scan",
+        json!({ "path": "c.stl" }),
+    );
+    let host = with_module.host();
+    assert_eq!(host.executed[0].0, "aligners.case.import-scans");
+    assert_eq!(
+        host.executed[0].1,
+        json!({ "files": [{ "path": "a.stl" }, { "path": "b.stl" }], "role": "bite" })
+    );
+    assert_eq!(host.executed[1].0, "aligners.case.import-scans");
+    assert_eq!(host.executed[1].1, json!({ "path": "c.stl" }));
+
+    // a look-alike id does not count; without the command, case.import runs
+    let mut without = Server::new(Recorder {
+        commands: vec![
+            "case.import",
+            "aligners.case.import-scans-x",
+            "import-scans.run",
+        ],
+        executed: Vec::new(),
+    });
+    tool_result(
+        &mut without,
+        1,
+        "import_scan",
+        json!({ "path": "a.stl", "role": "auto" }),
+    );
+    let host = without.host();
+    assert_eq!(host.executed[0].0, "case.import");
+    assert_eq!(
+        host.executed[0].1,
+        json!({ "path": "a.stl", "role": "auto" })
+    );
 }

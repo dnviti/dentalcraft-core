@@ -112,6 +112,21 @@ impl Toast {
     }
 }
 
+/// Last segment of the command ids that act as "Import scans" (e.g.
+/// `aligners.case.import-scans`), whatever the module: a surface that offers
+/// an import (the app, the MCP `import_scan` tool) prefers such a command to
+/// the module-agnostic `case.import`.
+pub const IMPORT_SCANS_SUFFIX: &str = "import-scans";
+
+/// `true` when `command_id` is an "Import scans" entry: its last
+/// dot-separated segment is [`IMPORT_SCANS_SUFFIX`].
+pub fn is_import_scans_command(command_id: &str) -> bool {
+    command_id
+        .rsplit('.')
+        .next()
+        .is_some_and(|last| last == IMPORT_SCANS_SUFFIX)
+}
+
 /// i18n key of the toast shown for placeholder commands.
 pub const NOT_AVAILABLE_KEY: &str = "module-command-not-available";
 
@@ -299,6 +314,15 @@ impl ModuleRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_scans_commands_end_with_the_suffix() {
+        assert!(is_import_scans_command("aligners.case.import-scans"));
+        assert!(is_import_scans_command("import-scans"));
+        assert!(!is_import_scans_command("case.import"));
+        assert!(!is_import_scans_command("aligners.case.import-scans-x"));
+        assert!(!is_import_scans_command("aligners.import-scans.run"));
+    }
 
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     struct DemoData {
