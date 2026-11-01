@@ -814,11 +814,35 @@ pub fn commit(state: &mut CaseState, placements: &[Placement], moves: &[ScanMove
     }
     state.case.scans.sort_by_key(|s| s.role);
 
+    let module_cleared = roles_changed(state, &touched, &before);
+
+    Committed {
+        imported,
+        replaced_roles: touched.into_iter().collect(),
+        module_cleared,
+    }
+}
+
+/// What every change of scan roles does to the rest of the case: resets the
+/// world frame when an arch is among `touched`, calls
+/// [`ModuleData::scan_replaced`](crate::ModuleData::scan_replaced) once per
+/// role (in role order), then drops the blobs that were in `before` (see
+/// [`CaseState::referenced_blobs`], taken before the change) and are no
+/// longer referenced. Returns what the modules cleared, sorted, without
+/// repeats.
+///
+/// [`commit`] ends with it; so does any other command that moves or replaces
+/// scans (e.g. `case.set-role`).
+pub fn roles_changed(
+    state: &mut CaseState,
+    touched: &BTreeSet<ScanRole>,
+    before: &HashSet<BlobRef>,
+) -> Vec<&'static str> {
     if touched.iter().any(|r| *r != ScanRole::Bite) {
         state.case.world_frame = Default::default();
     }
     let mut cleared = BTreeSet::new();
-    for &role in &touched {
+    for &role in touched {
         for module in state.modules.values_mut() {
             cleared.extend(module.data_mut().scan_replaced(role));
         }
@@ -831,12 +855,7 @@ pub fn commit(state: &mut CaseState, placements: &[Placement], moves: &[ScanMove
         .filter(|r| after.contains(r) || !before.contains(r))
         .collect();
     state.blobs.retain_only(&keep);
-
-    Committed {
-        imported,
-        replaced_roles: touched.into_iter().collect(),
-        module_cleared: cleared.into_iter().collect(),
-    }
+    cleared.into_iter().collect()
 }
 
 /// One file to import.

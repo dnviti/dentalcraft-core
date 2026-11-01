@@ -4,7 +4,7 @@
 //! current [`CaseState`] inside an [`UndoStack`], the [`StepHistory`], the
 //! registered modules and the registry of every agent-drivable command: the
 //! built-in ones of the session ([`builtins`]: `project.*`, `case.import`,
-//! `edit.undo` / `edit.redo`, `steps.*`, `view.set`) plus the
+//! `case.set-role`, `edit.undo` / `edit.redo`, `steps.*`, `view.set`) plus the
 //! [`CommandSpec`]s of the modules. The CLI and the MCP server drive it
 //! through [`Session::execute`], [`Session::batch`], [`Session::describe`]
 //! and [`Session::inspect`].
