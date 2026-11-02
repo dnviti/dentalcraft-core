@@ -4,10 +4,10 @@
 use std::collections::BTreeMap;
 
 use dc_case::{BlobRef, CaseState, ScanRole};
-use dc_scene::{Color, MeshColoring};
+use dc_scene::{Color, MeshColoring, SceneEntry};
 use serde_json::{Map, Value};
 
-use crate::{Item, RenderOptions, View, case_items, render};
+use crate::{Item, RenderOptions, View, case_items_with, render};
 
 /// Default image width of a request.
 pub const DEFAULT_WIDTH: u32 = 1024;
@@ -148,13 +148,25 @@ impl RenderRequest {
         Ok(r)
     }
 
-    /// Renders the scans of `state` (see [`case_items`]) and encodes PNG.
+    /// Renders the scans of `state` (see [`case_items_with`]) and encodes PNG.
     pub fn render_case_png(
         &self,
         state: &CaseState,
         labels: &BTreeMap<ScanRole, BlobRef>,
     ) -> Result<Vec<u8>, String> {
-        let items = case_items(state, labels, self.visible.as_deref());
+        self.render_case_png_with(state, labels, &[])
+    }
+
+    /// [`RenderRequest::render_case_png`] plus the scene entries of the
+    /// modules (`ModuleRegistry::scene_at`; see [`case_items_with`]): the
+    /// meshes they add, and the scans they replace left out.
+    pub fn render_case_png_with(
+        &self,
+        state: &CaseState,
+        labels: &BTreeMap<ScanRole, BlobRef>,
+        entries: &[SceneEntry],
+    ) -> Result<Vec<u8>, String> {
+        let items = case_items_with(state, labels, self.visible.as_deref(), entries);
         let mut opts = self.options.clone();
         if self.auto_occlusal && opts.view == View::OcclusalUpper {
             let lower_only = || {

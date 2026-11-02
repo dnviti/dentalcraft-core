@@ -9,7 +9,8 @@ use std::sync::Arc;
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
-use dc_case::{BlobRef, Pose};
+use dc_case::{BlobRef, Pose, ScanRole};
+use dc_mesh::TriMesh;
 
 /// Linear RGBA colour, components in `[0, 1]`.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -184,6 +185,88 @@ impl SceneItem {
     }
 }
 
+/// A [`SceneItem`] a module contributes to the case view, with the tags the
+/// shell needs to filter, pick and compose it. Geometry is in **case
+/// coordinates** (the consumer applies the case world frame, as for scans).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneEntry {
+    /// What to draw.
+    pub item: SceneItem,
+    /// Arch (`Upper` or `Lower`) the item belongs to. The arch toggles and
+    /// the render's `visible` filter hide it with that arch, and a hidden
+    /// item is not pickable. `None`: always shown.
+    pub arch: Option<ScanRole>,
+    /// FDI number of the tooth this mesh is (stable id for tinting and
+    /// picking by tooth); `None` for anything that is not one tooth.
+    pub tooth: Option<u8>,
+    /// While this entry is shown, the case scan of `arch` is not drawn (the
+    /// entry replaces it, e.g. the built teeth and gingiva).
+    pub hides_scan: bool,
+    /// Geometry drawn instead of the blob of a [`SceneItem::Mesh`] (same
+    /// triangles, moved vertices: e.g. the gingiva deformed at a stage, which
+    /// is not in the blob store). The blob still names the mesh (cache key,
+    /// fallback).
+    pub mesh: Option<Arc<TriMesh>>,
+}
+
+impl SceneEntry {
+    /// Entry for `item` with no tag: always shown, hides nothing.
+    pub fn new(item: SceneItem) -> Self {
+        Self {
+            item,
+            arch: None,
+            tooth: None,
+            hides_scan: false,
+            mesh: None,
+        }
+    }
+
+    /// Drawn with `mesh` instead of the geometry of its blob.
+    pub fn with_mesh(mut self, mesh: Arc<TriMesh>) -> Self {
+        self.mesh = Some(mesh);
+        self
+    }
+
+    /// The mesh to draw: the override, else the blob of a
+    /// [`SceneItem::Mesh`] looked up with `lookup`; `None` for other items.
+    pub fn resolve_mesh<'a>(
+        &'a self,
+        lookup: impl FnOnce(&BlobRef) -> Option<&'a Arc<TriMesh>>,
+    ) -> Option<&'a Arc<TriMesh>> {
+        match &self.item {
+            SceneItem::Mesh { blob, .. } => self.mesh.as_ref().or_else(|| lookup(blob)),
+            _ => None,
+        }
+    }
+
+    /// Belonging to `arch`.
+    pub fn with_arch(mut self, arch: ScanRole) -> Self {
+        self.arch = Some(arch);
+        self
+    }
+
+    /// Being the tooth `fdi`.
+    pub fn with_tooth(mut self, fdi: u8) -> Self {
+        self.tooth = Some(fdi);
+        self
+    }
+
+    /// Replacing the scan of its arch.
+    pub fn hiding_scan(mut self) -> Self {
+        self.hides_scan = true;
+        self
+    }
+
+    /// `true` when the entry is drawn with the arches in `visible` (all when
+    /// `None`; an entry with no arch is always drawn).
+    pub fn shown_with(&self, visible: Option<&[ScanRole]>) -> bool {
+        match (self.arch, visible) {
+            (Some(a), Some(v)) => v.contains(&a),
+            _ => true,
+        }
+    }
+}
+
 /// A named group of items drawn on top of the case (measures, seeds,
 /// collision maps...), which the user can show or hide.
 #[derive(Debug, Clone, PartialEq)]
@@ -226,6 +309,20 @@ mod tests {
         assert_eq!(p.color(0), Color::GINGIVA);
         assert_eq!(p.color(1), p.color(13));
         assert_ne!(p.color(1), p.color(2));
+    }
+
+    #[test]
+    fn entry_filters_by_arch() {
+        let item = SceneItem::mesh(BlobRef::of_bytes(b"m"), Color::TOOTH);
+        let e = SceneEntry::new(item.clone())
+            .with_arch(ScanRole::Lower)
+            .with_tooth(31)
+            .hiding_scan();
+        assert!(e.hides_scan && e.tooth == Some(31));
+        assert!(e.shown_with(None));
+        assert!(e.shown_with(Some(&[ScanRole::Lower])));
+        assert!(!e.shown_with(Some(&[ScanRole::Upper])));
+        assert!(SceneEntry::new(item).shown_with(Some(&[])));
     }
 
     #[test]

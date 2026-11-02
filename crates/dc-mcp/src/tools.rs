@@ -166,12 +166,14 @@ it is an error when nothing was imported.",
         tool(
             "render",
             "Render view",
-            "Renders the current view of the case as a PNG image (view parameters from execute view.set). Not available until the headless renderer lands.",
+            "Renders the current view of the case as a PNG image (view parameters from execute view.set). An arch whose teeth were built draws the 3D teeth and gingiva (model teeth) or its scan (model scan); stage poses the 3D teeth at a treatment stage. Without them: the headless CLI draws the 3D teeth at the initial position, the app what its viewport shows.",
             obj(
                 json!({
                     "width": { "type": "integer", "minimum": 1 },
                     "height": { "type": "integer", "minimum": 1 },
-                    "preset": { "type": "string", "enum": ["front", "back", "left", "right", "top", "bottom", "iso"] }
+                    "preset": { "type": "string", "enum": ["front", "back", "left", "right", "top", "bottom", "iso"] },
+                    "model": { "type": "string", "enum": ["scan", "teeth"], "description": "Scan or the built 3D teeth and gingiva. Default: teeth headless, what the viewport shows in the app." },
+                    "stage": { "type": "integer", "minimum": 0, "description": "Treatment stage that poses the 3D teeth (0: initial position). Default: none headless, the stage shown in the app. The scans stay at rest." }
                 }),
                 &[],
             ),
