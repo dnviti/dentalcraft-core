@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0-alpha.2](https://github.com/dnviti-personal-org/dentalcraft-core/compare/v0.3.0-alpha.1...v0.3.0-alpha.2) (2026-11-08)
+
+
+### Features
+
+* **core:** module scene entries with arch, tooth and stage ([#9](https://github.com/dnviti-personal-org/dentalcraft-core/issues/9)) ([abe9775](https://github.com/dnviti-personal-org/dentalcraft-core/commit/abe977558bfcd0cd075c4b96a8492d698060e0d8))
+
 ## [0.3.0-alpha.1](https://github.com/dnviti-personal-org/dentalcraft-core/compare/v0.2.1...v0.3.0-alpha.1) (2026-11-01)
 
 
