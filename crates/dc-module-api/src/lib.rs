@@ -21,7 +21,7 @@ pub use spec::{CommandOutput, CommandRunFn, CommandSpec, SpecCommand};
 use dc_case::CaseState;
 use dc_command::Command;
 use dc_jobs::JobSystem;
-use dc_scene::SceneItem;
+use dc_scene::{SceneEntry, SceneItem};
 
 /// Errors of the module layer.
 #[derive(Debug, thiserror::Error)]
@@ -232,6 +232,25 @@ pub trait Module: Send {
     /// Items to draw for `state`.
     fn scene(&self, state: &CaseState) -> Vec<SceneItem>;
 
+    /// Tagged items to draw for `state` at treatment stage `stage` (`None`
+    /// or `Some(0)`: the initial situation; `Some(n)`: the aligner with
+    /// index `n`). Geometry is in case coordinates. The shell draws these
+    /// in the viewport and in the headless render, filters them by
+    /// [`SceneEntry::arch`], and skips the scan of an arch while a shown
+    /// entry has [`SceneEntry::hides_scan`]. The default wraps
+    /// [`Module::scene`] in untagged entries and ignores the stage.
+    fn scene_at(&self, state: &CaseState, _stage: Option<u32>) -> Vec<SceneEntry> {
+        self.scene(state).into_iter().map(SceneEntry::new).collect()
+    }
+
+    /// [`Module::scene_at`] for a UI thread: never waits for slow work. What
+    /// is not ready yet is left out or drawn at rest and the flag is `false`
+    /// (the work goes on in the background; ask again later). The default
+    /// is [`Module::scene_at`], always complete.
+    fn scene_at_nowait(&self, state: &CaseState, stage: Option<u32>) -> (Vec<SceneEntry>, bool) {
+        (self.scene_at(state, stage), true)
+    }
+
     /// Codec of the module data: its current schema version, the migrations
     /// from older versions (one step each, chained) and the decoder. Register
     /// it under [`Module::id`] in a [`ModuleCodecs`] to load projects.
@@ -271,6 +290,14 @@ impl ModuleRegistry {
             .iter()
             .filter(|(_, e)| *e)
             .map(|(m, _)| m.as_ref())
+    }
+
+    /// The tagged scene entries of the enabled modules at `stage` (see
+    /// [`Module::scene_at`]), in registration order.
+    pub fn scene_at(&self, state: &CaseState, stage: Option<u32>) -> Vec<SceneEntry> {
+        self.enabled()
+            .flat_map(|m| m.scene_at(state, stage))
+            .collect()
     }
 
     /// Ids of all modules.
@@ -365,6 +392,16 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    #[test]
+    fn default_scene_at_wraps_scene_and_skips_disabled_modules() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(Box::new(Demo("aligners"))).unwrap();
+        let state = CaseState::new(dc_case::Case::new("T"));
+        assert!(reg.scene_at(&state, Some(2)).is_empty());
+        reg.set_enabled("aligners", false).unwrap();
+        assert!(reg.scene_at(&state, None).is_empty());
     }
 
     #[test]

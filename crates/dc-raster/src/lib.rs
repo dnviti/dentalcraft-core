@@ -31,7 +31,7 @@ use dc_mesh::{Aabb, TriMesh};
 use glam::{Mat4, Vec3};
 
 pub use camera::{Camera, View};
-pub use case::{case_items, label_palette};
+pub use case::{case_items, case_items_with, label_palette};
 pub use dc_scene::{Color, LabelPalette, MeshColoring};
 pub use request::{DEFAULT_HEIGHT, DEFAULT_SUPERSAMPLE, DEFAULT_WIDTH, RenderRequest, parse_size};
 

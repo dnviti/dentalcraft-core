@@ -20,7 +20,7 @@ session-cmd-steps-list-doc = Elenca i record dei passaggi di elaborazione e, qua
 session-cmd-steps-rewind = Torna al passaggio
 session-cmd-steps-rewind-doc = Torna allo stato immediatamente precedente a un passaggio di elaborazione: i record di quel passaggio e dei successivi vengono rimossi. Parametri: step.
 session-cmd-view-set = Imposta vista
-session-cmd-view-set-doc = Memorizza i parametri di vista per il renderer (ad es. preset, width, height, visible). Le chiavi impostate a null vengono rimosse. Non modifica il caso.
+session-cmd-view-set-doc = Memorizza i parametri di vista per il renderer (ad es. preset, width, height, visible, model scan|teeth, stage). Le chiavi impostate a null vengono rimosse. Non modifica il caso.
 
 # Usato dai messaggi qui sotto: legge il loro $role (upper, lower, bite).
 session-role = { $role ->

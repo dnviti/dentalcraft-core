@@ -20,7 +20,7 @@ session-cmd-steps-list-doc = Lists the processing step records and, when a pipel
 session-cmd-steps-rewind = Go back to step
 session-cmd-steps-rewind-doc = Goes back to the state right before a processing step: the records of that step and of the following ones are removed. Parameters: step.
 session-cmd-view-set = Set view
-session-cmd-view-set-doc = Stores view parameters for the renderer (e.g. preset, width, height, visible). Keys set to null are removed. Does not change the case.
+session-cmd-view-set-doc = Stores view parameters for the renderer (e.g. preset, width, height, visible, model scan|teeth, stage). Keys set to null are removed. Does not change the case.
 
 # Used by the messages below: reads their $role (upper, lower, bite).
 session-role = { $role ->

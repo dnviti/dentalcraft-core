@@ -11,6 +11,7 @@ publish.workspace = true
 
 [dependencies]
 dc-case.workspace = true
+dc-mesh.workspace = true
 glam.workspace = true
 serde.workspace = true
 

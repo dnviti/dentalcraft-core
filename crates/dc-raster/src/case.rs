@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use dc_case::{BlobRef, CaseState, ScanRole};
-use dc_scene::{Color, LabelPalette, MeshColoring};
+use dc_scene::{Color, LabelPalette, MeshColoring, SceneEntry, SceneItem};
 
 use crate::Item;
 
@@ -29,10 +29,34 @@ pub fn case_items<'a>(
     labels: &BTreeMap<ScanRole, BlobRef>,
     visible: Option<&[ScanRole]>,
 ) -> Vec<Item<'a>> {
+    case_items_with(state, labels, visible, &[])
+}
+
+/// [`case_items`] plus the entries the modules contribute
+/// (`ModuleRegistry::scene_at`).
+///
+/// - An entry whose `arch` is not in `visible` is not drawn.
+/// - A scan is not drawn while a drawn entry with `hides_scan` names its
+///   arch.
+/// - Only [`SceneItem::Mesh`] entries are drawn (the rasteriser has no
+///   lines, points or text), with [`SceneEntry::mesh`] when it is set;
+///   entries whose blob is not in `state` are skipped. Entry geometry is in case coordinates: the case world frame
+///   is applied, as for scans.
+pub fn case_items_with<'a>(
+    state: &'a CaseState,
+    labels: &BTreeMap<ScanRole, BlobRef>,
+    visible: Option<&[ScanRole]>,
+    entries: &'a [SceneEntry],
+) -> Vec<Item<'a>> {
     let world = state.case.world_frame.from_case.to_mat4().as_mat4();
+    let replaced: Vec<ScanRole> = entries
+        .iter()
+        .filter(|e| e.hides_scan && e.shown_with(visible))
+        .filter_map(|e| e.arch)
+        .collect();
     let mut out = Vec::new();
     for scan in &state.case.scans {
-        if visible.is_some_and(|v| !v.contains(&scan.role)) {
+        if visible.is_some_and(|v| !v.contains(&scan.role)) || replaced.contains(&scan.role) {
             continue;
         }
         let Some(mesh) = state.mesh(&scan.mesh) else {
@@ -54,6 +78,21 @@ pub fn case_items<'a>(
             None => Item::new(mesh).with_coloring(MeshColoring::Uniform(Color::TOOTH)),
         };
         out.push(item.with_xform(xform));
+    }
+    for e in entries.iter().filter(|e| e.shown_with(visible)) {
+        let SceneItem::Mesh {
+            coloring, xform, ..
+        } = &e.item
+        else {
+            continue;
+        };
+        if let Some(mesh) = e.resolve_mesh(|b| state.mesh(b)) {
+            out.push(
+                Item::new(mesh)
+                    .with_coloring(coloring.clone())
+                    .with_xform(world * xform.to_mat4().as_mat4()),
+            );
+        }
     }
     out
 }
@@ -150,5 +189,95 @@ mod tests {
         // different vertex count: the label mesh is drawn instead
         assert_eq!(items[1].mesh.vertex_count(), 4);
         assert!(matches!(items[1].coloring, MeshColoring::VertexLabels(_)));
+    }
+
+    fn entry(s: &mut CaseState, z: f32, arch: ScanRole, hides: bool) -> SceneEntry {
+        let blob = s.blobs.insert(tri(z));
+        let mut e = SceneEntry::new(SceneItem::Mesh {
+            blob,
+            coloring: MeshColoring::Uniform(Color::GINGIVA),
+            xform: Pose::from_translation(DVec3::new(0.0, 5.0, 0.0)),
+            pickable: true,
+        })
+        .with_arch(arch);
+        if hides {
+            e = e.hiding_scan();
+        }
+        e
+    }
+
+    #[test]
+    fn module_entries_are_drawn_in_the_world_frame() {
+        let mut s = state();
+        s.case.world_frame.from_case = Pose::from_translation(DVec3::new(0.0, 0.0, 2.0));
+        let e = entry(&mut s, 7.0, ScanRole::Upper, false);
+        let entries = [e];
+        let items = case_items_with(&s, &BTreeMap::new(), None, &entries);
+        assert_eq!(items.len(), 3);
+        let p = items[2].xform.transform_point3(Vec3::ZERO);
+        assert_eq!(p, Vec3::new(0.0, 5.0, 2.0));
+        assert_eq!(items[2].coloring, MeshColoring::Uniform(Color::GINGIVA));
+    }
+
+    #[test]
+    fn a_replacing_entry_hides_the_scan_of_its_arch() {
+        let mut s = state();
+        let e = entry(&mut s, 7.0, ScanRole::Upper, true);
+        let items = case_items_with(&s, &BTreeMap::new(), None, std::slice::from_ref(&e));
+        // lower scan + the entry; the upper scan (z = 1) is gone
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].mesh.positions[0].z, -1.0);
+        assert_eq!(items[1].mesh.positions[0].z, 7.0);
+        // the entry is hidden with its arch: the scan stays out too
+        let none = case_items_with(
+            &s,
+            &BTreeMap::new(),
+            Some(&[ScanRole::Lower]),
+            std::slice::from_ref(&e),
+        );
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].mesh.positions[0].z, -1.0);
+    }
+
+    #[test]
+    fn non_mesh_and_missing_entries_are_skipped() {
+        let s = state();
+        let lines = SceneEntry::new(SceneItem::Lines {
+            segments: vec![[Vec3::ZERO, Vec3::X]],
+            color: Color::BLACK,
+            width: 1.0,
+        });
+        let missing = SceneEntry::new(SceneItem::mesh(BlobRef::of_bytes(b"nope"), Color::TOOTH));
+        let entries = [lines, missing];
+        let items = case_items_with(&s, &BTreeMap::new(), None, &entries);
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn an_entry_mesh_override_is_drawn_instead_of_its_blob() {
+        let s = state();
+        let moved = Arc::new(tri(9.0));
+        let e = SceneEntry::new(SceneItem::mesh(BlobRef::of_bytes(b"nope"), Color::GINGIVA))
+            .with_mesh(Arc::clone(&moved));
+        let items = case_items_with(&s, &BTreeMap::new(), None, std::slice::from_ref(&e));
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[2].mesh.positions[0].z, 9.0);
+    }
+
+    #[test]
+    fn entries_reach_the_png() {
+        use crate::RenderRequest;
+        let mut s = state();
+        let e = entry(&mut s, 7.0, ScanRole::Upper, true);
+        let req = RenderRequest::from_json(&serde_json::json!({
+            "size": "64x48", "preset": "occlusal"
+        }))
+        .unwrap();
+        let with = req
+            .render_case_png_with(&s, &BTreeMap::new(), &[e])
+            .unwrap();
+        let without = req.render_case_png(&s, &BTreeMap::new()).unwrap();
+        assert_eq!(&with[..4], b"\x89PNG");
+        assert_ne!(with, without);
     }
 }
