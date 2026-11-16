@@ -15,6 +15,7 @@ glam.workspace = true
 kiddo.workspace = true
 nalgebra.workspace = true
 rayon.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 
 [lints]

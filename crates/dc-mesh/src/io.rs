@@ -12,6 +12,7 @@
 //! * OBJ: `v` (optionally `v x y z r g b`) and `f`; polygons are fan
 //!   triangulated, `vt`/`vn` and everything else are ignored.
 //! * PLY: ASCII, binary little and big endian. Writers emit binary LE.
+//!   Point clouds (vertex element only) go through [`write_ply`] / [`read_ply`].
 
 mod obj;
 mod ply;
@@ -23,7 +24,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{MeshError, Result, TriMesh};
+use crate::{MeshError, PointCloud, Result, TriMesh};
 
 /// Length unit of a source file. DentalCraft works in millimetres internally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -244,6 +245,42 @@ pub fn write_stl_ascii_to(w: &mut impl Write, mesh: &TriMesh) -> Result<()> {
     stl::write_ascii(w, mesh)
 }
 
+/// Writes a point cloud as a binary little endian PLY file
+/// (`x y z [nx ny nz] [red green blue]`).
+pub fn write_ply(cloud: &PointCloud, path: impl AsRef<Path>) -> Result<()> {
+    let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
+    write_ply_to(&mut w, cloud)?;
+    w.flush()?;
+    Ok(())
+}
+
+/// Writes a point cloud as a binary little endian PLY stream.
+pub fn write_ply_to(w: &mut impl Write, cloud: &PointCloud) -> Result<()> {
+    let n = cloud.points.len();
+    let check = |name, found: Option<usize>| match found {
+        Some(found) if found != n => Err(MeshError::AttributeLength {
+            name,
+            expected: n,
+            found,
+        }),
+        _ => Ok(()),
+    };
+    check("normals", cloud.normals.as_ref().map(Vec::len))?;
+    check("colors", cloud.colors.as_ref().map(Vec::len))?;
+    ply::write_cloud(w, cloud)
+}
+
+/// Reads the vertices of a PLY file (ASCII or binary) as a point cloud;
+/// faces are ignored.
+pub fn read_ply(path: impl AsRef<Path>) -> Result<PointCloud> {
+    read_ply_bytes(&std::fs::read(path)?)
+}
+
+/// In-memory variant of [`read_ply`].
+pub fn read_ply_bytes(bytes: &[u8]) -> Result<PointCloud> {
+    ply::read_cloud(bytes)
+}
+
 /// Guesses the unit of a dental scan from its largest bounding box extent
 /// (heuristic ported from the Blender plugin's `fix_units`). A dental arch is
 /// 40-100 mm wide, so an extent of 0.02-0.2 means metres, 2-20 centimetres,
@@ -306,5 +343,29 @@ mod tests {
                 format!("\"{}\"", u.symbol())
             );
         }
+    }
+
+    #[test]
+    fn ply_point_cloud_round_trip() {
+        let cloud = PointCloud {
+            points: vec![
+                glam::Vec3::new(1.0, 2.0, 3.0),
+                glam::Vec3::new(-4.5, 0.25, 9.0),
+            ],
+            normals: Some(vec![glam::Vec3::Z, glam::Vec3::X]),
+            colors: Some(vec![[255, 0, 10], [1, 2, 3]]),
+        };
+        let mut bytes = Vec::new();
+        write_ply_to(&mut bytes, &cloud).unwrap();
+        assert_eq!(read_ply_bytes(&bytes).unwrap(), cloud);
+        let plain = PointCloud::from_points(cloud.points.clone());
+        bytes.clear();
+        write_ply_to(&mut bytes, &plain).unwrap();
+        assert_eq!(read_ply_bytes(&bytes).unwrap(), plain);
+        let bad = PointCloud {
+            normals: Some(vec![]),
+            ..plain
+        };
+        assert!(write_ply_to(&mut Vec::new(), &bad).is_err());
     }
 }

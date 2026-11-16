@@ -258,20 +258,50 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
+/// The `scan.*` commands (3D scanner), as specs for the registry. They are
+/// not part of [`specs`]: a host that keeps its own scan controller (the
+/// desktop app) adds them where it runs them; a [`Session`](crate::Session)
+/// registers them and runs them on its shared controller
+/// ([`Session::scan_controller`](crate::Session::scan_controller)).
+pub fn scan_specs() -> Vec<CommandSpec> {
+    crate::loader();
+    dc_scanner::command_infos()
+        .into_iter()
+        .map(|i| CommandSpec {
+            id: i.id,
+            label_key: i.label_key,
+            doc_key: i.doc_key,
+            params_schema: i.params_schema,
+            run: handled_by_session,
+        })
+        .collect()
+}
+
+/// The command error of a failed scan command: `InvalidParams` is an invalid
+/// call, the others failed (their stable code leads the message).
+pub(crate) fn scan_error(e: dc_scanner::ScanError) -> CommandError {
+    match e {
+        dc_scanner::ScanError::Cancelled => CommandError::Cancelled,
+        dc_scanner::ScanError::InvalidParams(m) => CommandError::Invalid(m),
+        e => CommandError::Failed(format!("{}: {e}", e.code())),
+    }
+}
+
 /// `true` for the built-ins that act on the session rather than on the case
-/// state.
+/// state, including the `scan.*` and `turntable.*` commands.
 pub(crate) fn is_session_command(id: &str) -> bool {
-    matches!(
-        id,
-        PROJECT_NEW
-            | PROJECT_OPEN
-            | PROJECT_SAVE
-            | EDIT_UNDO
-            | EDIT_REDO
-            | STEPS_LIST
-            | STEPS_REWIND
-            | VIEW_SET
-    )
+    dc_scanner::is_scan_command(id)
+        || matches!(
+            id,
+            PROJECT_NEW
+                | PROJECT_OPEN
+                | PROJECT_SAVE
+                | EDIT_UNDO
+                | EDIT_REDO
+                | STEPS_LIST
+                | STEPS_REWIND
+                | VIEW_SET
+        )
 }
 
 pub(crate) fn role_str(role: ScanRole) -> &'static str {

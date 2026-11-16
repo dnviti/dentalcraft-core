@@ -17,6 +17,7 @@ dc-jobs.workspace = true
 dc-mesh.workspace = true
 dc-module-api.workspace = true
 dc-project.workspace = true
+dc-scanner.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
