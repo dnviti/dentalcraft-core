@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0-alpha.3](https://github.com/dnviti-personal-org/dentalcraft-core/compare/v0.3.0-alpha.2...v0.3.0-alpha.3) (2026-11-17)
+
+
+### Features
+
+* add the alpha 3D scanner connector, turntable and BLE link ([#12](https://github.com/dnviti-personal-org/dentalcraft-core/issues/12)) ([143a88b](https://github.com/dnviti-personal-org/dentalcraft-core/commit/143a88bea9477bdf067748414c7395d1781ea3ff))
+
 ## [0.3.0-alpha.2](https://github.com/dnviti-personal-org/dentalcraft-core/compare/v0.3.0-alpha.1...v0.3.0-alpha.2) (2026-11-08)
 
 
