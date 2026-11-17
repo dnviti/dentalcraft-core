@@ -583,3 +583,55 @@ mod tests {
         }
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Range of a block coordinate the 21-bit packing represents (blocks of
+    /// voxels within ±MAX_VOXEL lie well inside it).
+    const LO: i32 = -(1 << 20);
+    const HI: i32 = (1 << 20) - 1;
+
+    fn any_block() -> IVec3 {
+        let b = IVec3::new(kani::any(), kani::any(), kani::any());
+        kani::assume(b.cmpge(IVec3::splat(LO)).all() && b.cmple(IVec3::splat(HI)).all());
+        b
+    }
+
+    // Every block key within ±2^20 packs and unpacks to itself, so the
+    // packed sort and dedup of the meshing keep exactly the input blocks.
+    #[kani::proof]
+    fn pack_round_trips_in_range() {
+        let k = any_block();
+        assert_eq!(unpack(pack(k)), k);
+    }
+
+    // Packed keys sort like the key compared x first, then y, then z, so
+    // distinct keys never share a packed value.
+    #[kani::proof]
+    fn pack_orders_by_x_then_y_then_z() {
+        let (a, b) = (any_block(), any_block());
+        assert_eq!(pack(a).cmp(&pack(b)), (a.x, a.y, a.z).cmp(&(b.x, b.y, b.z)));
+    }
+
+    // Any voxel is its block's origin plus its local coordinate, and its
+    // local index addresses one of the block's voxels.
+    #[kani::proof]
+    fn voxel_splits_into_block_and_local_index() {
+        let g = IVec3::new(kani::any(), kani::any(), kani::any());
+        let i = local_index(g);
+        assert!(i < VOXELS);
+        assert_eq!(block_of(g) * SIDE + local_coords(i), g);
+    }
+
+    // Every local index of a block maps to a local coordinate and back.
+    #[kani::proof]
+    fn local_index_round_trips() {
+        let i: usize = kani::any();
+        kani::assume(i < VOXELS);
+        let l = local_coords(i);
+        assert!(l.cmpge(IVec3::ZERO).all() && l.cmplt(IVec3::splat(SIDE)).all());
+        assert_eq!(local_index(l), i);
+    }
+}

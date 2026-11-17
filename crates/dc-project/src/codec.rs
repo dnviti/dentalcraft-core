@@ -121,3 +121,29 @@ impl ModuleCodecs {
         self.codecs.get(id)
     }
 }
+
+/// Needs `-Z stubbing` (set in the workspace `[workspace.metadata.kani]`).
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Stand-in for `format!`: the harness checks that an error comes back,
+    /// never its message, and formatting symbolic integers keeps CBMC busy
+    /// for tens of minutes.
+    fn no_format(_: std::fmt::Arguments<'_>) -> String {
+        String::new()
+    }
+
+    // Data newer than the codec is refused, never decoded.
+    #[kani::proof]
+    #[kani::stub(std::fmt::format, no_format)]
+    #[kani::unwind(5)]
+    fn load_refuses_newer_schema() {
+        let current: u32 = kani::any();
+        let from: u32 = kani::any();
+        kani::assume(from > current);
+        let codec =
+            ModuleCodec::new(current, |_| Err(String::new())).with_migration(current, |_| Ok(()));
+        assert!(codec.load(Value::Null, from).is_err());
+    }
+}
