@@ -1,0 +1,38 @@
+[package]
+name = "dc-scanner"
+description = "3D scanner acquisition: device backends (simulated, hardware), live tracking and TSDF fusion, point-cloud and mesh editing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+dc-geom.workspace = true
+dc-mesh.workspace = true
+dc-turntable.workspace = true
+glam.workspace = true
+rayon.workspace = true
+libloading.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nusb.workspace = true
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# The workspace lints, except `unsafe_code`: denied here instead of forbidden,
+# so that only `revopoint_sdk` (run-time loaded vendor SDK, FFI) can allow it.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -16,6 +16,10 @@ fn session_keys_resolve_without_a_session() {
         assert_ne!(dc_i18n::tr(s.label_key), s.label_key, "{}", s.id);
         assert_ne!(dc_i18n::tr(s.doc_key), s.doc_key, "{}", s.id);
     }
+    for s in dc_session::builtins::scan_specs() {
+        assert_ne!(dc_i18n::tr(s.label_key), s.label_key, "{}", s.id);
+        assert_ne!(dc_i18n::tr(s.doc_key), s.doc_key, "{}", s.id);
+    }
     let spec = |id: &str| -> &CommandSpec { specs.iter().find(|s| s.id == id).unwrap() };
     let state = CaseState::new(Case::new("T"));
     let ctx = JobCtx::detached();

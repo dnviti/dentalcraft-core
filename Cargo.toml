@@ -26,6 +26,9 @@ dc-theme = { path = "crates/dc-theme" }
 dc-session = { path = "crates/dc-session" }
 dc-mcp = { path = "crates/dc-mcp" }
 dc-raster = { path = "crates/dc-raster" }
+dc-scanner = { path = "crates/dc-scanner" }
+dc-ble = { path = "crates/dc-ble" }
+dc-turntable = { path = "crates/dc-turntable" }
 
 # GUI: egui, eframe and egui-wgpu must always share the same version
 egui = { version = "=0.37.0", default-features = false, features = ["default_fonts"] }
@@ -43,6 +46,17 @@ uuid = { version = "1.29.0", features = ["v4", "serde"] }
 
 # concurrency
 rayon = "1.12.0"
+
+# run-time loading of optional vendor SDKs (never linked)
+libloading = "0.8.9"
+
+# scanner USB video on Linux: device discovery, V4L2 ioctls (pure Rust, no libc/libusb)
+nusb = "0.2.9"
+rustix = { version = "1.1.6", features = ["fs", "mm", "event"] }
+
+# Bluetooth LE (blocking, pure Rust): BlueZ over D-Bus on Linux, WinRT on Windows
+zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
+windows = "0.62.2"
 
 # geometry: linear algebra (SVD, eigen) and k-d tree nearest neighbours
 nalgebra = "0.35.0"

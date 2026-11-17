@@ -1,0 +1,22 @@
+[package]
+name = "dc-turntable"
+description = "Motorised turntables for scanning rigs: generic device trait, simulated table, Revopoint Dual-axis Turntable over Bluetooth LE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+dc-ble.workspace = true
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

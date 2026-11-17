@@ -26,13 +26,14 @@ pub mod builtins;
 mod inspect;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dc_case::{Case, CaseState};
 use dc_command::{CommandError, JobCtx, StepError, StepGraph, StepHistory, UndoStack};
 use dc_module_api::{CommandSpec, Module, ModuleCodecs, ModuleError, ModuleRegistry};
 use dc_project::{AppInfo, DcprjError, LoadOutcome, Manifest, Project};
+use dc_scanner::ScanController;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
@@ -148,6 +149,7 @@ pub struct Session {
     load_issues: Vec<String>,
     view: Map<String, Value>,
     app: AppInfo,
+    scan: LazyLock<Arc<Mutex<ScanController>>>,
 }
 
 impl Default for Session {
@@ -165,6 +167,7 @@ impl Session {
             modules: ModuleRegistry::new(),
             specs: builtins::specs()
                 .into_iter()
+                .chain(builtins::scan_specs())
                 .map(|s| (SESSION_SOURCE, s))
                 .collect(),
             undo: UndoStack::new(state.clone(), UndoStack::DEFAULT_BUDGET),
@@ -181,6 +184,7 @@ impl Session {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 commit: option_env!("DC_GIT_COMMIT").unwrap_or("dev").to_owned(),
             },
+            scan: LazyLock::new(|| Arc::new(Mutex::new(ScanController::new()))),
         }
     }
 
@@ -334,7 +338,7 @@ impl Session {
             .find(id)
             .ok_or_else(|| SessionError::UnknownCommand(id.to_owned()))?;
         if builtins::is_session_command(id) {
-            return self.run_session_command(id, &params);
+            return self.run_session_command(id, &params, ctx);
         }
         let (next, out) = spec
             .execute(self.undo.current(), &params, ctx)
@@ -376,11 +380,14 @@ impl Session {
         self.undo.redo().is_some()
     }
 
-    fn run_session_command(&mut self, id: &str, params: &Value) -> Result<Value> {
+    fn run_session_command(&mut self, id: &str, params: &Value, ctx: &JobCtx) -> Result<Value> {
         let invalid = |source| SessionError::Command {
             id: id.to_owned(),
             source,
         };
+        if dc_scanner::is_scan_command(id) {
+            return self.run_scan_command(id, params, ctx);
+        }
         match id {
             builtins::PROJECT_NEW => {
                 let p: NewParams = parse_params(params).map_err(invalid)?;
@@ -449,6 +456,67 @@ impl Session {
             }
             _ => Err(SessionError::UnknownCommand(id.to_owned())),
         }
+    }
+
+    // ------------------------------------------------------------ scanner
+
+    /// The scan controller behind the `scan.*` commands, created on first
+    /// use. It is shared (`Arc<Mutex<_>>`) so that the app can keep it while
+    /// the scan popup is open (live preview, buttons) and run the `scan.*`
+    /// commands of the CLI / MCP bridge against the same device and scan.
+    /// Lock it briefly: the slow commands (`scan.mesh-build`, `scan.stop`)
+    /// hold the lock until they finish, so a UI thread should `try_lock`.
+    pub fn scan_controller(&self) -> Arc<Mutex<ScanController>> {
+        Arc::clone(&self.scan)
+    }
+
+    /// Runs a `scan.*` or `turntable.*` command: `scan.import` here (it
+    /// needs the case), `turntable.devices` without the controller (its
+    /// Bluetooth discovery blocks), the others on the scan controller.
+    fn run_scan_command(&mut self, id: &str, params: &Value, ctx: &JobCtx) -> Result<Value> {
+        let fail = |e: dc_scanner::ScanError| SessionError::Command {
+            id: id.to_owned(),
+            source: builtins::scan_error(e),
+        };
+        if id == dc_scanner::control::TURNTABLE_DEVICES {
+            return dc_scanner::rig::turntable_devices(params).map_err(fail);
+        }
+        if id != dc_scanner::SCAN_IMPORT {
+            let controller = self.scan_controller();
+            let mut c = controller.lock().unwrap_or_else(PoisonError::into_inner);
+            return c.execute(id, params, &|| ctx.is_cancelled()).map_err(fail);
+        }
+        let role = dc_scanner::import_role(params).map_err(fail)?;
+        // the module's own import (it recognises the arch from the geometry)
+        // when it has one, the core's otherwise; like the app and the MCP
+        let import_id = self
+            .specs
+            .iter()
+            .filter(|(src, _)| self.source_enabled(src))
+            .map(|(_, s)| s.id)
+            .find(|id| dc_module_api::is_import_scans_command(id))
+            .unwrap_or(builtins::CASE_IMPORT);
+        let io_error = |e: std::io::Error| SessionError::Command {
+            id: id.to_owned(),
+            source: CommandError::Failed(e.to_string()),
+        };
+        let dir = std::env::temp_dir().join(format!("dentalcraft-scan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).map_err(io_error)?;
+        let result = (|| {
+            let path = {
+                let controller = self.scan_controller();
+                let c = controller.lock().unwrap_or_else(PoisonError::into_inner);
+                c.export_mesh_for_import(&dir, role).map_err(fail)?
+            };
+            let mut p = json!({ "path": path.display().to_string() });
+            if let Some(role) = role {
+                p["role"] = json!(role);
+            }
+            self.execute_with(import_id, p, ctx)
+        })();
+        // best effort: the import already copied the mesh into the case
+        let _ = std::fs::remove_dir_all(&dir);
+        result
     }
 
     // ------------------------------------------------------------ project

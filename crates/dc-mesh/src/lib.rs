@@ -9,8 +9,12 @@
 //! loops, connected components), a validation report ([`ValidationReport`]),
 //! the canonical `DCM1` blob encoding ([`dcm`]) and the mesh file I/O
 //! readers and writers ([`io`]: STL, OBJ, PLY, unit detection).
+//! [`PointCloud`] is the scanner's point set (positions with optional
+//! normals and colours), saved and loaded as PLY by [`io::write_ply`] /
+//! [`io::read_ply`].
 
 pub mod cleanup;
+pub mod cloud;
 pub mod dcm;
 pub mod io;
 mod topology;
@@ -19,6 +23,7 @@ mod validate;
 use glam::Vec3;
 
 pub use cleanup::{BadFaceReport, remove_bad_faces, rotate_y_up_to_z_up};
+pub use cloud::PointCloud;
 pub use io::{MeshFormat, ScanFile, Units, read_scan};
 pub use topology::{EdgeAdjacency, EdgeKey};
 pub use validate::ValidationReport;

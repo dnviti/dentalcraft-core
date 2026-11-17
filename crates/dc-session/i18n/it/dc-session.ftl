@@ -22,6 +22,66 @@ session-cmd-steps-rewind-doc = Torna allo stato immediatamente precedente a un p
 session-cmd-view-set = Imposta vista
 session-cmd-view-set-doc = Memorizza i parametri di vista per il renderer (ad es. preset, width, height, visible, model scan|teeth, stage). Le chiavi impostate a null vengono rimosse. Non modifica il caso.
 
+# Comandi dello scanner 3D (scan.*), alpha.
+scan-cmd-devices = Elenca scanner
+scan-cmd-devices-doc = Elenca gli scanner 3D collegati di ogni backend (backend, id, nome, numero di serie) e lo stato di ciascun backend (available, con un error_code quando non è utilizzabile, ad esempio sdk-missing). Il backend dello scanner simulato sim è sempre disponibile.
+scan-cmd-connect = Collega scanner
+scan-cmd-connect-doc = Collega uno scanner. Parametri (tutti facoltativi): backend (revopoint-usb: un Revopoint MINI 2 via USB, Linux, senza SDK; revopoint-sdk: tramite l'SDK Revopoint installato dall'utente; sim: lo scanner simulato), device (id preso dall'elenco degli scanner). Senza parametri si usa il primo scanner hardware trovato, altrimenti il typodont superiore simulato. options (solo backend sim) regola il dispositivo simulato: realtime, frames (si ferma dopo questi fotogrammi), width, height, fps, noise_mm, dropout, period_frames, seed.
+scan-cmd-disconnect = Scollega scanner
+scan-cmd-disconnect-doc = Termina l'acquisizione, scarta la scansione in corso e chiude lo scanner. La scansione già fermata e modificata resta disponibile.
+scan-cmd-start = Avvia scansione
+scan-cmd-start-doc = Avvia l'acquisizione, oppure riprende la scansione fermata. I fotogrammi vengono tracciati e fusi nella nuvola di punti in tempo reale.
+scan-cmd-pause = Metti in pausa la scansione
+scan-cmd-pause-doc = Smette di fondere i fotogrammi; il tracciamento continua, così si può riposizionare lo scanner e riprendere la scansione.
+scan-cmd-resume = Riprendi scansione
+scan-cmd-resume-doc = Riprende la fusione dei fotogrammi dopo una pausa.
+scan-cmd-stop = Ferma scansione
+scan-cmd-stop-doc = Termina l'acquisizione. La nuvola di punti fusa diventa la scansione da pulire, trasformare in mesh e importare. Restituisce il numero di punti.
+scan-cmd-reset = Azzera scansione
+scan-cmd-reset-doc = Scarta la scansione acquisita e le sue modifiche; lo scanner resta collegato.
+scan-cmd-status = Stato della scansione
+scan-cmd-status-doc = Restituisce lo stato dell'acquisizione (state, device, frames, fused_frames, tracking_lost, tracking_ok, points, fps, error, world_angles_deg: gli angoli di rotazione e inclinazione della piattaforma girevole quando è stato fissato il sistema di riferimento), auto (avanzamento dell'ultima scansione automatica con piattaforma: state, step, steps, tilt_deg, error, oppure null) e, a scansione ferma, la scansione modificabile (points, mesh_vertices, mesh_faces, can_undo, can_redo).
+scan-cmd-settings = Impostazioni di scansione
+scan-cmd-settings-doc = Imposta e restituisce le impostazioni di acquisizione. Parametri (tutti facoltativi, applicati quando la scansione non è in corso): live_voxel_mm (da 0,05 a 5), min_depth_mm, max_depth_mm, exposure_us (0 per l'esposizione automatica), roi_radius_mm (da 5 a 200, predefinito 45) e roi_height_mm (da 5 a 300, predefinito 60): il cilindro attorno all'asse della piattaforma a cui vengono ritagliati i fotogrammi quando è in uso una calibrazione della piattaforma, use_roi (predefinito true).
+scan-cmd-cloud = Modifica nuvola di punti
+scan-cmd-cloud-doc = Applica una modifica alla nuvola di punti della scansione fermata, annullabile con scan.undo. Il parametro op è un oggetto con il campo op: downsample (voxel_mm), remove-statistical (k, std_ratio), remove-radius (radius_mm, min_neighbors), isolate (radius_mm), smooth (k, iterations, strength), delete-aabb (min, max), delete-sphere (center, radius_mm), delete-plane (point, normal), delete-indices (indices), estimate-normals (k). Una modifica alla nuvola elimina la mesh.
+scan-cmd-mesh-build = Crea mesh
+scan-cmd-mesh-build-doc = Crea la mesh dalla nuvola di punti. Parametro: resolution_mm (da 0,05 a 5; più è piccolo, più è fine e pesante). Restituisce il numero di vertici e di facce.
+scan-cmd-mesh = Ripara mesh
+scan-cmd-mesh-doc = Applica una riparazione alla mesh, annullabile con scan.undo. Il parametro op è un oggetto con il campo op: fill-holes (max_edges), smooth (iterations, lambda, mu), remove-islands (min_fraction), decimate (ratio).
+scan-cmd-undo = Annulla modifica della scansione
+scan-cmd-undo-doc = Annulla l'ultima modifica alla nuvola di punti o alla mesh della scansione. Non tocca il caso.
+scan-cmd-redo = Ripristina modifica della scansione
+scan-cmd-redo-doc = Riapplica l'ultima modifica annullata alla nuvola di punti o alla mesh della scansione.
+scan-cmd-export = Esporta scansione
+scan-cmd-export-doc = Scrive la scansione su file. Parametri: path, what (cloud: nuvola di punti PLY; mesh: STL, PLY od OBJ secondo l'estensione di path, PLY per qualsiasi altra).
+scan-cmd-import = Importa scansione nel caso
+scan-cmd-import-doc = Importa la mesh della scansione nel caso come passaggio annullabile, come un file importato. Parametro: role (upper, lower o bite; facoltativo). Usa il comando di importazione del modulo attivo se ne ha uno, altrimenti case.import. Serve una mesh: va creata prima.
+scan-cmd-auto = Scansione automatica con piattaforma
+scan-cmd-auto-doc = Scansiona in automatico, in background, l'oggetto sulla piattaforma girevole: per ogni inclinazione la piattaforma si inclina, attende settle_s, poi ruota di rotation_deg mentre i fotogrammi vengono fusi. Servono uno scanner e una piattaforma collegati e una calibrazione della piattaforma che corrisponda a entrambi (turntable.calibrate): i fotogrammi vengono ritagliati attorno alla piattaforma e gli angoli della piattaforma guidano il tracciamento. Senza calibrazione fallisce con rig-uncalibrated, a meno che allow_uncalibrated sia true: in quel caso non si ritaglia nulla, quindi va usato solo quando lo sfondo è oltre il campo di profondità. Parametri (tutti facoltativi): tilts_deg (predefinito [-20, 0, 20]), rotation_deg (predefinito 360), deg_per_s (velocità di rotazione), settle_s (predefinito 0,5), allow_uncalibrated (predefinito false). Risponde subito con started e steps; l'avanzamento si segue con scan.status (auto). scan.pause e scan.resume la mettono in pausa e la riprendono, scan.stop la termina; al termine la scansione resta in pausa, pronta per scan.stop.
+
+# Comandi della piattaforma girevole (turntable.*), alpha.
+turntable-cmd-devices = Elenca piattaforme girevoli
+turntable-cmd-devices-doc = Cerca piattaforme girevoli via Bluetooth per timeout_s secondi (da 0 a 30, predefinito 3; con 0 non cerca) e le elenca (backend, id, nome) con lo stato di ciascun backend (available, con un error_code quando non è utilizzabile, ad esempio ble-no-adapter). La piattaforma simulata del backend sim è sempre elencata.
+turntable-cmd-connect = Collega piattaforma girevole
+turntable-cmd-connect-doc = Collega una piattaforma girevole. Parametri (tutti facoltativi): backend (revopoint-ble: la Revopoint Dual-axis Turntable via Bluetooth; sim: la piattaforma simulata, che lo scanner simulato vede ruotare), device (id preso dall'elenco delle piattaforme). Senza parametri si usa la prima piattaforma trovata via Bluetooth, altrimenti quella simulata. options (solo backend sim): fast (completa subito i movimenti quando nessuno scanner simulato li scandisce). Restituisce la piattaforma, i suoi assi e se è in uso una calibrazione corrispondente.
+turntable-cmd-disconnect = Scollega piattaforma girevole
+turntable-cmd-disconnect-doc = Ferma la scansione automatica o la calibrazione in corso e chiude la piattaforma. La regione di interesse e la previsione del movimento della calibrazione non vengono più applicate.
+turntable-cmd-move = Muovi piattaforma girevole
+turntable-cmd-move-doc = Muove un asse della piattaforma. Parametri: axis (rotate o tilt) ed esattamente uno tra by_deg (relativo, con segno) e to_deg (assoluto; l'inclinazione va di solito da -30 a 30). Risponde appena la piattaforma accetta il comando; busy nello stato resta true finché il movimento non finisce. Rifiutato durante una scansione automatica o una calibrazione.
+turntable-cmd-speed = Velocità della piattaforma girevole
+turntable-cmd-speed-doc = Imposta la velocità di un asse. Parametri: axis (rotate o tilt), deg_per_s (gradi al secondo; la piattaforma la limita al proprio intervallo, quella Revopoint ruota da 4 a 20 gradi al secondo).
+turntable-cmd-stop = Ferma piattaforma girevole
+turntable-cmd-stop-doc = Ferma subito tutti gli assi, e la scansione automatica o la calibrazione in corso.
+turntable-cmd-home = Riporta la piattaforma a zero
+turntable-cmd-home-doc = Riporta a zero la rotazione e l'inclinazione. Risponde appena la piattaforma accetta il comando.
+turntable-cmd-status = Stato della piattaforma girevole
+turntable-cmd-status-doc = Restituisce connected, info, axes (tipo, intervallo, riscontro di posizione), rotate_deg e tilt_deg (stimati dai comandi e dalle letture), busy (un movimento o un'operazione è in corso), calibrated (è in uso una calibrazione corrispondente a questo scanner e a questa piattaforma) e calibration_job (avanzamento dell'ultima calibrazione: state, step, steps, error).
+turntable-cmd-calibrate = Calibra piattaforma girevole
+turntable-cmd-calibrate-doc = Misura gli assi della piattaforma visti dallo scanner fisso, senza strumenti: metti un oggetto fermo sulla piattaforma, collega scanner e piattaforma e non spostarli. Lavora in background: la piattaforma fa prima un giro per riconoscere lo sfondo fisso, poi un altro giro a passi mentre lo scanner traccia l'oggetto, poi si inclina nei due sensi; gli assi vengono ricavati dalle pose tracciate e salvati. Parametri (tutti facoltativi): steps (da 3 a 36, predefinito 8), step_deg (da 5 a 120, predefinito 45; da 180 a 1080 gradi in tutto). Risponde subito; l'avanzamento si segue con turntable.status (calibration_job), il risultato si legge con turntable.calibration. La scansione acquisita durante la calibrazione viene scartata.
+turntable-cmd-calibration = Calibrazione della piattaforma girevole
+turntable-cmd-calibration-doc = Restituisce la calibrazione salvata della piattaforma, oppure null: axis_point, axis_dir, platter_up, tilt_axis_point, tilt_axis_dir (sistema della camera dello scanner, millimetri), scanner_serial, turntable_id, created, fit_rms_deg, fit_rms_mm.
+
 # Usato dai messaggi qui sotto: legge il loro $role (upper, lower, bite).
 session-role = { $role ->
     [upper] arcata superiore

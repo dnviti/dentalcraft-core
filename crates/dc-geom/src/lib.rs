@@ -2,21 +2,32 @@
 //!
 //! Every kernel lives in its own module and is reached through a
 //! [`Backend`], so that a GPU implementation can replace the CPU one later
-//! (WP36). In this version all kernels are contracts only: they return
-//! [`GeomError::NotImplemented`] until their work package lands
-//! (BVH WP13, ICP WP14, QEM WP15, hole filling WP16, sparse/harmonic WP17,
-//! SDF WP18). [`metrics`] holds the comparison measures used by the golden
-//! tests (Hausdorff distance, label agreement).
+//! (WP36): BVH ([`bvh`]), nearest neighbours ([`knn`]), ICP ([`icp`]), QEM
+//! decimation ([`qem`]), hole filling ([`holefill`]), sparse solvers
+//! ([`sparse`]), signed distance fields ([`sdf`]). [`metrics`] holds the
+//! comparison measures used by the golden tests (Hausdorff distance, label
+//! agreement).
+//!
+//! The 3D scanner pipeline uses [`tsdf`] (depth frame fusion, raycast,
+//! extraction), [`cloud`] (point cloud filters, normals, selections),
+//! [`meshing`] (oriented point cloud to open mesh) and [`repair`] (island
+//! removal, Taubin smoothing); [`tsdf`] and [`meshing`] share one sparse
+//! marching cubes implementation.
 
 pub mod bvh;
+pub mod cloud;
 pub mod cotan;
 pub mod holefill;
 pub mod icp;
 pub mod knn;
+mod mc;
+pub mod meshing;
 pub mod metrics;
 pub mod qem;
+pub mod repair;
 pub mod sdf;
 pub mod sparse;
+pub mod tsdf;
 
 /// Errors produced by geometry kernels.
 #[derive(Debug, thiserror::Error)]
@@ -79,12 +90,10 @@ mod tests {
     }
 
     #[test]
-    fn stubs_report_not_implemented() {
+    fn empty_inputs_are_handled() {
         let m = dc_mesh::TriMesh::default();
-        assert!(matches!(
-            holefill::fill_holes(&m, &holefill::HoleFillParams::default()),
-            Err(GeomError::NotImplemented(_))
-        ));
+        let (out, filled) = holefill::fill_holes(&m, &holefill::HoleFillParams::default()).unwrap();
+        assert_eq!((out, filled), (m, 0));
         let a = sparse::CsrMatrix::identity(2);
         assert_eq!(
             sparse::pcg_solve(&a, &[1.0, 1.0], &sparse::PcgParams::default()).unwrap(),

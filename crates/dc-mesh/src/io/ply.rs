@@ -5,7 +5,7 @@ use std::io::Write;
 use glam::Vec3;
 
 use super::bad;
-use crate::{Result, TriMesh};
+use crate::{PointCloud, Result, TriMesh};
 
 const FMT: &str = "PLY";
 
@@ -430,4 +430,50 @@ pub(super) fn write(w: &mut impl Write, mesh: &TriMesh) -> Result<()> {
         w.write_all(&rec)?;
     }
     Ok(())
+}
+
+/// Writes a point cloud as binary little endian PLY (`x y z [nx ny nz]
+/// [red green blue]`, no face element).
+pub(super) fn write_cloud(w: &mut impl Write, cloud: &PointCloud) -> Result<()> {
+    let mut h = String::from("ply\nformat binary_little_endian 1.0\ncomment dc-mesh\n");
+    h += &format!("element vertex {}\n", cloud.points.len());
+    h += "property float x\nproperty float y\nproperty float z\n";
+    if cloud.normals.is_some() {
+        h += "property float nx\nproperty float ny\nproperty float nz\n";
+    }
+    if cloud.colors.is_some() {
+        h += "property uchar red\nproperty uchar green\nproperty uchar blue\n";
+    }
+    h += "end_header\n";
+    w.write_all(h.as_bytes())?;
+    let mut rec = Vec::with_capacity(27);
+    for (i, p) in cloud.points.iter().enumerate() {
+        rec.clear();
+        for x in p.to_array() {
+            rec.extend_from_slice(&x.to_le_bytes());
+        }
+        if let Some(n) = &cloud.normals {
+            for x in n[i].to_array() {
+                rec.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        if let Some(c) = &cloud.colors {
+            rec.extend_from_slice(&c[i]);
+        }
+        w.write_all(&rec)?;
+    }
+    Ok(())
+}
+
+/// Reads the vertex element of a PLY file (any encoding) as a point cloud;
+/// faces, if any, are ignored.
+pub(super) fn read_cloud(bytes: &[u8]) -> Result<PointCloud> {
+    let mesh = read(bytes)?;
+    Ok(PointCloud {
+        points: mesh.positions,
+        normals: mesh.normals,
+        colors: mesh
+            .vertex_colors
+            .map(|c| c.into_iter().map(|[r, g, b, _]| [r, g, b]).collect()),
+    })
 }
