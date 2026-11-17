@@ -345,3 +345,60 @@ mod tests {
         assert_eq!(local_coord(t[0].trailing_zeros() as usize), IVec3::ZERO);
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use crate::sdf::store::MAX_BLOCK;
+
+    /// Largest domain edge in blocks (keeps the division checks small).
+    const MAX_DIM: i32 = 8;
+
+    /// Domain whose low corner is that of stored blocks (within
+    /// ±(MAX_BLOCK + 1), margin included) and whose edges hold up to
+    /// `MAX_DIM` blocks. `index` and `block` never read `cells`.
+    fn any_domain() -> Domain {
+        let lo = IVec3::new(kani::any(), kani::any(), kani::any());
+        let dims = IVec3::new(kani::any(), kani::any(), kani::any());
+        let r = IVec3::splat(MAX_BLOCK + 1);
+        kani::assume(lo.cmpge(-r).all() && lo.cmple(r).all());
+        kani::assume(dims.cmpge(IVec3::ONE).all() && dims.cmple(IVec3::splat(MAX_DIM)).all());
+        Domain {
+            lo,
+            dims,
+            cells: Vec::new(),
+        }
+    }
+
+    fn cell_count(d: &Domain) -> usize {
+        (d.dims.x * d.dims.y * d.dims.z) as usize
+    }
+
+    // The block of any voxel (any `i32` coordinates) is inside the domain
+    // exactly when `index` finds it, at a cell index below the cell count
+    // that maps back to the same block.
+    #[kani::proof]
+    fn domain_index_then_block_is_identity() {
+        let d = any_domain();
+        let g = IVec3::new(kani::any(), kani::any(), kani::any());
+        let b = crate::sdf::store::block_of(g);
+        let inside = b.cmpge(d.lo).all() && b.cmplt(d.lo + d.dims).all();
+        match d.index(b) {
+            Some(c) => {
+                assert!(inside);
+                assert!(c < cell_count(&d));
+                assert_eq!(d.block(c), b);
+            }
+            None => assert!(!inside),
+        }
+    }
+
+    // Every cell index of the domain is the index of its own block.
+    #[kani::proof]
+    fn domain_block_then_index_is_identity() {
+        let d = any_domain();
+        let c: usize = kani::any();
+        kani::assume(c < cell_count(&d));
+        assert_eq!(d.index(d.block(c)), Some(c));
+    }
+}

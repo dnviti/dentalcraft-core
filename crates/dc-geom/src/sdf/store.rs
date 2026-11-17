@@ -220,3 +220,64 @@ mod tests {
         assert_eq!(signed(0.25, false), 0.25);
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Range of a block coordinate the 21-bit packing represents.
+    const LO: i32 = -(1 << 20);
+    const HI: i32 = (1 << 20) - 1;
+
+    fn any_block() -> IVec3 {
+        let b = IVec3::new(kani::any(), kani::any(), kani::any());
+        kani::assume(b.cmpge(IVec3::splat(LO)).all() && b.cmple(IVec3::splat(HI)).all());
+        b
+    }
+
+    // Every block coordinate within ±2^20 (a superset of ±MAX_BLOCK) packs
+    // and unpacks to itself.
+    #[kani::proof]
+    fn pack_round_trips_in_range() {
+        let b = any_block();
+        assert_eq!(unpack(pack(b)), b);
+    }
+
+    // Packed keys sort like the coordinates compared z first, then y, then
+    // x: the storage order that `Store::new` and `sort_keys` rely on (and
+    // distinct blocks never share a key).
+    #[kani::proof]
+    fn pack_orders_by_z_then_y_then_x() {
+        let (a, b) = (any_block(), any_block());
+        assert_eq!(pack(a).cmp(&pack(b)), (a.z, a.y, a.x).cmp(&(b.z, b.y, b.x)));
+    }
+
+    // Any voxel is its block's origin plus its local coordinate, and its
+    // local index addresses one of the block's voxels.
+    #[kani::proof]
+    fn voxel_splits_into_block_and_local_index() {
+        let g = IVec3::new(kani::any(), kani::any(), kani::any());
+        let i = local_of(g);
+        assert!(i < VOXELS);
+        assert_eq!(local_coord(i), g & IVec3::splat(SIDE - 1));
+        assert_eq!(block_of(g) * SIDE + local_coord(i), g);
+    }
+
+    // Every local index of a block maps to a local coordinate and back.
+    #[kani::proof]
+    fn local_index_round_trips() {
+        let i: usize = kani::any();
+        kani::assume(i < VOXELS);
+        let l = local_coord(i);
+        assert!(l.cmpge(IVec3::ZERO).all() && l.cmplt(IVec3::splat(SIDE)).all());
+        assert_eq!(local_of(l), i);
+    }
+
+    // A voxel on the inside always reads as inside (strictly negative), for
+    // any distance, zero and NaN included.
+    #[kani::proof]
+    fn inside_is_always_negative() {
+        let d: f32 = kani::any();
+        assert!(signed(d, true) < 0.0);
+    }
+}

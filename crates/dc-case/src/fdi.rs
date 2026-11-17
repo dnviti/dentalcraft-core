@@ -168,3 +168,89 @@ mod tests {
         assert_eq!(serde_json::from_str::<Fdi>("47").unwrap().get(), 47);
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Valid FDI numbers written out, independently of `valid`.
+    fn in_spec(n: u8) -> bool {
+        matches!(
+            n,
+            11..=18
+                | 21..=28
+                | 31..=38
+                | 41..=48
+                | 51..=55
+                | 61..=65
+                | 71..=75
+                | 81..=85
+        )
+    }
+
+    fn any_fdi() -> Fdi {
+        let n: u8 = kani::any();
+        let f = Fdi::new(n);
+        kani::assume(f.is_ok());
+        f.unwrap()
+    }
+
+    // `Fdi::new` accepts exactly the ISO 3950 numbers (permanent 11–48,
+    // deciduous 51–85), and an accepted number keeps its value and digits.
+    #[kani::proof]
+    fn new_accepts_exactly_iso_numbers() {
+        let n: u8 = kani::any();
+        let f = Fdi::new(n);
+        assert_eq!(f.is_ok(), in_spec(n));
+        if let Ok(f) = f {
+            assert_eq!(f.get(), n);
+            assert_eq!(f.quadrant() * 10 + f.position(), n);
+            assert!((1..=8).contains(&f.quadrant()));
+            assert!(f.position() >= 1);
+            assert_eq!(Fdi::try_from(n).ok(), Some(f));
+        }
+    }
+
+    // The mirror of a valid tooth is a different valid tooth, and mirroring
+    // twice gives the original tooth back.
+    #[kani::proof]
+    fn mirror_is_valid_involution() {
+        let f = any_fdi();
+        let m = f.mirror();
+        assert!(in_spec(m.get()));
+        assert_ne!(m, f);
+        assert_eq!(m.mirror(), f);
+    }
+
+    // Mirroring keeps the arch, the dentition and the position and flips the
+    // side of the midline.
+    #[kani::proof]
+    fn mirror_keeps_arch_and_flips_side() {
+        let f = any_fdi();
+        let m = f.mirror();
+        assert_eq!(m.is_upper(), f.is_upper());
+        assert_eq!(m.is_permanent(), f.is_permanent());
+        assert_eq!(m.position(), f.position());
+        assert_ne!(m.is_right(), f.is_right());
+    }
+
+    // `permanent_arch(upper)` lists 16 distinct valid permanent teeth, all of
+    // that arch. (Distinctness via a bit set: comparing every pair takes
+    // minutes.)
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn permanent_arch_is_the_16_teeth_of_the_arch() {
+        let upper: bool = kani::any();
+        let mut seen = 0u128;
+        let mut count = 0;
+        for f in Fdi::permanent_arch(upper) {
+            assert!(in_spec(f.get()));
+            assert!(f.is_permanent());
+            assert_eq!(f.is_upper(), upper);
+            assert_eq!(seen & (1 << f.get()), 0);
+            seen |= 1 << f.get();
+            count += 1;
+        }
+        assert_eq!(count, 16);
+    }
+}

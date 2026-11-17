@@ -1137,3 +1137,57 @@ fn segment_dist2(p: DVec3, a: DVec3, b: DVec3) -> f64 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Queue entry with a valid key cost (finite, sign bit clear), a stamp
+    /// sum within its 30 bits and a placement code below 4.
+    fn any_entry() -> Entry {
+        let e = Entry {
+            cost: kani::any(),
+            a: kani::any(),
+            b: kani::any(),
+            stamps: kani::any(),
+            alt: kani::any(),
+        };
+        kani::assume(e.cost.is_finite() && e.cost.is_sign_positive());
+        kani::assume(e.stamps <= STAMP_MASK && e.alt < 4);
+        e
+    }
+
+    // A queue entry unpacks to the entry that was packed.
+    #[kani::proof]
+    fn entry_pack_round_trips() {
+        let e = any_entry();
+        let u = Entry::unpack(e.pack());
+        assert_eq!(u.cost.to_bits(), e.cost.to_bits());
+        assert_eq!((u.a, u.b, u.stamps, u.alt), (e.a, e.b, e.stamps, e.alt));
+    }
+
+    // The integer order of packed entries is the queue order: cost first,
+    // then vertex `a`, vertex `b`, stamp sum and placement.
+    #[kani::proof]
+    fn entry_pack_orders_by_cost_then_fields() {
+        let (x, y) = (any_entry(), any_entry());
+        let fields = |e: &Entry| (e.a, e.b, e.stamps, e.alt);
+        let expected = x
+            .cost
+            .partial_cmp(&y.cost)
+            .unwrap()
+            .then(fields(&x).cmp(&fields(&y)));
+        assert_eq!(x.pack().cmp(&y.pack()), expected);
+    }
+
+    // Any collapse cost, NaN and infinities included, becomes a valid queue
+    // key: finite, not negative and with the sign bit clear (a set sign bit
+    // would sort the entry after every other one).
+    #[kani::proof]
+    fn key_cost_is_a_valid_queue_key() {
+        let k = key_cost(kani::any());
+        assert!(k.is_finite());
+        assert!(k >= 0.0);
+        assert!(k.is_sign_positive());
+    }
+}
