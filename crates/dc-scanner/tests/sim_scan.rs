@@ -23,7 +23,7 @@ fn options() -> SimOptions {
 }
 
 /// Scans the upper typodont; returns the cloud and the world-to-model
-/// transform (world = camera of the first frame).
+/// transform (world = camera of the first frame turned Z-up).
 fn scan() -> (PointCloud, Affine3A) {
     let backend = SimBackend::new(options());
     let mut session = ScanSession::new(ScanSettings::default());
@@ -43,8 +43,21 @@ fn scan() -> (PointCloud, Affine3A) {
     assert!(status.error.is_none(), "{status:?}");
     assert!(status.tracking_lost <= 2, "{status:?}");
     assert!(status.fused_frames >= FRAMES - 2, "{status:?}");
+    // without a rig the world is the first camera frame with +Z its up
+    assert!(!status.rig_world, "{status:?}");
+    let to_world = Affine3A::from_cols_array(&status.world_from_camera.unwrap());
+    assert_eq!(to_world, dc_scanner::rig::camera_world());
+    assert_eq!(
+        to_world.transform_vector3(Vec3::NEG_Y),
+        Vec3::Z,
+        "camera up"
+    );
+    assert_eq!(status.scanner_deg, Some([0.0, 0.0]));
     let bounds = sim::typodont_arch(true).aabb().unwrap();
-    (cloud, sim::camera_pose(&bounds, 0, &options()))
+    (
+        cloud,
+        sim::camera_pose(&bounds, 0, &options()) * to_world.inverse(),
+    )
 }
 
 #[test]

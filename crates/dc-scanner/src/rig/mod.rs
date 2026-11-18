@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dc_turntable::{AngleProbe, AxisInfo, TurntableInfo};
-use glam::{Affine3A, Quat, Vec3};
+use glam::{Affine3A, Mat3, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -219,6 +219,21 @@ pub fn about(point: Vec3, dir: Vec3, deg: f32) -> Affine3A {
         * Affine3A::from_translation(-point)
 }
 
+/// Rigid map from the camera frame to a frame whose axes are `x`, `y`, `z`
+/// (unit, right-handed, in camera coordinates) with its origin at `origin`.
+fn frame_from_camera(x: Vec3, y: Vec3, z: Vec3, origin: Vec3) -> Affine3A {
+    let r = Mat3::from_cols(x, y, z).transpose();
+    Affine3A::from_mat3_translation(r, -(r * origin))
+}
+
+/// The scan world frame without a rig calibration, as a map from the
+/// camera frame: +Z the camera's up (−y), +X back toward the scanner (−z),
+/// Y = Z × X (the camera's +x), origin at the camera. A scanner held level
+/// sees a horizontal surface as the XY plane.
+pub fn camera_world() -> Affine3A {
+    frame_from_camera(Vec3::NEG_Z, Vec3::X, Vec3::NEG_Y, Vec3::ZERO)
+}
+
 impl RigGeometry {
     /// The geometry of `c`.
     pub fn new(c: &RigCalibration) -> Self {
@@ -294,6 +309,22 @@ impl RigGeometry {
     pub fn roi(&self, p: Vec3, tilt_deg: f32, radius_mm: f32, height_mm: f32) -> bool {
         let (h, r2) = self.height(p, tilt_deg);
         (-ROI_BELOW_PLATTER_MM..=height_mm).contains(&h) && r2 <= radius_mm * radius_mm
+    }
+
+    /// The scan world frame of a scan whose first view was taken with the
+    /// platter tilted by `tilt_deg`, as a rigid map from that camera frame:
+    /// +Z the rotation axis pointing up from the platter, origin on the
+    /// axis at the platter, +X from the axis toward the scanner along the
+    /// platter, Y = Z × X. The object stands along +Z on the XY plane.
+    pub fn world_from_camera(&self, tilt_deg: f32) -> Affine3A {
+        let t = self.tilt(tilt_deg);
+        let origin = t.transform_point3(self.axis_point);
+        let z = t.transform_vector3(self.up).normalize();
+        let x = (-origin)
+            .reject_from_normalized(z)
+            .try_normalize()
+            .unwrap_or_else(|| z.any_orthonormal_vector());
+        frame_from_camera(x, z.cross(x), z, origin)
     }
 }
 

@@ -246,7 +246,52 @@ fn recorded_revolution_calibrates_and_fuses() {
             s.fused, s.flagged, s.delta_deg, s.rms_mm
         );
     }
+    // the world is the rig frame: the platter is the XY plane, the object
+    // stands along +Z, the scanner on the +X side looking down at it
+    let f = scan.world.transform_vector3(glam::Vec3::Z);
+    let eye = scan.world.transform_point3(glam::Vec3::ZERO);
+    let (tilt, yaw) = ((-f.z).asin().to_degrees(), f.y.atan2(-f.x).to_degrees());
+    let plane: Vec<glam::Vec3> = scan
+        .cloud
+        .points
+        .iter()
+        .copied()
+        .filter(|p| p.z.abs() < 1.5 && p.truncate().length() > 20.0)
+        .collect();
+    let normal = plane_normal(&plane);
+    let normal_deg = normal.map(|n| n.dot(glam::Vec3::Z).abs().acos().to_degrees());
+    println!(
+        "world: scanner at {eye:?} tilt {tilt:.1} deg yaw {yaw:.1} deg; {} platter points, \
+         normal {normal_deg:?} deg off +Z; object z {:?} mm",
+        plane.len(),
+        bounds.map(|(lo, hi)| (lo.z, hi.z)),
+    );
+    assert!(
+        yaw.abs() < 5.0 && (0.0..80.0).contains(&tilt),
+        "{tilt} {yaw}"
+    );
+    assert!(eye.x > 0.0 && eye.z > 0.0, "{eye:?}");
     assert_eq!(fused, scan.stops.len());
+}
+
+/// Normal of the least-squares plane of `points` (smallest principal axis).
+fn plane_normal(points: &[glam::Vec3]) -> Option<glam::Vec3> {
+    if points.len() < 3 {
+        return None;
+    }
+    let c = points.iter().copied().sum::<glam::Vec3>() / points.len() as f32;
+    let mut m = glam::Mat3::ZERO;
+    for p in points {
+        let d = *p - c;
+        m += glam::Mat3::from_cols(d * d.x, d * d.y, d * d.z);
+    }
+    // inverse iteration converges on the smallest eigenvector
+    let inv = (m + glam::Mat3::IDENTITY * 1e-6).inverse();
+    let mut n = glam::Vec3::ONE.normalize();
+    for _ in 0..50 {
+        n = (inv * n).try_normalize()?;
+    }
+    Some(n)
 }
 
 /// `depth` (pinhole `f`, centre of the image) as seen through a camera

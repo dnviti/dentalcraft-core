@@ -54,7 +54,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::rig::fit::{angle_about, to_d};
-use crate::rig::{Background, RigCalibration, RigGeometry, RigInput, about};
+use crate::rig::{Background, RigCalibration, RigGeometry, RigInput, about, camera_world};
 use crate::tracking::{FrameSample, TrackParams, sample_frame, track_frame};
 use crate::{DepthFrame, DeviceInfo, Result, ScanError, ScannerBackend, ScannerDevice, backend};
 
@@ -186,9 +186,22 @@ pub struct ScanStatus {
     pub error: Option<String>,
     /// Technical detail of that failure (untranslated).
     pub error_detail: Option<String>,
-    /// Turntable angles `[rotate, tilt]` (degrees) when the world frame was
-    /// set (first fused frame), when a turntable was connected.
+    /// Turntable angles `[rotate, tilt]` (degrees, as read: the rotation is
+    /// cumulative) when the world frame was set (first fused frame), when a
+    /// turntable was connected.
     pub world_angles_deg: Option<[f32; 2]>,
+    /// The scan world frame (fused cloud, preview, result) as a rigid map
+    /// from the camera frame of the first fused frame, column-major 3×4
+    /// (`Affine3A::to_cols_array`), once set.
+    pub world_from_camera: Option<[f32; 12]>,
+    /// The world frame is the calibrated rig frame: +Z the turntable axis
+    /// pointing up from the platter, origin on the axis at the platter,
+    /// +X toward the scanner. Otherwise it is [`crate::rig::camera_world`].
+    pub rig_world: bool,
+    /// Pose of the scanner at the first fused frame in the world frame:
+    /// `[tilt, yaw]` in degrees, tilt > 0 looking down, yaw 0 looking at
+    /// the axis (along −X).
+    pub scanner_deg: Option<[f32; 2]>,
 }
 
 /// What the live view draws.
@@ -306,6 +319,9 @@ struct Live {
     generation: u64,
     error: Option<(&'static str, String)>,
     world_angles: Option<[f32; 2]>,
+    /// World frame from the first camera frame, once set.
+    world: Option<Affine3A>,
+    rig_world: bool,
     latency: Duration,
 }
 
@@ -341,6 +357,8 @@ impl StopRecord {
 }
 
 /// The fused model and the camera track; owned by the thread while scanning.
+/// Poses and the volume are in the camera frame of the first fused frame;
+/// `world` maps them to the scan world frame for every output.
 struct Fusion {
     volume: TsdfVolume,
     /// Camera-to-world pose of the latest tracked frame.
@@ -353,6 +371,10 @@ struct Fusion {
     angles: Option<(f32, f32)>,
     /// Turntable angles of the world frame (first fused frame).
     world_angles: Option<(f32, f32)>,
+    /// The scan world frame from the first camera frame.
+    world: Affine3A,
+    /// `world` is the calibrated rig frame.
+    rig_world: bool,
     /// The fused stops of `scan.auto`.
     stops: Vec<StopRecord>,
     /// Frames fused one by one (not as stops).
@@ -368,10 +390,43 @@ impl Fusion {
             started: false,
             angles: None,
             world_angles: None,
+            world: camera_world(),
+            rig_world: false,
             stops: Vec::new(),
             loose_frames: 0,
         }
     }
+
+    /// Sets the world frame at the first fused frame (taken at `angles`):
+    /// the rig frame with a calibration, else [`camera_world`].
+    fn set_world(&mut self, geometry: Option<&RigGeometry>, angles: Option<(f32, f32)>) {
+        self.world_angles = angles;
+        (self.world, self.rig_world) = match geometry {
+            Some(g) => (g.world_from_camera(angles.map_or(0.0, |a| a.1)), true),
+            None => (camera_world(), false),
+        };
+    }
+}
+
+/// `cloud` moved rigidly by `m`, in place.
+fn moved(mut cloud: PointCloud, m: &Affine3A) -> PointCloud {
+    for p in &mut cloud.points {
+        *p = m.transform_point3(*p);
+    }
+    for n in cloud.normals.iter_mut().flatten() {
+        *n = m.transform_vector3(*n);
+    }
+    cloud
+}
+
+/// `[tilt, yaw]` (degrees) of the camera placed in the world by `world`:
+/// tilt > 0 looking down, yaw 0 looking along −X (at the turntable axis).
+fn scanner_angles(world: &Affine3A) -> [f32; 2] {
+    let f = world.transform_vector3(Vec3::Z);
+    [
+        (-f.z).clamp(-1.0, 1.0).asin().to_degrees(),
+        f.y.atan2(-f.x).to_degrees(),
+    ]
 }
 
 /// The acquisition seen from a rig job thread: hold, frames, stops. Cheap
@@ -642,8 +697,8 @@ impl ScanSession {
     }
 
     /// Ends the acquisition and returns the fused cloud (surface points with
-    /// normals, world = first frame camera). From `Stopped` it returns the
-    /// same cloud again.
+    /// normals, in the scan world frame, see [`ScanStatus::rig_world`]).
+    /// From `Stopped` it returns the same cloud again.
     ///
     /// # Errors
     /// [`ScanError::InvalidState`] when nothing was acquired;
@@ -661,13 +716,17 @@ impl ScanSession {
         }
         self.state = ScanState::Stopped;
         let fusion = self.fusion.as_ref().ok_or(ScanError::Empty("scan"))?;
-        let cloud = fusion.volume.extract_cloud();
+        let cloud = moved(fusion.volume.extract_cloud(), &fusion.world);
         let mut live = self.shared.live();
         let frame_points = live
             .preview
             .as_ref()
             .map_or_else(Arc::default, |p| Arc::clone(&p.frame_points));
-        live.publish(Arc::new(cloud.clone()), frame_points, fusion.pose);
+        live.publish(
+            Arc::new(cloud.clone()),
+            frame_points,
+            fusion.world * fusion.pose,
+        );
         Ok(cloud)
     }
 
@@ -733,6 +792,9 @@ impl ScanSession {
             error: live.error.as_ref().map(|(code, _)| (*code).to_owned()),
             error_detail: live.error.as_ref().map(|(_, detail)| detail.clone()),
             world_angles_deg: live.world_angles,
+            world_from_camera: live.world.map(|w| w.to_cols_array()),
+            rig_world: live.rig_world,
+            scanner_deg: live.world.as_ref().map(scanner_angles),
         }
     }
 
@@ -944,7 +1006,7 @@ fn fuse_stop(
         if s.points.is_empty() {
             return out;
         }
-        fusion.world_angles = Some(angles);
+        fusion.set_world(geometry, Some(angles));
         Affine3A::IDENTITY
     } else {
         let prior = match (geometry, fusion.world_angles) {
@@ -1135,8 +1197,10 @@ pub struct ReplayedScan {
     pub loop_applied: bool,
     /// Static clutter pixels removed from the stops.
     pub clutter_pixels: usize,
-    /// The fused cloud (world = camera at the first stop).
+    /// The fused cloud, in the scan world frame (`world`).
     pub cloud: PointCloud,
+    /// The scan world frame from the camera frame of the first stop.
+    pub world: Affine3A,
 }
 
 /// A recorded stop: turntable angles `(rotate, tilt)` and the
@@ -1186,7 +1250,8 @@ pub fn fuse_recorded_stops(
         loop_error_deg: closed.error_deg,
         loop_applied: closed.applied,
         clutter_pixels: closed.clutter_pixels,
-        cloud: fusion.volume.extract_cloud(),
+        cloud: moved(fusion.volume.extract_cloud(), &fusion.world),
+        world: fusion.world,
     }
 }
 
@@ -1326,7 +1391,7 @@ fn acquire(
                     false
                 } else {
                     if !fusion.started {
-                        fusion.world_angles = angles;
+                        fusion.set_world(geometry.as_ref(), angles);
                     }
                     fusion.volume.integrate(&depth, &k, &pose);
                     fusion.started = true;
@@ -1350,6 +1415,8 @@ fn acquire(
             live.fused_frames += 1;
             if live.fused_frames == 1 {
                 live.world_angles = fusion.world_angles.map(|(r, t)| [r, t]);
+                live.world = Some(fusion.world);
+                live.rig_world = fusion.rig_world;
             }
         }
         if let Some(prev) = last_frame {
@@ -1365,10 +1432,10 @@ fn acquire(
             let fused_frames = live.fused_frames;
             drop(live);
             if fused_frames != extracted_at {
-                cloud = Arc::new(fusion.volume.extract_cloud());
+                cloud = Arc::new(moved(fusion.volume.extract_cloud(), &fusion.world));
                 extracted_at = fused_frames;
             }
-            let camera = tracked.unwrap_or(fusion.pose);
+            let camera = fusion.world * tracked.unwrap_or(fusion.pose);
             let frame_points = sample
                 .points
                 .iter()
