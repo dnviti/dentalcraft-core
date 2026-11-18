@@ -15,7 +15,7 @@ mod spec;
 use std::sync::Arc;
 
 pub use dc_project::{ModuleCodec, ModuleCodecs};
-pub use menu::{LeafInput, MenuItem, MenuKind, MenuStatus, MenuTree};
+pub use menu::{LeafInput, MenuItem, MenuKind, MenuStatus, MenuTree, ScannerInput};
 pub use spec::{CommandOutput, CommandRunFn, CommandSpec, SpecCommand};
 
 use dc_case::CaseState;
