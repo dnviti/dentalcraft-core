@@ -30,8 +30,13 @@ const DEPTH_BYTES: usize = DEPTH_WIDTH as usize * DEPTH_HEIGHT as usize * 2;
 const IR_BYTES: usize = DEPTH_WIDTH as usize * DEPTH_HEIGHT as usize;
 /// Bytes of the header in row 0 (the rest of the row is zero).
 const HEADER_BYTES: usize = 84;
-/// The first ten `u16` words of every header seen so far.
+/// The first ten `u16` words of every header seen so far, except word
+/// [`HEADER_VARYING_WORD`].
 const HEADER_MAGIC: [u16; 10] = [0, 0, 0, 0x100, 0x160, 0, 12, 0, 0, 0];
+/// The header word that is not constant: `0x160` on 2026-11-16, `0x148` on
+/// 2026-11-18, on the same unit and firmware (meaning unknown, maybe a
+/// sensor reading). It is not checked.
+const HEADER_VARYING_WORD: usize = 4;
 
 /// A `Y16` format of the depth node. The device offers the three sizes at
 /// 5, 10 and 15 fps nominal, but paces the frames itself: on one unit it
@@ -79,7 +84,8 @@ impl StreamMode {
 /// Header of a depth frame (row 0), little endian. Offsets observed on
 /// firmware with `bcdDevice` 0x0419:
 ///
-/// * bytes 0..20: ten `u16` words, always [`HEADER_MAGIC`];
+/// * bytes 0..20: ten `u16` words, always [`HEADER_MAGIC`] except word
+///   [`HEADER_VARYING_WORD`];
 /// * bytes 20..24: `u32` device time in milliseconds;
 /// * then `f32`s: orientation quaternion `w, x, y, z` (24..40), gyroscope
 ///   (40..52), accelerometer in g (52..64, about `(0, 0, 1)` at rest),
@@ -108,7 +114,7 @@ pub struct FrameHeader {
 pub fn parse_header(row0: &[u8]) -> Option<FrameHeader> {
     let bytes = row0.get(..HEADER_BYTES)?;
     let word = |i: usize| u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);
-    if (0..HEADER_MAGIC.len()).any(|i| word(i) != HEADER_MAGIC[i]) {
+    if (0..HEADER_MAGIC.len()).any(|i| i != HEADER_VARYING_WORD && word(i) != HEADER_MAGIC[i]) {
         return None;
     }
     let f = |i: usize| {
@@ -238,6 +244,10 @@ mod tests {
         assert!(h.gyro.length() < 0.05);
         assert!(h.magnetometer.length() > 10.0);
 
+        // word 4 varies between sessions (0x148 on 2026-11-18): still a header
+        let mut varying = ROW0.to_vec();
+        varying[8..10].copy_from_slice(&0x148_u16.to_le_bytes());
+        assert_eq!(parse_header(&varying).unwrap().timestamp_ms, 35_428_028);
         // not a header: other words, or too short
         let mut other = ROW0.to_vec();
         other[6] = 7;
