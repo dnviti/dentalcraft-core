@@ -326,6 +326,118 @@ pub fn point_to_plane_step(p: &[DVec3], q: &[DVec3], n: &[DVec3]) -> Result<DAff
     Ok(DAffine3::from_mat3_translation(rot, t))
 }
 
+/// Outcome of [`point_to_plane_solve`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlaneSolve {
+    /// The rigid motion (identity along the weak directions).
+    pub delta: DAffine3,
+    /// Smallest eigenvalue of the scaled normal matrix over its largest
+    /// (0 for a rank-deficient system): how well the pairs constrain the
+    /// six degrees of freedom.
+    pub conditioning: f64,
+    /// Directions left unchanged because they were too weakly constrained.
+    pub weak: usize,
+}
+
+/// Weighted, degeneracy-aware variant of [`point_to_plane_step`].
+///
+/// The rotation unknowns are scaled by the RMS distance of the points from
+/// their centroid, so the six eigenvalues of the normal matrix are
+/// comparable (Gelfand et al. 2003, *Geometrically stable sampling*). The
+/// system is solved in its eigenbasis and every direction whose
+/// eigenvalue is below `min_relative_eigen` times the largest is left at
+/// zero: those motions (sliding along a plane, turning about the axis of a
+/// surface of revolution) keep the starting pose instead of following the
+/// noise. `weights` (one per pair, `None`: all 1) are robust weights, e.g.
+/// Tukey's biweight of the residual.
+///
+/// # Errors
+/// [`GeomError::InvalidInput`] when the slices are empty or of different
+/// lengths.
+pub fn point_to_plane_solve(
+    p: &[DVec3],
+    q: &[DVec3],
+    n: &[DVec3],
+    weights: Option<&[f64]>,
+    min_relative_eigen: f64,
+) -> Result<PlaneSolve> {
+    if p.is_empty()
+        || p.len() != q.len()
+        || p.len() != n.len()
+        || weights.is_some_and(|w| w.len() != p.len())
+    {
+        return Err(GeomError::InvalidInput(format!(
+            "point-to-plane needs equal non-empty sets ({}, {}, {})",
+            p.len(),
+            q.len(),
+            n.len()
+        )));
+    }
+    let w = |i: usize| weights.map_or(1.0, |w| w[i].max(0.0));
+    let total: f64 = (0..p.len()).map(w).sum();
+    if total <= 0.0 {
+        return Ok(PlaneSolve {
+            delta: DAffine3::IDENTITY,
+            conditioning: 0.0,
+            weak: 6,
+        });
+    }
+    let c = (0..p.len()).map(|i| w(i) * p[i]).sum::<DVec3>() / total;
+    let scale = ((0..p.len())
+        .map(|i| w(i) * (p[i] - c).length_squared())
+        .sum::<f64>()
+        / total)
+        .sqrt()
+        .max(1e-9);
+    let mut ata = Matrix6::<f64>::zeros();
+    let mut atb = Vector6::<f64>::zeros();
+    for i in 0..p.len() {
+        let wi = w(i);
+        if wi == 0.0 {
+            continue;
+        }
+        let rc = (p[i] - c).cross(n[i]) / scale;
+        let row = [rc.x, rc.y, rc.z, n[i].x, n[i].y, n[i].z];
+        let b = (q[i] - p[i]).dot(n[i]);
+        for r in 0..6 {
+            atb[r] += wi * row[r] * b;
+            for k in r..6 {
+                ata[(r, k)] += wi * row[r] * row[k];
+            }
+        }
+    }
+    for r in 0..6 {
+        for k in 0..r {
+            ata[(r, k)] = ata[(k, r)];
+        }
+    }
+    let eig = ata.symmetric_eigen();
+    let lmax = eig.eigenvalues.max();
+    let lmin = eig.eigenvalues.min();
+    let mut x = Vector6::<f64>::zeros();
+    let mut weak = 0;
+    for k in 0..6 {
+        let l = eig.eigenvalues[k];
+        if lmax <= 0.0 || l < min_relative_eigen.max(PLANE_RCOND) * lmax {
+            weak += 1;
+            continue;
+        }
+        let v = eig.eigenvectors.column(k);
+        x += v * (v.dot(&atb) / l);
+    }
+    let rot = rotation_from_vector(DVec3::new(x[0], x[1], x[2]) / scale);
+    let t = c + DVec3::new(x[3], x[4], x[5]) - rot * c;
+    Ok(PlaneSolve {
+        delta: DAffine3::from_mat3_translation(rot, t),
+        conditioning: if lmax > 0.0 {
+            (lmin / lmax).max(0.0)
+        } else {
+            0.0
+        },
+        weak,
+    })
+}
+
 /// Rotation of angle `|v|` about `v` (Rodrigues).
 fn rotation_from_vector(v: DVec3) -> DMat3 {
     let angle = v.length();

@@ -50,10 +50,11 @@ impl ScannerBackend for RevopointUsbBackend {
             calibration,
             address: found.address,
             capture: None,
-            mode: self.options.mode,
+            mode: self.options.stream_mode(),
             restart: None,
             reconnect_deadline: None,
             buf: Vec::new(),
+            spare: Vec::new(),
             latest_ir: None,
         }))
     }
@@ -84,6 +85,8 @@ pub struct RevopointUsbDevice {
     /// Set while a start waits for the device to come back.
     reconnect_deadline: Option<Instant>,
     buf: Vec<u8>,
+    /// Second frame buffer, to drain the queue down to the newest frame.
+    spare: Vec<u8>,
     latest_ir: Option<Vec<u8>>,
 }
 
@@ -162,7 +165,7 @@ impl RevopointUsbDevice {
 
     /// Sets the requested mode, else [`StreamMode::Depth`].
     fn negotiate(&self, capture: &mut Capture) -> Result<StreamMode> {
-        for mode in [self.options.mode, StreamMode::Depth] {
+        for mode in [self.options.stream_mode(), StreamMode::Depth] {
             let (w, h) = mode.size();
             if let Some(size) = capture.set_format(w, h, PIX_FMT_Y16)?
                 && size >= mode.frame_bytes()
@@ -269,13 +272,28 @@ impl ScannerDevice for RevopointUsbDevice {
         let Some(capture) = self.capture.as_mut() else {
             return Err(ScanError::Device("the depth stream is not started".into()));
         };
+        let full = self.mode.frame_bytes();
         match capture.next(timeout, &mut self.buf) {
             Ok(Some(dq)) => {
-                if dq.bytes < self.mode.frame_bytes() {
+                if dq.bytes < full {
                     // a short (incomplete) frame: skip it
                     return Ok(None);
                 }
-                self.depth_frame(dq.timestamp_us).map(Some)
+                // frames queued behind it are newer: keep the newest, so
+                // the frame and the turntable angle read now stay close
+                let mut timestamp_us = dq.timestamp_us;
+                for _ in 0..self.options.buffers {
+                    match capture.next(Duration::ZERO, &mut self.spare) {
+                        Ok(Some(next)) if next.bytes >= full => {
+                            std::mem::swap(&mut self.buf, &mut self.spare);
+                            timestamp_us = next.timestamp_us;
+                        }
+                        Ok(Some(_)) => {}
+                        // a failure surfaces at the next call
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                self.depth_frame(timestamp_us).map(Some)
             }
             Ok(None) => Ok(None),
             Err(e) => {
@@ -285,6 +303,10 @@ impl ScannerDevice for RevopointUsbDevice {
                 Err(e)
             }
         }
+    }
+
+    fn latency(&self) -> Duration {
+        self.options.latency
     }
 }
 

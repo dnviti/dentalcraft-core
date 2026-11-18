@@ -1,0 +1,257 @@
+//! Offline replay of a turntable dataset recorded on the real rig (MINI 2
+//! and Revopoint dual-axis table): the settled stops of a 24 x 15 degree
+//! revolution go through the calibration and then through the
+//! stop-and-capture fusion of `scan.auto`, and the residuals are printed.
+//!
+//! Ignored by default: it needs `DC_SCAN_DATA`, the directory holding the
+//! dataset `b_turn_24x15` (format in its `README.md`: `frames.bin`, 800x600
+//! little-endian `u16` per frame in 1/200 mm, `meta.csv` with the phase,
+//! the stop and the reported angles of every frame). Run with
+//! `DC_SCAN_DATA=/var/tmp/dc-scan-data cargo test --release -p dc-scanner
+//! --test recorded_rig -- --ignored --nocapture`.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+
+use dc_scanner::rig::calib::{self, CalibrationStop};
+use dc_scanner::rig::{RigCalibration, rfc3339};
+use dc_scanner::session::{RecordedStop, fuse_recorded_stops};
+use dc_scanner::{CameraIntrinsics, ScanSettings};
+
+const W: usize = 800;
+const H: usize = 600;
+
+/// A settled stop: reported angles and its frames (mm, `NaN` invalid).
+struct Stop {
+    rotate: f32,
+    tilt: f32,
+    frames: Vec<Arc<Vec<f32>>>,
+}
+
+/// The settled frames of `dataset`, per stop: the "still" frames from the
+/// third on (the first two still show the move, the frames arrive about
+/// 0.8 s late).
+fn load(dataset: &str) -> Option<Vec<Stop>> {
+    let dir = PathBuf::from(std::env::var_os("DC_SCAN_DATA")?).join(dataset);
+    let meta = std::fs::read_to_string(dir.join("meta.csv")).ok()?;
+    let raw = std::fs::read(dir.join("frames.bin")).ok()?;
+    let frame = |idx: usize| -> Arc<Vec<f32>> {
+        let bytes = &raw[idx * W * H * 2..(idx + 1) * W * H * 2];
+        Arc::new(
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| {
+                    let v = u16::from_le_bytes(*b);
+                    let d = f32::from(v) * 0.005;
+                    // the working range of the acquisition
+                    if v == 0 || !(100.0..=300.0).contains(&d) {
+                        f32::NAN
+                    } else {
+                        d
+                    }
+                })
+                .collect(),
+        )
+    };
+    let mut lines = meta.lines();
+    let head: Vec<&str> = lines.next()?.split(',').collect();
+    let col = |name: &str| head.iter().position(|h| *h == name);
+    let (i_idx, i_rot, i_tilt, i_phase, i_step) = (
+        col("idx")?,
+        col("rep_rot_deg")?,
+        col("cmd_tilt_deg")?,
+        col("phase")?,
+        col("step")?,
+    );
+    let mut stops: BTreeMap<u32, (f32, f32, Vec<usize>)> = BTreeMap::new();
+    for line in lines {
+        let f: Vec<&str> = line.split(',').collect();
+        if f.get(i_phase) != Some(&"still") {
+            continue;
+        }
+        let step: u32 = f[i_step].parse().ok()?;
+        let e = stops.entry(step).or_insert((
+            f[i_rot].parse().ok()?,
+            f[i_tilt].parse().ok()?,
+            Vec::new(),
+        ));
+        e.2.push(f[i_idx].parse().ok()?);
+    }
+    Some(
+        stops
+            .into_values()
+            .map(|(rotate, tilt, idx)| {
+                // DC_SCAN_SKIP: still frames dropped per stop (default 2)
+                let skip: usize = std::env::var("DC_SCAN_SKIP")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2);
+                let settled: Vec<usize> = if idx.len() > skip {
+                    idx[skip..].to_vec()
+                } else {
+                    idx
+                };
+                Stop {
+                    rotate,
+                    tilt,
+                    frames: settled.into_iter().map(frame).collect(),
+                }
+            })
+            .collect(),
+    )
+}
+
+#[test]
+#[ignore = "needs DC_SCAN_DATA with the recorded dataset b_turn_24x15"]
+fn recorded_revolution_calibrates_and_fuses() {
+    let Some(stops) = load("b_turn_24x15") else {
+        panic!("set DC_SCAN_DATA to the directory holding b_turn_24x15");
+    };
+    // no scanner calibration file was installed: the field-of-view estimate
+    // (DC_SCAN_FX overrides it, to study its effect)
+    let f: f32 = std::env::var("DC_SCAN_FX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1190.0);
+    let intr = CameraIntrinsics {
+        width: W as u32,
+        height: H as u32,
+        fx: f,
+        fy: f,
+        cx: 399.5,
+        cy: 299.5,
+    };
+    println!("{} stops", stops.len());
+    let medians: Vec<CalibrationStop> = stops
+        .iter()
+        .map(|s| CalibrationStop {
+            rotate_deg: s.rotate,
+            tilt_deg: s.tilt,
+            depth: Arc::new(calib::median_depth(&s.frames)),
+        })
+        .collect();
+
+    let t = Instant::now();
+    let outcome = calib::measure(&intr, &medians, &[]);
+    let (outcome, report) = match outcome {
+        Ok(o) => {
+            let r = o.report.clone();
+            (Some(o), r)
+        }
+        Err((e, r)) => {
+            println!("calibration refused: {e}");
+            (None, r)
+        }
+    };
+    println!(
+        "calibration in {:?}: {}",
+        t.elapsed(),
+        serde_json::to_string(&report).unwrap()
+    );
+    let outcome = outcome.expect("the recorded revolution calibrates");
+    println!(
+        "axis point {:?} dir {:?} up {:?}",
+        outcome.platter_point, outcome.axis.dir, outcome.up
+    );
+    let c = RigCalibration {
+        axis_point: outcome.platter_point.into(),
+        axis_dir: outcome.axis.dir.into(),
+        platter_up: outcome.up.into(),
+        tilt_axis_point: None,
+        tilt_axis_dir: None,
+        scanner_serial: None,
+        turntable_id: "recorded".into(),
+        created: rfc3339(std::time::SystemTime::now()),
+        fit_rms_deg: outcome.axis.rms_deg,
+        fit_rms_mm: outcome.axis.rms_mm,
+        angle_gain: outcome.axis.angle_gain,
+        fit_pairs: outcome.axis.pairs as u32,
+    };
+
+    let t = Instant::now();
+    let recorded: Vec<RecordedStop> = medians
+        .iter()
+        .map(|s| ((s.rotate_deg, s.tilt_deg), Arc::clone(&s.depth)))
+        .collect();
+    // DC_SCAN_ROI_MM: radius of the region of interest (default 45 mm)
+    let settings = ScanSettings {
+        roi_radius_mm: std::env::var("DC_SCAN_ROI_MM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(ScanSettings::default().roi_radius_mm),
+        ..ScanSettings::default()
+    };
+    let scan = fuse_recorded_stops(&settings, &c, &intr, &recorded);
+    let fused = scan.stops.iter().filter(|s| s.fused).count();
+    let flagged = scan.stops.iter().filter(|s| s.flagged).count();
+    let rms: Vec<f32> = scan.stops.iter().filter_map(|s| s.rms_mm).collect();
+    let mean_rms = rms.iter().sum::<f32>() / rms.len().max(1) as f32;
+    let max_delta = scan
+        .stops
+        .iter()
+        .map(|s| s.delta_deg.abs())
+        .fold(0.0, f32::max);
+    let bounds = scan.cloud.aabb();
+    println!(
+        "fusion in {:?}: {fused}/{} stops fused, {flagged} flagged, mean rms {mean_rms:.3} mm, \
+         max |dtheta| {max_delta:.2} deg, loop {:?} deg (applied {}), {} points, bounds {bounds:?}",
+        t.elapsed(),
+        scan.stops.len(),
+        scan.loop_error_deg,
+        scan.loop_applied,
+        scan.cloud.len()
+    );
+    for (k, s) in scan.stops.iter().enumerate() {
+        println!(
+            "  stop {k:2}: fused {} flagged {} dtheta {:+.3} rms {:?}",
+            s.fused, s.flagged, s.delta_deg, s.rms_mm
+        );
+    }
+    assert_eq!(fused, scan.stops.len());
+}
+
+/// How consistent the recorded revolution is under other pinhole
+/// intrinsics: the per-pair angle residual and the angle gain of the
+/// calibration over a grid of focal lengths and principal points. Exact
+/// intrinsics give residuals near the registration noise and a gain of 1.
+#[test]
+#[ignore = "needs DC_SCAN_DATA with the recorded dataset b_turn_24x15; slow"]
+fn recorded_revolution_under_other_intrinsics() {
+    let Some(stops) = load("b_turn_24x15") else {
+        panic!("set DC_SCAN_DATA to the directory holding b_turn_24x15");
+    };
+    let medians: Vec<CalibrationStop> = stops
+        .iter()
+        .map(|s| CalibrationStop {
+            rotate_deg: s.rotate,
+            tilt_deg: s.tilt,
+            depth: Arc::new(calib::median_depth(&s.frames)),
+        })
+        .collect();
+    for f in [1100.0, 1190.0, 1300.0, 1400.0] {
+        for cx in [339.5, 369.5, 399.5, 429.5, 459.5] {
+            for cy in [239.5, 269.5, 299.5, 329.5, 359.5] {
+                let intr = CameraIntrinsics {
+                    width: W as u32,
+                    height: H as u32,
+                    fx: f,
+                    fy: f,
+                    cx,
+                    cy,
+                };
+                let r = match calib::measure(&intr, &medians, &[]) {
+                    Ok(o) => o.report,
+                    Err((_, r)) => r,
+                };
+                println!(
+                    "f {f:6.1} cx {cx:5.1} cy {cy:5.1}: rms {:?} deg {:?} mm, gain {:?}, pairs {}",
+                    r.rms_deg, r.rms_mm, r.angle_gain, r.pairs
+                );
+            }
+        }
+    }
+}

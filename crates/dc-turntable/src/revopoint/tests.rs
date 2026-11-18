@@ -201,9 +201,12 @@ fn speed_mapping_is_seconds_per_turn() {
     assert_eq!(turn_speed_value(100.0), 18);
     assert_eq!(turn_speed_value(1.0), 90);
     assert_eq!(turn_speed_value(4.0), 90);
-    assert_eq!(tilt_speed_value(6.0), 10);
-    assert_eq!(tilt_speed_value(100.0), 7);
-    assert_eq!(tilt_speed_value(0.1), 90);
+    // the firmware takes only multiples of 5 from 40 to 90 (measured)
+    assert_eq!(tilt_speed_value(6.0), 55);
+    assert_eq!(tilt_speed_value(6.7), 60);
+    assert_eq!(tilt_speed_value(100.0), 90);
+    assert_eq!(tilt_speed_value(0.1), 40);
+    assert!((tilt_speed_deg_per_s(60) - 6.67).abs() < 0.01);
 }
 
 #[test]
@@ -362,7 +365,7 @@ fn a_cancelled_or_stalled_wait_reports_it() {
 fn tilt_is_open_loop_and_range_checked() {
     let (mut t, table) = open(Table::default());
     t.set_speed(AxisKind::Tilt, 100.0).unwrap();
-    assert_eq!(sent(&table).last().unwrap(), "+CR,TILTSPEED=7;");
+    assert_eq!(sent(&table).last().unwrap(), "+CR,TILTSPEED=90;");
     let n = sent(&table).len();
     assert_eq!(
         t.move_to(AxisKind::Tilt, 31.0).unwrap_err().code(),
@@ -371,7 +374,7 @@ fn tilt_is_open_loop_and_range_checked() {
     assert_eq!(sent(&table).len(), n, "nothing sent for a refused tilt");
     t.move_to(AxisKind::Tilt, 3.0).unwrap();
     assert_eq!(sent(&table).last().unwrap(), "+CR,TILTVALUE=3.000000;");
-    // 3 degrees at 60/7 deg/s: about 0.35 s, then the margin
+    // 3 degrees at 90 / 9 = 10 deg/s: about 0.3 s, then the margin
     let start = Instant::now();
     t.wait_settled(AxisKind::Tilt, Duration::from_secs(5), &never)
         .unwrap();

@@ -15,6 +15,7 @@ dc-mesh.workspace = true
 dc-turntable.workspace = true
 glam.workspace = true
 rayon.workspace = true
+nalgebra.workspace = true
 libloading.workspace = true
 schemars.workspace = true
 serde.workspace = true

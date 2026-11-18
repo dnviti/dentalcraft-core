@@ -119,7 +119,10 @@ pub fn device_name(bcd_device: u16) -> &'static str {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UsbOptions {
     /// `Y16` mode to negotiate; [`StreamMode::Depth`] is the fallback when
-    /// the driver refuses it.
+    /// the driver refuses it. The default, `Depth`, moves a third of the
+    /// bytes of `Full`; with [`UsbOptions::keep_ir`] a `Depth` mode is
+    /// raised to `Full`, the only one known to carry the infrared pair on
+    /// every unit.
     pub mode: StreamMode,
     /// Frame rate asked for (the device offers 5, 10 and 15).
     pub fps: u32,
@@ -130,16 +133,31 @@ pub struct UsbOptions {
     /// Keep the infrared pair of the latest frame
     /// ([`RevopointUsbDevice::latest_ir`]).
     pub keep_ir: bool,
+    /// How long before its arrival a frame shows the scene: 0.7 to 1.1 s
+    /// measured on a MINI 2 (2026-11-18), see [`crate::ScannerDevice::latency`].
+    pub latency: Duration,
+}
+
+impl UsbOptions {
+    /// The mode actually negotiated first.
+    pub fn stream_mode(&self) -> StreamMode {
+        if self.keep_ir && self.mode == StreamMode::Depth {
+            StreamMode::Full
+        } else {
+            self.mode
+        }
+    }
 }
 
 impl Default for UsbOptions {
     fn default() -> Self {
         Self {
-            mode: StreamMode::Full,
+            mode: StreamMode::Depth,
             fps: 15,
             buffers: 4,
             reconnect_timeout: Duration::from_secs(8),
             keep_ir: false,
+            latency: Duration::from_millis(800),
         }
     }
 }

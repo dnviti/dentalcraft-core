@@ -145,6 +145,19 @@ pub enum ScanError {
     /// the table (allowed with `allow_uncalibrated`).
     #[error("no turntable calibration for this scanner and turntable: calibrate first")]
     RigUncalibrated,
+    /// `turntable.calibrate` measured an axis that fails its checks; `code`
+    /// says which (`calibration-no-object`, `calibration-tracking`,
+    /// `calibration-inaccurate`, `calibration-implausible`).
+    #[error("turntable calibration refused ({code}): {detail}")]
+    CalibrationRefused {
+        /// Stable code of the failed check.
+        code: &'static str,
+        /// Technical detail with the measured values (untranslated).
+        detail: String,
+    },
+    /// `scan.auto` ended with too few views fused or registered.
+    #[error("the automatic scan is unusable: {0}")]
+    ScanQuality(String),
 }
 
 impl From<dc_turntable::TurntableError> for ScanError {
@@ -188,6 +201,8 @@ impl ScanError {
             Self::Turntable(e) => e.code(),
             Self::Calibration(_) => "calibration",
             Self::RigUncalibrated => "rig-uncalibrated",
+            Self::CalibrationRefused { code, .. } => code,
+            Self::ScanQuality(_) => "scan-quality-low",
         }
     }
 }
@@ -238,6 +253,11 @@ pub trait ScannerDevice: Send {
     /// Sets the exposure time, when the device supports it.
     fn set_exposure_us(&mut self, _us: u32) -> Result<()> {
         Ok(())
+    }
+    /// How long before its arrival a frame shows the scene, about: the
+    /// turntable angle of a frame is read that long before it arrived.
+    fn latency(&self) -> Duration {
+        Duration::ZERO
     }
 }
 

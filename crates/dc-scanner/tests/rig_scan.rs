@@ -147,13 +147,14 @@ fn calibrated_turntable_scan_covers_the_model_and_ignores_the_enclosure() {
     assert!(pivot_err < 1.0, "tilt axis off by {pivot_err} mm: {cal}");
     println!("calibrated in {:?}: {cal}", started.elapsed());
 
-    // --- automatic scan ---------------------------------------------------
+    // --- automatic scan (stop-and-capture by default) ----------------------
     let r = run(
         &mut c,
         "scan.auto",
         json!({"tilts_deg": [-15, 15], "rotation_deg": 360, "deg_per_s": 90, "settle_s": 0}),
     );
-    assert_eq!(r["steps"], 4);
+    // per tilt: the tilt, then 37 stops every 10 degrees
+    assert_eq!(r["steps"], 76);
     let job = wait_job(&mut c, "scan.status", "auto");
     assert_eq!(job["state"], "done", "{job}");
     let status = run(&mut c, "scan.status", Value::Null);

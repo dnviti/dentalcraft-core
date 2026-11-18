@@ -1,4 +1,4 @@
-//! Rotation axis of a turntable from tracked camera poses.
+//! Rotation axis of a turntable from rigid motions of the object.
 //!
 //! With the scanner fixed and the object turning, the tracked camera poses
 //! `P_k` (camera to world, world = first fused camera) describe the motion
@@ -30,15 +30,18 @@ pub struct AxisFit {
     pub point: Vec3,
     /// Unit direction: positive angles turn right-handed about it.
     pub dir: Vec3,
-    /// RMS difference between the fitted and the commanded angles (deg).
+    /// RMS difference between the fitted angles and the commanded ones
+    /// times [`AxisFit::angle_gain`] (deg).
     pub rms_deg: f32,
     /// RMS residual of the fixed-point equations (mm).
     pub rms_mm: f32,
     /// Pairs used.
     pub pairs: usize,
+    /// Least-squares ratio of the fitted over the commanded angles.
+    pub angle_gain: f32,
 }
 
-fn to_d(a: &Affine3A) -> DAffine3 {
+pub(crate) fn to_d(a: &Affine3A) -> DAffine3 {
     DAffine3::from_mat3_translation(a.matrix3.as_dmat3(), a.translation.as_dvec3())
 }
 
@@ -58,7 +61,7 @@ fn skew_vector(r: &DMat3) -> DVec3 {
 }
 
 /// Signed rotation angle of `r` about the unit axis `a` (radians).
-fn angle_about(r: &DMat3, a: DVec3) -> f64 {
+pub fn angle_about(r: &DMat3, a: DVec3) -> f64 {
     let cos = 0.5 * (r.x_axis.x + r.y_axis.y + r.z_axis.z - 1.0);
     skew_vector(r).dot(a).atan2(cos.clamp(-1.0, 1.0))
 }
@@ -84,8 +87,7 @@ fn null_vector(m: &DMat3) -> Option<DVec3> {
 /// [`ScanError::Calibration`] with fewer than two usable pairs (angle
 /// differences of 5 to 150 degrees) or degenerate motions.
 pub fn fit_axis(samples: &[(f32, Affine3A)]) -> Result<AxisFit> {
-    let fail = |m: &str| ScanError::Calibration(m.to_owned());
-    let mut motions: Vec<(f64, DMat3, DVec3)> = Vec::new();
+    let mut motions = Vec::new();
     for (i, (ai, pi)) in samples.iter().enumerate() {
         for (aj, pj) in &samples[i + 1..] {
             let delta = wrap_deg(f64::from(*aj) - f64::from(*ai));
@@ -93,21 +95,37 @@ pub fn fit_axis(samples: &[(f32, Affine3A)]) -> Result<AxisFit> {
                 continue;
             }
             let q = to_d(pj).inverse() * to_d(pi);
-            motions.push((delta, q.matrix3, q.translation));
+            motions.push((delta, q));
         }
     }
+    fit_motions(&motions)
+}
+
+/// Fits the rotation axis of rigid motions of the object in the camera
+/// frame: `(commanded angle difference in degrees, motion)` where the
+/// motion moves the object from the first angle to the second.
+///
+/// # Errors
+/// [`ScanError::Calibration`] with fewer than two motions or degenerate
+/// ones (the object did not turn).
+pub fn fit_motions(motions: &[(f64, DAffine3)]) -> Result<AxisFit> {
+    let fail = |m: &str| ScanError::Calibration(m.to_owned());
     if motions.len() < 2 {
         return Err(fail("too few rotations to fit the axis"));
     }
     let mut m = DMat3::ZERO;
-    for (_, r, _) in &motions {
-        let d = *r - DMat3::IDENTITY;
+    for (_, q) in motions {
+        let d = q.matrix3 - DMat3::IDENTITY;
         m += d.transpose() * d;
+    }
+    // a still object leaves every R = I: nothing to fit
+    if m.to_cols_array().iter().map(|v| v.abs()).sum::<f64>() < 1e-6 * motions.len() as f64 {
+        return Err(fail("the object did not turn"));
     }
     let mut dir = null_vector(&m).ok_or_else(|| fail("the object did not turn"))?;
     let handed: f64 = motions
         .iter()
-        .map(|(delta, r, _)| delta.signum() * skew_vector(r).dot(dir))
+        .map(|(delta, q)| delta.signum() * skew_vector(&q.matrix3).dot(dir))
         .sum();
     if handed < 0.0 {
         dir = -dir;
@@ -115,20 +133,31 @@ pub fn fit_axis(samples: &[(f32, Affine3A)]) -> Result<AxisFit> {
     // (I - R) c = t for every motion, plus a . c = 0
     let mut ata = DMat3::from_cols(dir * dir.x, dir * dir.y, dir * dir.z);
     let mut atb = DVec3::ZERO;
-    for (_, r, t) in &motions {
-        let a = DMat3::IDENTITY - *r;
+    for (_, q) in motions {
+        let a = DMat3::IDENTITY - q.matrix3;
         ata += a.transpose() * a;
-        atb += a.transpose() * *t;
+        atb += a.transpose() * q.translation;
     }
     if ata.determinant().abs() < 1e-12 {
         return Err(fail("degenerate motions"));
     }
     let point = ata.inverse() * atb;
+    let measured: Vec<f64> = motions
+        .iter()
+        .map(|(_, q)| angle_about(&q.matrix3, dir).to_degrees())
+        .collect();
+    let (num, den) = motions
+        .iter()
+        .zip(&measured)
+        .fold((0.0, 0.0), |(n, d), ((delta, _), m)| {
+            (n + delta * m, d + delta * delta)
+        });
+    let gain = if den > 0.0 { num / den } else { 1.0 };
     let (mut sq_mm, mut sq_deg) = (0.0, 0.0);
-    for (delta, r, t) in &motions {
-        let res = (DMat3::IDENTITY - *r) * point - *t;
+    for ((delta, q), m) in motions.iter().zip(&measured) {
+        let res = (DMat3::IDENTITY - q.matrix3) * point - q.translation;
         sq_mm += res.length_squared();
-        sq_deg += (angle_about(r, dir).to_degrees() - delta).powi(2);
+        sq_deg += (m - gain * delta).powi(2);
     }
     let n = motions.len() as f64;
     Ok(AxisFit {
@@ -137,6 +166,7 @@ pub fn fit_axis(samples: &[(f32, Affine3A)]) -> Result<AxisFit> {
         rms_deg: (sq_deg / n).sqrt() as f32,
         rms_mm: (sq_mm / (3.0 * n)).sqrt() as f32,
         pairs: motions.len(),
+        angle_gain: gain as f32,
     })
 }
 

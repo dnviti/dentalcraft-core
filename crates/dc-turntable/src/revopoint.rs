@@ -44,10 +44,14 @@
 //! revolution (`+QT,TURNSPEED;` answers `17.5,90.0,2.0`: min, max, step),
 //! so `v = 360 / deg_per_s` clamped to 18..90 ([`turn_speed_value`]);
 //! live, `v = 18` turned at 21.4 deg/s. The tilt speed unit is not known
-//! (`+QR,TILTSPEED;` answers `6.8,90.0,1.0`); the alpha mapping assumes
-//! seconds for the full 60 degree travel, `v = 60 / deg_per_s` in 7..90
-//! ([`tilt_speed_value`]). Both only feed the motion estimate and the
-//! timeouts; rotation completion never relies on them.
+//! (`+QR,TILTSPEED;` answers `6.8,90.0,1.0`, but the firmware refuses
+//! `+CR,TILTSPEED=` with 7, 8, 10, 15, 20, 30 and 35, `FAIL,ERR=007`, and
+//! accepts 40, 45, 50, 55, 60 and 90, measured 2026-11-18); `v = 60`
+//! tilted 20 degrees in about 3 s, so the mapping assumes the speed grows
+//! with the value, `deg_per_s = v / 9`, `v` a multiple of 5 in 40..90
+//! ([`tilt_speed_value`], [`tilt_speed_deg_per_s`]). Both only feed the
+//! motion estimate and the timeouts; rotation completion never relies on
+//! them.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -68,8 +72,8 @@ pub const DEVICE_NAME: &str = "REVO_DUAL_AXIS_TABLE";
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Range of the rotation speed value (seconds per revolution).
 pub const TURN_SPEED_RANGE: (f32, f32) = (18.0, 90.0);
-/// Range of the tilt speed value (alpha: seconds for the full travel).
-pub const TILT_SPEED_RANGE: (f32, f32) = (7.0, 90.0);
+/// Range of the tilt speed value accepted by the firmware.
+pub const TILT_SPEED_RANGE: (f32, f32) = (40.0, 90.0);
 /// Tilt range used when the table does not answer `+QR,TILTANGLE;`.
 pub const DEFAULT_TILT_LIMITS: (f32, f32) = (-30.0, 30.0);
 /// Rotation speed assumed until one is set: value 36, what Revo Scan sends.
@@ -101,12 +105,19 @@ pub fn turn_speed_value(deg_per_s: f32) -> u32 {
         .round() as u32
 }
 
-/// Device value of `+CR,TILTSPEED=` for a tilt speed (deg/s), clamped to
-/// [`TILT_SPEED_RANGE`] (alpha mapping, see the module doc).
+/// Device value of `+CR,TILTSPEED=` for a tilt speed (deg/s): `9 *
+/// deg_per_s` rounded to a multiple of 5 and clamped to
+/// [`TILT_SPEED_RANGE`], the values the firmware accepts (see the module
+/// doc).
 pub fn tilt_speed_value(deg_per_s: f32) -> u32 {
-    (60.0 / deg_per_s)
-        .clamp(TILT_SPEED_RANGE.0, TILT_SPEED_RANGE.1)
-        .round() as u32
+    let v = (9.0 * deg_per_s).clamp(TILT_SPEED_RANGE.0, TILT_SPEED_RANGE.1);
+    (5.0 * (v / 5.0).round()) as u32
+}
+
+/// Tilt speed (deg/s) of the device value `v` (`v / 9`; `60` measured at
+/// about 6.7 deg/s).
+pub fn tilt_speed_deg_per_s(v: u32) -> f32 {
+    v as f32 / 9.0
 }
 
 /// The command strings.
@@ -729,7 +740,7 @@ impl Turntable for RevopointTurntable {
             AxisKind::Tilt => {
                 let v = tilt_speed_value(deg_per_s);
                 self.command(&cmd::tilt_speed(v))?;
-                self.model().tilt.set_speed(60.0 / v as f32);
+                self.model().tilt.set_speed(tilt_speed_deg_per_s(v));
             }
         }
         Ok(())

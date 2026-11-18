@@ -21,7 +21,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::jobs::{self, AutoPlan, CalibrationPlan, Job, JobShared, TableHandle, lock};
+use super::jobs::{self, AutoMode, AutoPlan, CalibrationPlan, Job, JobShared, TableHandle, lock};
 use super::{RigCalibration, RigJobKind, RigJobStatus, TurntableStatus, calibration_json};
 use crate::control::{
     NoParams, SCAN_AUTO, TURNTABLE_CALIBRATE, TURNTABLE_CALIBRATION, TURNTABLE_CONNECT,
@@ -96,11 +96,26 @@ pub(crate) struct SpeedParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct CalibrateParams {
-    /// Rotation steps, 3 to 36 (default 8).
+    /// Rotation steps, 3 to 36 (default 24).
     steps: Option<u32>,
-    /// Degrees per step, 5 to 120 (default 45); steps times step_deg must
+    /// Degrees per step, 5 to 120 (default 15); steps times step_deg must
     /// be 180 to 1080.
     step_deg: Option<f32>,
+    /// Frames averaged (per-pixel median) at each stop, 1 to 10 (default 3).
+    frames_per_stop: Option<u32>,
+    /// Wait after each move in seconds, 0 to 30 (default 0.5; at least the
+    /// scanner latency plus 0.4 s).
+    settle_s: Option<f32>,
+}
+
+/// How `scan.auto` turns the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AutoModeParam {
+    /// Stop every `step_deg`, capture, register from the turntable pose.
+    StopAndCapture,
+    /// Turn without stopping, tracking every frame.
+    Continuous,
 }
 
 /// Parameters of `scan.auto`.
@@ -112,13 +127,24 @@ pub(crate) struct AutoParams {
     tilts_deg: Option<Vec<f32>>,
     /// Rotation of each pass in degrees (default 360).
     rotation_deg: Option<f32>,
-    /// Rotation speed in degrees per second (default: the table's).
+    /// `stop-and-capture` (default with a calibration) or `continuous`
+    /// (default without).
+    mode: Option<AutoModeParam>,
+    /// Stop-and-capture: degrees between stops, 2 to 45 (default 10).
+    step_deg: Option<f32>,
+    /// Stop-and-capture: frames averaged (per-pixel median) at each stop,
+    /// 1 to 10 (default 3).
+    frames_per_stop: Option<u32>,
+    /// Rotation speed in degrees per second (default: 30 between stops;
+    /// continuous, about 2 degrees per frame at the scanner's frame rate,
+    /// 4 to 30).
     deg_per_s: Option<f32>,
-    /// Wait after each tilt before scanning, in seconds (default 0.5).
+    /// Wait after each move in seconds (default 0.5; at least the scanner
+    /// latency plus 0.4 s).
     settle_s: Option<f32>,
     /// Run without a turntable calibration (default false): no region of
-    /// interest and no motion prior, so only for setups where the
-    /// background is beyond the depth range.
+    /// interest and no motion prior, so only continuous and only for setups
+    /// where the background is beyond the depth range.
     allow_uncalibrated: Option<bool>,
 }
 
@@ -661,6 +687,28 @@ impl ScanController {
                 "settle_s {settle_s} not in [0, 30]"
             )));
         }
+        let calibrated = self.session.rig_calibration().is_some();
+        let mode = match p.mode {
+            Some(AutoModeParam::Continuous) => AutoMode::Continuous,
+            Some(AutoModeParam::StopAndCapture) if !calibrated => {
+                return Err(ScanError::RigUncalibrated);
+            }
+            None if !calibrated => AutoMode::Continuous,
+            _ => {
+                let step_deg = p.step_deg.unwrap_or(10.0);
+                let frames = p.frames_per_stop.unwrap_or(3);
+                if !(2.0..=45.0).contains(&step_deg) || !(1..=10).contains(&frames) {
+                    return Err(ScanError::InvalidParams(format!(
+                        "step_deg {step_deg} not in [2, 45] or frames_per_stop {frames} not in \
+                         [1, 10]"
+                    )));
+                }
+                AutoMode::Stops {
+                    step_deg,
+                    frames: frames as usize,
+                }
+            }
+        };
         match self.session.status().state {
             ScanState::Connected | ScanState::Stopped => self.session.start_held()?,
             ScanState::Scanning => self.session.rig_link().set_hold(true),
@@ -677,6 +725,7 @@ impl ScanController {
             deg_per_s: p.deg_per_s,
             settle: Duration::from_secs_f32(settle_s),
             has_tilt,
+            mode,
         };
         let steps = plan.steps();
         let job = jobs::start_auto(table, self.session.rig_link(), plan)?;
@@ -687,15 +736,21 @@ impl ScanController {
 
     fn calibrate(&mut self, p: &CalibrateParams) -> Result<Value> {
         let (table, axes, info) = self.job_prerequisites()?;
-        let steps = p.steps.unwrap_or(8);
-        let step_deg = p.step_deg.unwrap_or(45.0);
+        let steps = p.steps.unwrap_or(24);
+        let step_deg = p.step_deg.unwrap_or(15.0);
         let total = steps as f32 * step_deg;
+        let frames = p.frames_per_stop.unwrap_or(3);
+        let settle_s = p.settle_s.unwrap_or(0.5);
         if !(3..=36).contains(&steps)
             || !(5.0..=120.0).contains(&step_deg)
             || !(180.0..=1080.0).contains(&total)
+            || !(1..=10).contains(&frames)
+            || !(0.0..=30.0).contains(&settle_s)
         {
             return Err(ScanError::InvalidParams(format!(
-                "{steps} steps of {step_deg} degrees: steps 3 to 36, step_deg 5 to 120, 180 to 1080 degrees in all"
+                "{steps} steps of {step_deg} degrees, {frames} frames per stop, settle {settle_s} \
+                 s: steps 3 to 36, step_deg 5 to 120, 180 to 1080 degrees in all, 1 to 10 \
+                 frames, settle 0 to 30 s"
             )));
         }
         let status = self.session.status();
@@ -716,7 +771,8 @@ impl ScanController {
             steps,
             step_deg,
             tilt_deg,
-            roi_radius_mm: self.session.settings().roi_radius_mm,
+            frames: frames as usize,
+            settle: Duration::from_secs_f32(settle_s),
             scanner_serial: status.device.and_then(|d| d.serial),
             turntable_id: info.id,
             dir: self.rig.dir.clone(),

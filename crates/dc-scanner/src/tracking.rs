@@ -2,11 +2,18 @@
 //!
 //! Every new depth frame is registered onto the fused model with projective
 //! point-to-plane ICP (Newcombe et al. 2011, *KinectFusion*): the model is
-//! ray cast from the previous camera pose ([`TsdfVolume::raycast`], at a
-//! reduced resolution), each frame point is projected into that synthetic
-//! view to find its partner, and the linearised point-to-plane system is
-//! solved with [`dc_geom::icp::point_to_plane_step`]. The caller supplies
-//! the initial guess (constant-velocity prediction).
+//! ray cast from the initial guess of the camera pose
+//! ([`TsdfVolume::raycast`], at a reduced resolution), each frame point is
+//! projected into that synthetic view to find its partner, and the
+//! linearised point-to-plane system is solved with
+//! [`dc_geom::icp::point_to_plane_solve`]. The caller supplies the initial
+//! guess: the turntable prior or a constant-velocity prediction.
+//!
+//! The solve is robust and degeneracy-aware: every pair is weighted by
+//! Tukey's biweight of its residual (cut at the current gate), and the
+//! motions the pairs barely constrain (turning a surface of revolution
+//! about its axis, sliding along a plane) keep the initial guess
+//! ([`TrackParams::min_relative_eigen`]).
 //!
 //! The frame is first sampled with [`sample_frame`]: a regular grid over
 //! the image whose step is chosen from the number of *valid* pixels, so a
@@ -19,11 +26,13 @@
 //! gate, the points are within that gate plus the size of one model pixel
 //! (the model is ray cast at a coarser resolution than the frame), and the
 //! frame and model normals agree within [`TrackParams::max_normal_deg`]. A
-//! frame is accepted when enough of its samples pair up, the plane residual
-//! is small and the motion since the previous frame is plausible; otherwise
-//! it counts as lost and is not fused.
+//! frame is accepted when enough of its samples pair up (samples marked
+//! [`FrameSample::excluded`], e.g. on the turntable platter, which pairs
+//! under any rotation, do not count), the plane residual is small and the
+//! correction applied to the initial guess is plausible; otherwise it
+//! counts as lost and is not fused.
 
-use dc_geom::icp::{point_to_plane_step, rotation_angle};
+use dc_geom::icp::{point_to_plane_solve, rotation_angle};
 use dc_geom::tsdf::{CameraIntrinsics, TsdfVolume};
 use glam::{Affine3A, DAffine3, DVec3, Vec3};
 use rayon::prelude::*;
@@ -35,15 +44,19 @@ pub struct TrackParams {
     pub gates_mm: [f32; 3],
     /// Iterations per stage at most.
     pub iterations_per_stage: usize,
-    /// Fewest pairs for a valid solve.
+    /// Fewest counted pairs for a valid solve and an accepted frame.
     pub min_inliers: usize,
-    /// Fewest pairs as a fraction of the frame samples for an accepted frame.
+    /// Fewest counted pairs as a fraction of the counted frame samples
+    /// (those not [`FrameSample::excluded`]) for an accepted frame.
     pub min_inlier_fraction: f32,
     /// Largest accepted RMS point-to-plane residual (mm).
     pub max_rms_mm: f32,
-    /// Largest accepted camera translation between two frames (mm).
+    /// Largest accepted correction of the initial guess, as the shift of
+    /// the centroid of the frame samples (mm) by `initial^-1 * pose`: the
+    /// motion of the scanned surface, not of the far camera origin.
     pub max_step_mm: f32,
-    /// Largest accepted camera rotation between two frames (degrees).
+    /// Largest accepted correction of the initial guess, as a camera
+    /// rotation (degrees).
     pub max_step_deg: f32,
     /// The model is ray cast at most this many pixels wide.
     pub max_model_width: u32,
@@ -55,6 +68,10 @@ pub struct TrackParams {
     pub max_slope: f32,
     /// Largest angle between the frame and model normals of a pair (degrees).
     pub max_normal_deg: f32,
+    /// Motions whose eigenvalue in the point-to-plane system is below this
+    /// fraction of the largest keep the initial guess (degeneracy guard,
+    /// see [`point_to_plane_solve`]).
+    pub min_relative_eigen: f64,
 }
 
 impl Default for TrackParams {
@@ -71,9 +88,16 @@ impl Default for TrackParams {
             target_points: 8000,
             max_slope: 4.0,
             max_normal_deg: 30.0,
+            min_relative_eigen: 2e-3,
         }
     }
 }
+
+/// Largest correction of a turntable prior (mm), see
+/// [`TrackParams::with_prior`].
+pub const PRIOR_MAX_STEP_MM: f32 = 5.0;
+/// Largest correction of a turntable prior (degrees).
+pub const PRIOR_MAX_STEP_DEG: f32 = 5.0;
 
 impl TrackParams {
     /// Pixel stride that samples about [`TrackParams::target_points`] of
@@ -84,6 +108,18 @@ impl TrackParams {
             .ceil()
             .max(1.0) as u32
     }
+
+    /// The parameters for an initial guess predicted by a calibrated
+    /// turntable: the correction is held to [`PRIOR_MAX_STEP_MM`] and
+    /// [`PRIOR_MAX_STEP_DEG`], since a larger one means the solve slid
+    /// away from a good guess.
+    pub fn with_prior(self) -> Self {
+        Self {
+            max_step_mm: PRIOR_MAX_STEP_MM,
+            max_step_deg: PRIOR_MAX_STEP_DEG,
+            ..self
+        }
+    }
 }
 
 /// The tracking samples of a depth frame (camera space, mm).
@@ -93,6 +129,22 @@ pub struct FrameSample {
     pub points: Vec<Vec3>,
     /// Unit normal of each point, facing the camera.
     pub normals: Vec<Vec3>,
+    /// Per point: it is solved with but not counted as evidence of a good
+    /// pose (on the turntable platter, a plane that pairs under any turn).
+    /// Empty: every point counts.
+    pub excluded: Vec<bool>,
+}
+
+impl FrameSample {
+    /// The point `i` counts for the acceptance of a frame.
+    pub fn counts(&self, i: usize) -> bool {
+        !self.excluded.get(i).copied().unwrap_or(false)
+    }
+
+    /// Points that count for the acceptance of a frame.
+    pub fn counted(&self) -> usize {
+        self.points.len() - self.excluded.iter().filter(|e| **e).count()
+    }
 }
 
 /// Offset (pixels) of the neighbours used for the edge test and normals.
@@ -166,12 +218,18 @@ pub fn sample_frame(
 pub struct TrackResult {
     /// Estimated camera-to-world pose of the frame.
     pub pose: Affine3A,
-    /// RMS point-to-plane residual of the final pairs (mm).
+    /// RMS point-to-plane residual of the final counted pairs (mm).
     pub rms_mm: f32,
-    /// Number of final pairs.
+    /// Number of final counted pairs (not [`FrameSample::excluded`]).
     pub inliers: usize,
     /// Solves performed.
     pub iterations: usize,
+    /// Conditioning of the last solve (see
+    /// [`dc_geom::icp::PlaneSolve::conditioning`]).
+    pub conditioning: f64,
+    /// The last solve kept the initial guess along at least one weakly
+    /// constrained motion.
+    pub degenerate: bool,
     /// The frame passed every acceptance test.
     pub ok: bool,
 }
@@ -234,17 +292,25 @@ impl ModelView {
         ok.then_some((q, n))
     }
 
-    /// Pairs of the frame samples placed by `pose`.
-    fn pairs(&self, frame: &FrameSample, pose: &DAffine3, gate: f64) -> Vec<(DVec3, DVec3, DVec3)> {
+    /// Pairs of the frame samples placed by `pose`: frame point, model
+    /// point, model normal, whether the sample counts.
+    fn pairs(
+        &self,
+        frame: &FrameSample,
+        pose: &DAffine3,
+        gate: f64,
+    ) -> Vec<(DVec3, DVec3, DVec3, bool)> {
         frame
             .points
             .par_iter()
             .zip(frame.normals.par_iter())
+            .enumerate()
             .with_min_len(512)
-            .filter_map(|(p, n)| {
+            .filter_map(|(i, (p, n))| {
                 let w = pose.transform_point3(p.as_dvec3());
                 let wn = pose.transform_vector3(n.as_dvec3());
-                self.partner(w, wn, gate).map(|(q, n)| (w, q, n))
+                self.partner(w, wn, gate)
+                    .map(|(q, n)| (w, q, n, frame.counts(i)))
             })
             .collect()
     }
@@ -258,39 +324,64 @@ fn to_f(a: &DAffine3) -> Affine3A {
     Affine3A::from_mat3_translation(a.matrix3.as_mat3(), a.translation.as_vec3())
 }
 
+/// Tukey's biweight of the residual `r` with cut-off `c`.
+fn tukey(r: f64, c: f64) -> f64 {
+    let u = r / c;
+    if u.abs() >= 1.0 {
+        0.0
+    } else {
+        (1.0 - u * u).powi(2)
+    }
+}
+
 /// Registers the frame samples `frame` (camera space, mm, from
-/// [`sample_frame`]) onto the model in `volume`, ray cast from `model_pose`
-/// with the frame intrinsics `intr`, starting from the camera-to-world
-/// guess `initial`.
+/// [`sample_frame`]) onto the model in `volume`, starting from the
+/// camera-to-world guess `initial`, from which the model is ray cast with
+/// the frame intrinsics `intr`. The acceptance limits on the motion apply
+/// to the correction `initial^-1 * pose`.
 pub fn track_frame(
     volume: &TsdfVolume,
     frame: &FrameSample,
     intr: &CameraIntrinsics,
-    model_pose: &Affine3A,
     initial: &Affine3A,
     params: &TrackParams,
 ) -> TrackResult {
-    let view = ModelView::new(volume, intr, model_pose, params);
+    let view = ModelView::new(volume, intr, initial, params);
     let mut pose = to_d(initial);
     let mut iterations = 0;
-    let failed = |pose: &DAffine3, iterations| TrackResult {
+    let (mut conditioning, mut degenerate) = (0.0, false);
+    let failed = |pose: &DAffine3, iterations, conditioning| TrackResult {
         pose: to_f(pose),
         rms_mm: f32::INFINITY,
         inliers: 0,
         iterations,
+        conditioning,
+        degenerate: true,
         ok: false,
     };
     for &gate in &params.gates_mm {
         for _ in 0..params.iterations_per_stage {
             let pairs = view.pairs(frame, &pose, gate as f64);
             if pairs.len() < params.min_inliers.max(dc_geom::icp::MIN_PAIRS) {
-                return failed(&pose, iterations);
+                return failed(&pose, iterations, conditioning);
             }
-            let (p, (q, n)): (Vec<DVec3>, (Vec<DVec3>, Vec<DVec3>)) =
-                pairs.into_iter().map(|(p, q, n)| (p, (q, n))).unzip();
-            let Ok(delta) = point_to_plane_step(&p, &q, &n) else {
-                return failed(&pose, iterations);
+            let mut p = Vec::with_capacity(pairs.len());
+            let mut q = Vec::with_capacity(pairs.len());
+            let mut n = Vec::with_capacity(pairs.len());
+            let mut w = Vec::with_capacity(pairs.len());
+            for (a, b, c, _) in pairs {
+                w.push(tukey((b - a).dot(c), gate as f64));
+                p.push(a);
+                q.push(b);
+                n.push(c);
+            }
+            let Ok(solve) = point_to_plane_solve(&p, &q, &n, Some(&w), params.min_relative_eigen)
+            else {
+                return failed(&pose, iterations, conditioning);
             };
+            conditioning = solve.conditioning;
+            degenerate = solve.weak > 0;
+            let delta = solve.delta;
             pose = delta * pose;
             iterations += 1;
             let moved = delta.translation.length();
@@ -301,28 +392,33 @@ pub fn track_frame(
     }
     let gate = params.gates_mm[2] as f64;
     let pairs = view.pairs(frame, &pose, gate);
-    let inliers = pairs.len();
+    let (inliers, sq) = pairs
+        .iter()
+        .filter(|pair| pair.3)
+        .fold((0usize, 0.0), |(k, s), (p, q, n, _)| {
+            (k + 1, s + (p - q).dot(*n).powi(2))
+        });
     let rms = if inliers == 0 {
         f64::INFINITY
     } else {
-        (pairs
-            .iter()
-            .map(|(p, q, n)| (p - q).dot(*n).powi(2))
-            .sum::<f64>()
-            / inliers as f64)
-            .sqrt()
+        (sq / inliers as f64).sqrt()
     };
-    let step = to_d(model_pose).inverse() * pose;
+    let step = to_d(initial).inverse() * pose;
+    let centroid =
+        frame.points.iter().map(|p| p.as_dvec3()).sum::<DVec3>() / frame.points.len().max(1) as f64;
+    let shift = step.transform_point3(centroid).distance(centroid);
     let ok = inliers >= params.min_inliers
-        && inliers as f32 >= params.min_inlier_fraction * frame.points.len() as f32
+        && inliers as f32 >= params.min_inlier_fraction * frame.counted() as f32
         && rms <= params.max_rms_mm as f64
-        && step.translation.length() <= params.max_step_mm as f64
+        && shift <= params.max_step_mm as f64
         && rotation_angle(&step).to_degrees() <= params.max_step_deg as f64;
     TrackResult {
         pose: to_f(&pose),
         rms_mm: rms as f32,
         inliers,
         iterations,
+        conditioning,
+        degenerate,
         ok,
     }
 }
@@ -362,7 +458,6 @@ mod tests {
             &volume,
             &sample,
             &f1.intrinsics,
-            &Affine3A::IDENTITY,
             &Affine3A::IDENTITY,
             &params,
         );
@@ -422,5 +517,115 @@ mod tests {
                 .points
                 .is_empty()
         );
+    }
+
+    /// A fixed rig camera looking at the turntable scene, frames at table
+    /// angles, and the camera-frame platter motion of the simulation.
+    fn rig() -> (SimDevice, Affine3A) {
+        use dc_turntable::sim::SimRig;
+        let options = SimOptions {
+            realtime: false,
+            width: 200,
+            height: 125,
+            ..SimOptions::default()
+        };
+        let info = SimBackend::default().list().unwrap()[0].clone();
+        let camera = crate::sim::rig_camera_pose(&options);
+        let dev = SimDevice::new(info, &typodont_arch(true), options)
+            .unwrap()
+            .with_rig(SimRig::new())
+            .unwrap();
+        (dev, camera)
+    }
+
+    /// Camera pose at table angle `deg`, world = camera at angle 0.
+    fn prior(camera: &Affine3A, deg: f32) -> Affine3A {
+        let m = camera.inverse()
+            * crate::sim::rig_platter(dc_turntable::sim::RigPose {
+                rotate_deg: deg,
+                tilt_deg: 0.0,
+            })
+            * *camera;
+        m.inverse()
+    }
+
+    fn rig_frame(dev: &SimDevice, deg: f32) -> crate::DepthFrame {
+        dev.render_rig(
+            7,
+            dc_turntable::sim::RigPose {
+                rotate_deg: deg,
+                tilt_deg: 0.0,
+            },
+        )
+    }
+
+    #[test]
+    fn a_gap_of_lost_frames_recovers_from_the_turntable_prior() {
+        let (dev, camera) = rig();
+        let f0 = rig_frame(&dev, 0.0);
+        let k = f0.intrinsics;
+        let mut volume = TsdfVolume::new(TsdfParams {
+            voxel_mm: 0.4,
+            trunc_mm: 1.6,
+            max_weight: 64.0,
+        });
+        volume.integrate(&f0.depth_mm, &k, &Affine3A::IDENTITY);
+        let params = TrackParams {
+            max_rms_mm: 0.3,
+            ..TrackParams::default()
+        }
+        .with_prior();
+        // 15 degrees since the last tracked frame (several frames lost):
+        // the prior is far from the last pose but close to the truth
+        let f = rig_frame(&dev, 15.0);
+        let truth = prior(&camera, 15.0);
+        let s = sample_frame(&f.depth_mm, &k, &params);
+        let r = track_frame(&volume, &s, &k, &truth, &params);
+        assert!(r.ok, "{r:?}");
+        let err = to_d(&truth).inverse() * to_d(&r.pose);
+        let c = DVec3::new(0.0, 0.0, 100.0);
+        assert!(err.transform_point3(c).distance(c) < 0.2, "{err:?}");
+        // a guess 8 degrees off: whatever the solve finds, a correction
+        // that large is refused
+        let off = prior(&camera, 23.0);
+        let r = track_frame(&volume, &s, &k, &off, &params);
+        let moved = rotation_angle(&(to_d(&off).inverse() * to_d(&r.pose))).to_degrees();
+        assert!(!r.ok || moved <= 5.0, "{r:?}");
+    }
+
+    #[test]
+    fn platter_points_alone_do_not_accept_a_frame() {
+        let (dev, camera) = rig();
+        let f0 = rig_frame(&dev, 0.0);
+        let k = f0.intrinsics;
+        let mut volume = TsdfVolume::new(TsdfParams {
+            voxel_mm: 0.4,
+            trunc_mm: 1.6,
+            max_weight: 64.0,
+        });
+        volume.integrate(&f0.depth_mm, &k, &Affine3A::IDENTITY);
+        let params = TrackParams::default().with_prior();
+        let f = rig_frame(&dev, 4.0);
+        let mut s = sample_frame(&f.depth_mm, &k, &params);
+        let guess = prior(&camera, 4.0);
+        assert!(track_frame(&volume, &s, &k, &guess, &params).ok);
+        // every point within 30 mm of the scene floor of the model (the
+        // typodont stands on the platter at z = 0) counts as platter: what
+        // is left does not count, so the frame is not accepted on them
+        s.excluded = s
+            .points
+            .iter()
+            .map(|p| camera.transform_point3(*p).z < 30.0)
+            .collect();
+        assert_eq!(s.counted(), 0);
+        let r = track_frame(&volume, &s, &k, &guess, &params);
+        assert!(!r.ok && r.inliers == 0, "{r:?}");
+        // a few counted points among many platter pairs: below the fraction
+        let n = s.points.len();
+        for e in s.excluded.iter_mut().step_by(n / 50) {
+            *e = false;
+        }
+        let r = track_frame(&volume, &s, &k, &guess, &params);
+        assert!(!r.ok, "{r:?}");
     }
 }
