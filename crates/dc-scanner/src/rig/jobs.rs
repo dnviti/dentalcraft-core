@@ -79,8 +79,12 @@ pub(crate) const CONTINUOUS_DEG_PER_S: (f32, f32) = (4.0, 30.0);
 /// flagged stop is fused at the turntable pose, which the recorded data
 /// show exact: a full turn ends on the very first view).
 const MIN_FUSED_STOPS: f32 = 0.5;
-/// Stops: more than this fraction of flagged stops is a warning.
-const WEAK_FLAGGED_FRACTION: f32 = 0.2;
+/// Stops: a mean residual of the fused stops above this (mm) is a warning.
+/// On the rig the stops fused at the turntable pose show 0.27-0.29 mm (the
+/// registration refinement is refused on most real stops: the turntable
+/// is exact, the single-view registration is not, so a flagged stop is
+/// not a weakness by itself).
+const WEAK_RMS_MM: f32 = 0.4;
 /// A loop error beyond this (degrees) is a warning.
 const WEAK_LOOP_DEG: f32 = 1.0;
 /// Continuous: a scan fusing less than this fraction of its frames fails.
@@ -432,7 +436,7 @@ fn judge(quality: &ScanQuality, mode: AutoMode) -> Result<()> {
 fn warning(quality: &ScanQuality, mode: AutoMode) -> Option<String> {
     let weak = match mode {
         AutoMode::Stops { .. } => {
-            quality.flagged_stops as f32 > WEAK_FLAGGED_FRACTION * quality.stops.max(1) as f32
+            quality.mean_rms_mm.is_some_and(|r| r > WEAK_RMS_MM)
                 || quality
                     .loop_error_deg
                     .iter()
@@ -749,6 +753,12 @@ mod tests {
         assert!(judge(&q, stops).is_ok());
         assert_eq!(warning(&q, stops), None);
         q.flagged_stops = 10;
+        q.mean_rms_mm = Some(0.28);
+        assert_eq!(warning(&q, stops), None);
+        q.mean_rms_mm = Some(0.5);
+        assert_eq!(warning(&q, stops).as_deref(), Some(WARN_SCAN_QUALITY_WEAK));
+        q.mean_rms_mm = Some(0.28);
+        q.loop_error_deg = vec![0.06, -1.4];
         assert_eq!(warning(&q, stops).as_deref(), Some(WARN_SCAN_QUALITY_WEAK));
         q.flagged_stops = 30;
         assert!(judge(&q, stops).is_ok());
