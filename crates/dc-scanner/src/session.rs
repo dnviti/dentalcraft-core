@@ -104,6 +104,10 @@ pub struct ScanSettings {
     /// device that supports it, see [`crate::revopoint_usb::light`]);
     /// `false` turns it off or leaves it as the device keeps it.
     pub fill_light: bool,
+    /// Run the scanner at its fast frame rate (on a device that supports
+    /// it, see [`crate::revopoint_usb::exposure`]): about 6.8 instead of
+    /// 2.7 frames per second on the MINI 2. `false` sends nothing.
+    pub fast_exposure: bool,
 }
 
 impl Default for ScanSettings {
@@ -117,6 +121,7 @@ impl Default for ScanSettings {
             roi_height_mm: crate::rig::DEFAULT_ROI_HEIGHT_MM,
             use_roi: true,
             fill_light: true,
+            fast_exposure: true,
         }
     }
 }
@@ -579,6 +584,7 @@ impl ScanSession {
             .exposure_us
             .map_or(Ok(()), |us| device.set_exposure_us(us))
             .and_then(|()| device.set_fill_light(self.settings.fill_light))
+            .and_then(|()| device.set_fast_exposure(self.settings.fast_exposure))
             .and_then(|()| device.start());
         if let Err(e) = started {
             self.device = Some(device);

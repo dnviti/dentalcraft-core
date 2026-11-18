@@ -20,7 +20,7 @@
 //! | `scan.stop` | none | `{points}` (the cloud becomes the editable scan) |
 //! | `scan.reset` | none | `{}` (discards the scan and its edits) |
 //! | `scan.status` | none | status + `editor` |
-//! | `scan.settings` | `live_voxel_mm?`, `min_depth_mm?`, `max_depth_mm?`, `exposure_us?`, `roi_radius_mm?`, `roi_height_mm?`, `use_roi?` | current settings |
+//! | `scan.settings` | `live_voxel_mm?`, `min_depth_mm?`, `max_depth_mm?`, `exposure_us?`, `roi_radius_mm?`, `roi_height_mm?`, `use_roi?`, `fill_light?`, `fast_exposure?` | current settings |
 //! | `scan.cloud` | `op`: a [`CloudOp`] | the op's summary + `editor` |
 //! | `scan.mesh-build` | `resolution_mm` | vertices / faces + `editor` |
 //! | `scan.mesh` | `op`: a [`MeshOp`] | the op's summary + `editor` |
@@ -332,6 +332,9 @@ struct SettingsParams {
     /// Keep the scanner's fill light steadily on while scanning (default
     /// true; false turns it off).
     fill_light: Option<bool>,
+    /// Run the scanner at its fast frame rate (default true; on the MINI 2
+    /// about 6.8 instead of 2.7 frames per second).
+    fast_exposure: Option<bool>,
 }
 
 /// Parameters of `scan.cloud`.
@@ -720,7 +723,8 @@ impl ScanController {
             || p.roi_radius_mm.is_some()
             || p.roi_height_mm.is_some()
             || p.use_roi.is_some()
-            || p.fill_light.is_some();
+            || p.fill_light.is_some()
+            || p.fast_exposure.is_some();
         if given {
             if let Some(v) = p.live_voxel_mm {
                 s.live_voxel_mm = v;
@@ -746,6 +750,9 @@ impl ScanController {
             if let Some(v) = p.fill_light {
                 s.fill_light = v;
             }
+            if let Some(v) = p.fast_exposure {
+                s.fast_exposure = v;
+            }
             self.session.set_settings(s)?;
         }
         let s = self.session.settings();
@@ -758,6 +765,7 @@ impl ScanController {
             "roi_height_mm": s.roi_height_mm,
             "use_roi": s.use_roi,
             "fill_light": s.fill_light,
+            "fast_exposure": s.fast_exposure,
         }))
     }
 

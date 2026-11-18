@@ -6,12 +6,14 @@
 //! frames, the colour node (interface 2) `MJPG` 1600x1200. This backend
 //! reads the depth node with the standard capture API of the system, plain
 //! V4L2 calls on Linux (`v4l2`) and Media Foundation on Windows (`mf`, on
-//! the inbox UVC driver `usbvideo`), and needs no vendor SDK. Its only
-//! vendor command is the fill light ([`light`]: on while streaming, off
-//! after, a closed list of lines the user authorised on 2026-11-18, Linux
-//! only); it sends no other extension-unit request, no HID report and no
-//! firmware. The colour stream is not read (it is not registered to the
-//! depth image, and stopping it also resets the depth stream).
+//! the inbox UVC driver `usbvideo`), and needs no vendor SDK. Its vendor
+//! commands are closed lists the user authorised on 2026-11-18, Linux only:
+//! the fill light ([`light`]: on while streaming, off after), the fast
+//! exposure profile ([`exposure`]) and the read-only factory calibration
+//! file read ([`factory`]). It sends no other extension-unit request, no
+//! HID report and no firmware. The colour stream is not read (it is not
+//! registered to the depth image, and stopping it also resets the depth
+//! stream).
 //!
 //! * **Discovery.** [`ScannerBackend::list`] enumerates the USB devices with
 //!   `nusb` and keeps the `2207:110c` devices. On Linux their V4L2 nodes are
@@ -29,13 +31,15 @@
 //!   a header (device time, IMU orientation), the rest is depth as `u16`
 //!   times the depth scale; `0` is no depth. Frames are copied out of the
 //!   driver buffers before these are queued again.
-//! * **Calibration.** Intrinsics and depth scale come from a user file or
-//!   the alpha defaults, see [`calib`]. Without a calibration file the
-//!   geometry is an estimate (focal length from the published field of
-//!   view, depth scale measured on one unit).
+//! * **Calibration.** Intrinsics and depth scale come from a user file, else
+//!   the factory calibration read from the scanner and cached, else the
+//!   alpha defaults, see [`calib`] and [`factory`]. The depth scale is an
+//!   estimate measured on one unit in every case but a user file.
 //! * **Exposure.** The device runs its own auto exposure; V4L2 offers only
-//!   brightness and gain, which are not an exposure time.
-//!   [`ScannerDevice::set_exposure_us`] is therefore a no-op.
+//!   brightness and gain, which are not an exposure time, so
+//!   [`ScannerDevice::set_exposure_us`] is a no-op. The fast profile
+//!   ([`exposure`], [`crate::ScanSettings::fast_exposure`]) shortens the
+//!   pattern time: about 6.8 instead of 2.7 frames per second.
 //!
 //! # Stop and restart
 //!
@@ -66,6 +70,8 @@
 pub mod calib;
 #[cfg(any(target_os = "linux", windows))]
 mod device;
+pub mod exposure;
+pub mod factory;
 pub mod frame;
 pub mod light;
 #[cfg(target_os = "linux")]
@@ -91,6 +97,8 @@ use serde::{Deserialize, Serialize};
 pub use calib::{Calibration, CalibrationSource};
 #[cfg(any(target_os = "linux", windows))]
 pub use device::RevopointUsbDevice;
+pub use exposure::ExposureProfile;
+pub use factory::FactoryFile;
 pub use frame::StreamMode;
 pub use light::FillLight;
 

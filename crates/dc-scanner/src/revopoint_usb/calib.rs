@@ -1,24 +1,27 @@
 //! Calibration of the depth image: pinhole intrinsics and depth scale.
 //!
-//! The backend sends nothing to the device, so it cannot read the factory
-//! calibration. It uses, in this order:
+//! It comes from, in this order:
 //!
 //! 1. the file named by [`CALIB_ENV`], when set (it must exist);
 //! 2. `calib.yaml`, else `calib.json`, in [`default_calib_dir`]
 //!    (`<data dir>/dentalcraft/revopoint-usb/`);
-//! 3. the alpha defaults ([`Calibration::default`]).
+//! 3. the factory calibration of the scanner, read from the device once and
+//!    cached ([`super::factory`]);
+//! 4. the alpha defaults ([`Calibration::default`]).
 //!
 //! A file overrides the defaults key by key. Keys (millimetres and pixels):
 //! `fx`, `fy`, `cx`, `cy`, `depth_scale` (mm per raw depth unit), and
 //! optionally `width` / `height`, the image size the intrinsics refer to
 //! (default 800x600; other sizes are scaled to the 800x600 depth image).
-//! Unknown keys are ignored, so a vendor `camparam.yaml` that uses these
-//! names can be used as is.
+//! Unknown keys are ignored.
 //!
 //! * JSON: one object, e.g. `{"fx": 1190, "fy": 1190, "cx": 399.5,
 //!   "cy": 299.5, "depth_scale": 0.004}`.
 //! * YAML: `key: number` lines (OpenCV `%YAML:1.0` headers, `---`, comments
 //!   and nesting are accepted; a key is found at any depth).
+//! * The vendor `camparam.yaml` (OpenCV matrices, [`parse_camparam`]) is
+//!   recognised by its `!!opencv-matrix` tags and used as is: the pinhole
+//!   is its rectified left projection `pL`.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -90,6 +93,9 @@ pub enum CalibrationSource {
     Defaults,
     /// This file, over the defaults.
     File(PathBuf),
+    /// The factory calibration of the scanner, cached in this file
+    /// ([`super::factory`]).
+    Factory(PathBuf),
 }
 
 /// The keys of a calibration file; each one overrides its default.
@@ -201,6 +207,9 @@ impl CalibrationKeys {
 /// [`ScanError::InvalidParams`] for malformed text, values out of range, or
 /// a file with none of the keys.
 pub fn parse_calibration(text: &str) -> Result<Calibration> {
+    if text.contains(OPENCV_MATRIX_TAG) {
+        return parse_camparam(text);
+    }
     let keys = if text.trim_start().starts_with('{') {
         serde_json::from_str::<CalibrationKeys>(text)
             .map_err(|e| ScanError::InvalidParams(e.to_string()))?
@@ -208,6 +217,145 @@ pub fn parse_calibration(text: &str) -> Result<Calibration> {
         CalibrationKeys::from_yaml(text)?
     };
     keys.apply()
+}
+
+/// Tag of a matrix in an OpenCV YAML file.
+const OPENCV_MATRIX_TAG: &str = "!!opencv-matrix";
+
+/// The top-level scalar `name` of an OpenCV YAML file, without quotes.
+fn opencv_scalar<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    text.lines().find_map(|line| {
+        let rest = line.strip_prefix(name)?.trim_start().strip_prefix(':')?;
+        Some(rest.trim().trim_matches(['"', '\'']))
+    })
+}
+
+/// The top-level matrix `name` of an OpenCV YAML file (`name:
+/// !!opencv-matrix`, then `rows`, `cols`, `dt` and `data: [..]`, the data
+/// possibly over several lines): `(rows, cols, row-major data)`.
+///
+/// # Errors
+/// [`ScanError::InvalidParams`] for a matrix without sizes, with a number
+/// that does not parse or with `rows * cols` values missing.
+fn opencv_matrix(text: &str, name: &str) -> Result<Option<(usize, usize, Vec<f64>)>> {
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let Some(rest) = line
+            .strip_prefix(name)
+            .and_then(|r| r.trim_start().strip_prefix(':'))
+        else {
+            continue;
+        };
+        if !rest.contains(OPENCV_MATRIX_TAG) {
+            continue;
+        }
+        let (mut rows, mut cols, mut data) = (None, None, None::<String>);
+        for l in lines.by_ref() {
+            let t = l.trim();
+            if let Some(d) = data.as_mut() {
+                d.push(' ');
+                d.push_str(t);
+            } else if let Some(v) = t.strip_prefix("rows:") {
+                rows = v.trim().parse::<usize>().ok();
+            } else if let Some(v) = t.strip_prefix("cols:") {
+                cols = v.trim().parse::<usize>().ok();
+            } else if let Some(v) = t.strip_prefix("data:") {
+                data = Some(v.trim().to_owned());
+            } else if !t.is_empty() && !l.starts_with([' ', '\t']) {
+                break;
+            }
+            if data.as_deref().is_some_and(|d| d.contains(']')) {
+                break;
+            }
+        }
+        let bad = |what: &str| ScanError::InvalidParams(format!("matrix `{name}`: {what}"));
+        let (Some(rows), Some(cols)) = (rows, cols) else {
+            return Err(bad("no rows/cols"));
+        };
+        let data = data.ok_or_else(|| bad("no data"))?;
+        let inner = data
+            .trim()
+            .strip_prefix('[')
+            .and_then(|d| d.split_once(']'))
+            .map(|(d, _)| d)
+            .ok_or_else(|| bad("data is not a [list]"))?;
+        let values = inner
+            .split(',')
+            .map(|v| v.trim().parse::<f64>().map_err(|_| bad("not a number")))
+            .collect::<Result<Vec<f64>>>()?;
+        if values.len() != rows * cols {
+            return Err(bad("wrong number of values"));
+        }
+        return Ok(Some((rows, cols, values)));
+    }
+    Ok(None)
+}
+
+/// Parses the vendor `camparam.yaml` (OpenCV YAML, see [`super::factory`]):
+/// the pinhole is `pL`, the projection of the rectified left camera, which
+/// is the view of the depth image, at `width` x `height` (default
+/// 800x600). The depth scale keeps its default (the file has none).
+///
+/// # Errors
+/// [`ScanError::InvalidParams`] without a 3x4 `pL` or for values out of
+/// range.
+pub fn parse_camparam(text: &str) -> Result<Calibration> {
+    let size = |name: &str| {
+        opencv_scalar(text, name)
+            .map(|v| {
+                v.parse::<u32>().map_err(|_| {
+                    ScanError::InvalidParams(format!("camparam `{name}` is not a pixel count"))
+                })
+            })
+            .transpose()
+    };
+    let (width, height) = (size("width")?, size("height")?);
+    let p = match opencv_matrix(text, "pL")? {
+        Some((3, 4, p)) => p,
+        Some(_) => return Err(ScanError::InvalidParams("camparam `pL` is not 3x4".into())),
+        None => return Err(ScanError::InvalidParams("camparam has no `pL`".into())),
+    };
+    CalibrationKeys {
+        fx: Some(p[0] as f32),
+        fy: Some(p[5] as f32),
+        cx: Some(p[2] as f32),
+        cy: Some(p[6] as f32),
+        depth_scale: None,
+        width,
+        height,
+    }
+    .apply()
+}
+
+/// Parses the vendor `Pl.bin`: ten little-endian `f32`, one pad then the
+/// 3x3 pinhole of the rectified left camera (`fx 0 cx / 0 fy cy / 0 0 1`),
+/// at the 800x600 of the depth image (as `camparam.yaml` of the MINI 2
+/// states for the same values).
+///
+/// # Errors
+/// [`ScanError::InvalidParams`] for another size or not a pinhole.
+pub fn parse_pl_bin(bytes: &[u8]) -> Result<Calibration> {
+    let v: Vec<f32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect();
+    let pinhole =
+        v.len() == 10 && bytes.len() == 40 && [v[2], v[4], v[7], v[8]] == [0.0; 4] && v[9] == 1.0;
+    if !pinhole {
+        return Err(ScanError::InvalidParams(
+            "Pl.bin is not 40 bytes of a 3x3 pinhole".into(),
+        ));
+    }
+    CalibrationKeys {
+        fx: Some(v[1]),
+        fy: Some(v[5]),
+        cx: Some(v[3]),
+        cy: Some(v[6]),
+        ..CalibrationKeys::default()
+    }
+    .apply()
 }
 
 /// The per-user calibration directory, `<data dir>/dentalcraft/revopoint-usb`
@@ -299,6 +447,62 @@ mod tests {
         let k = c.intrinsics;
         assert_eq!((k.fx, k.fy, k.cx, k.cy), (1200.0, 1200.0, 399.5, 299.5));
         assert_eq!(c.depth_scale_mm, DEFAULT_DEPTH_SCALE_MM);
+    }
+
+    /// The layout of the vendor `camparam.yaml` (values made up).
+    const CAMPARAM: &str = "%YAML:1.0\n---\ndeviceID: \"X1\"\nwidth: \"800\"\nheight: \"600\"\n\
+        cameraMatrixL: !!opencv-matrix\n   rows: 3\n   cols: 3\n   dt: d\n   data: [ 1.1e+03, 0., \
+        4.1e+02, 0.,\n       1.1e+03, 3.3e+02, 0., 0., 1. ]\n\
+        pL: !!opencv-matrix\n   rows: 3\n   cols: 4\n   dt: d\n   data: [ 1.15e+03, 0., \
+        1.6e+02, 0., 0.,\n       1.15e+03, 3.25e+02, 0., 0., 0., 1.,\n       0. ]\n\
+        pR: !!opencv-matrix\n   rows: 3\n   cols: 4\n   dt: d\n   data: [ 1.15e+03, 0., \
+        6.5e+02, -1.0e+05, 0., 1.15e+03, 3.25e+02, 0., 0., 0., 1., 0. ]\n";
+
+    #[test]
+    fn vendor_camparam_uses_the_rectified_left_projection() {
+        for c in [
+            parse_camparam(CAMPARAM).unwrap(),
+            parse_calibration(CAMPARAM).unwrap(),
+        ] {
+            let k = c.intrinsics;
+            assert_eq!((k.width, k.height), (800, 600));
+            assert_eq!((k.fx, k.fy, k.cx, k.cy), (1150.0, 1150.0, 160.0, 325.0));
+            assert_eq!(c.depth_scale_mm, DEFAULT_DEPTH_SCALE_MM);
+        }
+        // at another resolution the pinhole is scaled to the depth image
+        let big = CAMPARAM
+            .replace("\"800\"", "\"1600\"")
+            .replace("\"600\"", "\"1200\"");
+        let k = parse_camparam(&big).unwrap().intrinsics;
+        assert_eq!((k.fx, k.fy, k.cx, k.cy), (575.0, 575.0, 79.75, 162.25));
+        // no pL, a pL of another size, a truncated or garbled pL
+        for bad in [
+            CAMPARAM.replace("pL:", "pX:"),
+            CAMPARAM.replacen("cols: 4", "cols: 3", 1),
+            CAMPARAM.replace("       0. ]\n", "]\n"),
+            CAMPARAM.replace("1.6e+02", "abc"),
+            CAMPARAM.replace("width: \"800\"", "width: \"wide\""),
+        ] {
+            assert_eq!(
+                parse_camparam(&bad).unwrap_err().code(),
+                "invalid-params",
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn pl_bin_is_a_pinhole_of_ten_floats() {
+        let floats = |v: [f32; 10]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let ok = floats([0.0, 1142.5, 0.0, 163.25, 0.0, 1142.5, 329.75, 0.0, 0.0, 1.0]);
+        let k = parse_pl_bin(&ok).unwrap().intrinsics;
+        assert_eq!((k.fx, k.fy, k.cx, k.cy), (1142.5, 1142.5, 163.25, 329.75));
+        assert!(parse_pl_bin(&ok[..36]).is_err());
+        assert!(parse_pl_bin(&[ok.clone(), vec![0]].concat()).is_err());
+        let not_pinhole = floats([0.0, 1142.5, 0.0, 163.25, 0.0, 1142.5, 329.75, 0.0, 0.0, 2.0]);
+        assert!(parse_pl_bin(&not_pinhole).is_err());
+        let negative = floats([0.0, -1.0, 0.0, 163.25, 0.0, 1142.5, 329.75, 0.0, 0.0, 1.0]);
+        assert!(parse_pl_bin(&negative).is_err());
     }
 
     #[test]

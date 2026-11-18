@@ -5,7 +5,10 @@
 
 use std::time::{Duration, Instant};
 
-use super::calib::{Calibration, load_calibration};
+use super::calib::{Calibration, CalibrationSource, load_calibration};
+#[cfg(target_os = "linux")]
+use super::exposure::ExposureProfile;
+use super::factory;
 use super::frame::{self, StreamMode};
 #[cfg(target_os = "linux")]
 use super::light::FillLight;
@@ -43,12 +46,46 @@ impl ScannerBackend for RevopointUsbBackend {
         let node = found
             .depth_node()
             .ok_or_else(|| ScanError::Device(found.no_node()))?;
-        let (calibration, _) = load_calibration()?;
+        let (mut calibration, mut calibration_source) = load_calibration()?;
         // the node must open; it is closed again until `start`
         let idle = open_capture(&node).map_err(|(_, e)| e)?;
+        #[cfg(target_os = "linux")]
+        let shell_unit = found.has_shell_unit();
+        let mut calibration_note = None;
+        // no user file: the factory calibration, cached or read now (the
+        // stream is idle, as the file channel requires)
+        if calibration_source == CalibrationSource::Defaults {
+            match found.info.serial.as_deref().and_then(factory::cache_dir) {
+                Some(dir) => {
+                    let read = |file| {
+                        #[cfg(target_os = "linux")]
+                        if shell_unit {
+                            return idle.read_factory_file(file);
+                        }
+                        let _ = file;
+                        Err(ScanError::Device(
+                            "the factory calibration is read on Linux, from a device with \
+                             the vendor extension unit"
+                                .into(),
+                        ))
+                    };
+                    match factory::load_or_read(&dir, read) {
+                        Ok((c, path)) => {
+                            calibration = c;
+                            calibration_source = CalibrationSource::Factory(path);
+                        }
+                        Err(e) => calibration_note = Some(e.to_string()),
+                    }
+                }
+                None => {
+                    calibration_note =
+                        Some("no serial number or data directory to cache the factory file".into());
+                }
+            }
+        }
         // idle, the device blinks its LEDs: off until a stream turns them on
         #[cfg(target_os = "linux")]
-        if found.has_shell_unit() {
+        if shell_unit {
             let _ = idle.set_fill_light(FillLight::Off);
         }
         drop(idle);
@@ -56,6 +93,8 @@ impl ScannerBackend for RevopointUsbBackend {
             info: found.info,
             options: self.options.clone(),
             calibration,
+            calibration_source,
+            calibration_note,
             address: found.address,
             capture: None,
             mode: self.options.stream_mode(),
@@ -68,6 +107,8 @@ impl ScannerBackend for RevopointUsbBackend {
             shell_unit: false,
             light_on: false,
             light_note: None,
+            fast_exposure: false,
+            exposure_note: None,
         }))
     }
 }
@@ -87,6 +128,10 @@ pub struct RevopointUsbDevice {
     info: DeviceInfo,
     options: UsbOptions,
     calibration: Calibration,
+    /// Where `calibration` comes from.
+    calibration_source: CalibrationSource,
+    /// Why the factory calibration is not in use, when it is not.
+    calibration_note: Option<String>,
     /// USB address of the current enumeration.
     address: Address,
     capture: Option<Capture>,
@@ -108,6 +153,10 @@ pub struct RevopointUsbDevice {
     light_on: bool,
     /// Why the fill light was not driven, once.
     light_note: Option<String>,
+    /// Apply [`ExposureProfile::Fast`] when a stream starts.
+    fast_exposure: bool,
+    /// Why the exposure profile was not applied, once.
+    exposure_note: Option<String>,
 }
 
 impl std::fmt::Debug for RevopointUsbDevice {
@@ -117,6 +166,7 @@ impl std::fmt::Debug for RevopointUsbDevice {
             .field("streaming", &self.capture.is_some())
             .field("mode", &self.mode)
             .field("fill_light", &self.fill_light)
+            .field("fast_exposure", &self.fast_exposure)
             .field("shell_unit", &self.shell_unit)
             .field("light_on", &self.light_on)
             .finish_non_exhaustive()
@@ -135,6 +185,17 @@ impl RevopointUsbDevice {
     /// The calibration in use (loaded when the device was opened).
     pub fn calibration(&self) -> &Calibration {
         &self.calibration
+    }
+
+    /// Where the calibration in use comes from.
+    pub fn calibration_source(&self) -> &CalibrationSource {
+        &self.calibration_source
+    }
+
+    /// Why the factory calibration is not in use, when there is no user
+    /// file and it could not be read or parsed.
+    pub fn calibration_note(&self) -> Option<&str> {
+        self.calibration_note.as_deref()
     }
 
     /// The negotiated stream mode (the requested one until a stream ran).
@@ -192,6 +253,15 @@ impl RevopointUsbDevice {
                 FillLight::Off
             };
             self.light_on = self.send_light(light) && self.fill_light;
+            if self.fast_exposure && self.shell_unit {
+                let sent = self
+                    .capture
+                    .as_ref()
+                    .map(|c| c.set_exposure_profile(ExposureProfile::Fast));
+                if let Some(Err(e)) = sent {
+                    self.exposure_note.get_or_insert_with(|| e.to_string());
+                }
+            }
         }
         Ok(())
     }
@@ -220,6 +290,12 @@ impl RevopointUsbDevice {
     /// reason only).
     pub fn fill_light_note(&self) -> Option<&str> {
         self.light_note.as_deref()
+    }
+
+    /// Why the exposure profile was not applied, when it was not (the
+    /// first reason only).
+    pub fn exposure_note(&self) -> Option<&str> {
+        self.exposure_note.as_deref()
     }
 
     /// Sets the requested mode, else [`StreamMode::Depth`].
@@ -337,6 +413,13 @@ impl ScannerDevice for RevopointUsbDevice {
             let sent = self.send_light(if on { FillLight::On } else { FillLight::Off });
             self.light_on = on && sent;
         }
+        Ok(())
+    }
+
+    fn set_fast_exposure(&mut self, on: bool) -> Result<()> {
+        // applied when the next stream starts (the registers stay set
+        // across restarts until the scanner is unplugged)
+        self.fast_exposure = on;
         Ok(())
     }
 

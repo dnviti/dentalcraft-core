@@ -20,6 +20,10 @@ use rustix::io::Errno;
 use rustix::ioctl::{Getter, Opcode, Setter, Updater, ioctl, opcode};
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 
+use super::exposure::ExposureProfile;
+use super::factory::{
+    CLOSE_PAYLOAD, FILE_PAYLOAD_LEN, FactoryFile, OPEN_SELECTOR, READ_SELECTOR, append_chunk,
+};
 use super::light::{FillLight, SHELL_PAYLOAD_LEN, SHELL_SELECTOR, SHELL_UNIT};
 use crate::{Result, ScanError};
 
@@ -515,14 +519,15 @@ struct XuQuery {
 
 const UVCIOC_CTRL_QUERY: Opcode = opcode::read_write::<XuQuery>(b'u', 0x21);
 const UVC_SET_CUR: u8 = 0x01;
+const UVC_GET_CUR: u8 = 0x81;
 const UVC_GET_LEN: u8 = 0x85;
 
 impl Capture {
-    /// One query of the shell selector of the extension unit.
-    fn shell_query(&self, query: u8, data: &mut [u8]) -> Result<()> {
+    /// One query of `selector` of the vendor extension unit.
+    fn xu_query(&self, selector: u8, query: u8, data: &mut [u8]) -> Result<()> {
         let mut q = XuQuery {
             unit: SHELL_UNIT,
-            selector: SHELL_SELECTOR,
+            selector,
             query,
             size: data.len() as u16,
             data: data.as_mut_ptr(),
@@ -534,6 +539,30 @@ impl Capture {
             .map_err(|e| errno_error("UVCIOC_CTRL_QUERY", e))
     }
 
+    /// Checks that `selector` of the extension unit is `expected` bytes
+    /// long (`what` names the command for the error).
+    fn check_len(&self, selector: u8, expected: usize, what: &str) -> Result<()> {
+        let mut len = [0u8; 2];
+        self.xu_query(selector, UVC_GET_LEN, &mut len)?;
+        let len = u16::from_le_bytes(len) as usize;
+        if len != expected {
+            return Err(ScanError::Device(format!(
+                "extension unit {SHELL_UNIT} selector {selector} is {len} bytes, not \
+                 {expected}: no {what} sent"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Sends shell `payloads` after checking the selector length.
+    fn send_shell(&self, payloads: Vec<[u8; SHELL_PAYLOAD_LEN]>, what: &str) -> Result<()> {
+        self.check_len(SHELL_SELECTOR, SHELL_PAYLOAD_LEN, what)?;
+        for mut p in payloads {
+            self.xu_query(SHELL_SELECTOR, UVC_SET_CUR, &mut p)?;
+        }
+        Ok(())
+    }
+
     /// Sets the fill light (the lines of [`FillLight`], nothing else),
     /// after checking that the shell selector is
     /// [`SHELL_PAYLOAD_LEN`] bytes long.
@@ -542,19 +571,50 @@ impl Capture {
     /// [`ScanError::Device`] when the selector has another length or a
     /// query fails.
     pub fn set_fill_light(&self, light: FillLight) -> Result<()> {
-        let mut len = [0u8; 2];
-        self.shell_query(UVC_GET_LEN, &mut len)?;
-        let len = u16::from_le_bytes(len) as usize;
-        if len != SHELL_PAYLOAD_LEN {
+        self.send_shell(light.payloads(), "light command")
+    }
+
+    /// Applies `profile` (its lines, nothing else), with the checks of
+    /// [`Capture::set_fill_light`].
+    ///
+    /// # Errors
+    /// As [`Capture::set_fill_light`].
+    pub fn set_exposure_profile(&self, profile: ExposureProfile) -> Result<()> {
+        self.send_shell(profile.payloads(), "exposure command")
+    }
+
+    /// Reads the factory file `file` over the read-only file channel (see
+    /// [`super::factory`]): open for reading, read until the end, close.
+    /// Call it with the stream idle.
+    ///
+    /// # Errors
+    /// [`ScanError::Device`] when a selector has another length, a query
+    /// fails or a reply is malformed.
+    pub fn read_factory_file(&self, file: FactoryFile) -> Result<Vec<u8>> {
+        self.check_len(OPEN_SELECTOR, FILE_PAYLOAD_LEN, "file read")?;
+        self.check_len(READ_SELECTOR, FILE_PAYLOAD_LEN, "file read")?;
+        self.xu_query(OPEN_SELECTOR, UVC_SET_CUR, &mut file.open_payload())?;
+        let mut data = Vec::new();
+        let read = (|| -> Result<()> {
+            loop {
+                let mut reply = [0u8; FILE_PAYLOAD_LEN];
+                self.xu_query(READ_SELECTOR, UVC_GET_CUR, &mut reply)?;
+                if !append_chunk(&reply, &mut data)? {
+                    return Ok(());
+                }
+            }
+        })();
+        // the session is closed whatever happened after it was opened
+        let mut close = CLOSE_PAYLOAD;
+        let closed = self.xu_query(OPEN_SELECTOR, UVC_SET_CUR, &mut close);
+        read.and(closed)?;
+        if data.is_empty() {
             return Err(ScanError::Device(format!(
-                "extension unit {SHELL_UNIT} selector {SHELL_SELECTOR} is {len} bytes, not \
-                 {SHELL_PAYLOAD_LEN}: no light command sent"
+                "{}: empty or missing on the device",
+                file.device_path()
             )));
         }
-        for mut p in light.payloads() {
-            self.shell_query(UVC_SET_CUR, &mut p)?;
-        }
-        Ok(())
+        Ok(data)
     }
 }
 

@@ -1,4 +1,4 @@
-//! The fill light of the scanner: the only vendor command of the backend.
+//! The fill light of the scanner, the first vendor command of the backend.
 //!
 //! **User decision, 2026-11-18 21:36.** Left alone, the MINI 2 blinks its
 //! LEDs about twice a second, streaming or not; Revo Scan keeps them steady.
@@ -71,7 +71,7 @@ impl FillLight {
 
 /// `line` as a shell request: ASCII, NUL padded to [`SHELL_PAYLOAD_LEN`]
 /// bytes (always NUL terminated).
-fn payload(line: &str) -> [u8; SHELL_PAYLOAD_LEN] {
+pub(super) fn payload(line: &str) -> [u8; SHELL_PAYLOAD_LEN] {
     let mut p = [0u8; SHELL_PAYLOAD_LEN];
     let bytes = line.as_bytes();
     assert!(bytes.len() < SHELL_PAYLOAD_LEN && line.is_ascii());
