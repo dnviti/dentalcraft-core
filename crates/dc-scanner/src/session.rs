@@ -54,7 +54,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::rig::fit::{angle_about, to_d};
-use crate::rig::{RigCalibration, RigGeometry, RigInput, about};
+use crate::rig::{Background, RigCalibration, RigGeometry, RigInput, about};
 use crate::tracking::{FrameSample, TrackParams, sample_frame, track_frame};
 use crate::{DepthFrame, DeviceInfo, Result, ScanError, ScannerBackend, ScannerDevice, backend};
 
@@ -257,8 +257,10 @@ pub(crate) struct StopOutcome {
 pub(crate) struct LoopOutcome {
     /// Turn about the axis that closes the loop (degrees), when measured.
     pub error_deg: Option<f32>,
-    /// The error was spread over the stops and the model rebuilt.
+    /// The model was rebuilt (loop error spread, clutter removed).
     pub applied: bool,
+    /// Static clutter pixels removed from the stops.
+    pub clutter_pixels: usize,
 }
 
 /// A request of a rig job, served by the acquisition thread.
@@ -842,6 +844,15 @@ const STOP_MAX_SHIFT_MM: f64 = 1.5;
 const LOOP_MAX_DEG: f32 = 3.0;
 /// A loop error below this (degrees) is left as is.
 const LOOP_MIN_DEG: f32 = 0.02;
+/// Fewest stops of a revolution to tell static clutter from the object.
+const MIN_CLUTTER_STOPS: usize = 8;
+/// Static clutter is not removed when it is more than this fraction of
+/// the stop pixels (the object itself looks the same at every angle).
+const MAX_CLUTTER_FRACTION: f32 = 0.3;
+/// Fraction of the stops of a revolution in which a depth must repeat at
+/// a pixel to be static clutter: higher than the calibration's
+/// background, so the object's own near-axis surfaces stay.
+const CLUTTER_MIN_FRACTION: f32 = 0.85;
 /// Turntable motion (degrees) above which a frame must show the object
 /// turning; a tracked frame that barely moves is locked on the static
 /// scene.
@@ -985,57 +996,96 @@ fn fuse_stop(
     out
 }
 
-/// Closes the loop of the stops from `first`: when the last one is a full
-/// turn after the first (same view), it is registered onto the first one
-/// alone; the turn about the axis that this finds is spread linearly over
-/// the stops of the revolution (a 1-D pose graph with equal weights on
-/// the stop-to-stop edges), and the model is rebuilt from the stops.
+/// Closes the loop of the stops from `first` (one revolution at one tilt):
+///
+/// * when the last stop is a full turn after the first (same view), it is
+///   registered onto the first one alone; the turn about the axis that
+///   this finds is spread linearly over the stops of the revolution (a 1-D
+///   pose graph with equal weights on the stop-to-stop edges);
+/// * the static clutter of the revolution (a depth repeated at the same
+///   pixel in most stops, see [`Background`]: enclosure, stand, artefacts
+///   that the turntable pose smears into rings) is removed from its stops,
+///   unless that would take more than [`MAX_CLUTTER_FRACTION`] of their
+///   pixels (an object turning into itself, like a centred cylinder);
+///
+/// and the model is rebuilt from the stops.
 fn close_loop(
     fusion: &mut Fusion,
     geometry: Option<&RigGeometry>,
     settings: &ScanSettings,
     first: usize,
 ) -> LoopOutcome {
-    let none = LoopOutcome {
+    let mut out = LoopOutcome {
         error_deg: None,
         applied: false,
+        clutter_pixels: 0,
     };
     let Some(g) = geometry else {
-        return none;
+        return out;
     };
-    let stops = &fusion.stops[first.min(fusion.stops.len())..];
+    let first = first.min(fusion.stops.len());
+    let stops = &fusion.stops[first..];
     let n = stops.len().saturating_sub(1);
     let (Some(s0), Some(sn)) = (stops.first(), stops.last()) else {
-        return none;
+        return out;
     };
-    if n < 3
-        || ((sn.angles.0 - s0.angles.0).abs() - 360.0).abs() > 1.0
-        || (sn.angles.1 - s0.angles.1).abs() > 0.1
+    let mut error = 0.0;
+    if n >= 3
+        && ((sn.angles.0 - s0.angles.0).abs() - 360.0).abs() <= 1.0
+        && (sn.angles.1 - s0.angles.1).abs() <= 0.1
     {
-        return none;
+        let mut v0 = TsdfVolume::new(settings.tsdf());
+        v0.integrate(&s0.depth(), &s0.intrinsics, &s0.pose);
+        let params = track_params(true);
+        let depth = sn.depth();
+        let s = sample(&depth, &sn.intrinsics, &params, Some((g, sn.angles.1)));
+        let r = track_frame(&v0, &s, &sn.intrinsics, &sn.pose, &params);
+        if r.ok {
+            let (_, dir) = g.axis_at(sn.angles.1);
+            let c = to_d(&sn.pose).inverse() * to_d(&r.pose);
+            error = angle_about(&c.matrix3, dir.as_dvec3()).to_degrees() as f32;
+            out.error_deg = Some(error);
+        }
     }
-    let mut v0 = TsdfVolume::new(settings.tsdf());
-    v0.integrate(&s0.depth(), &s0.intrinsics, &s0.pose);
-    let params = track_params(true);
-    let depth = sn.depth();
-    let s = sample(&depth, &sn.intrinsics, &params, Some((g, sn.angles.1)));
-    let r = track_frame(&v0, &s, &sn.intrinsics, &sn.pose, &params);
-    if !r.ok {
-        return none;
-    }
-    let (point, dir) = g.axis_at(sn.angles.1);
-    let c = to_d(&sn.pose).inverse() * to_d(&r.pose);
-    let error = angle_about(&c.matrix3, dir.as_dvec3()).to_degrees() as f32;
-    let mut out = LoopOutcome {
-        error_deg: Some(error),
-        applied: false,
-    };
     // a model fused frame by frame cannot be rebuilt from the stops
-    if error.abs() > LOOP_MAX_DEG || error.abs() < LOOP_MIN_DEG || fusion.loose_frames > 0 {
+    if fusion.loose_frames > 0 {
         return out;
     }
-    for (i, s) in fusion.stops[first..].iter_mut().enumerate() {
-        s.pose *= about(point, dir, error * i as f32 / n as f32);
+    let spread = (LOOP_MIN_DEG..=LOOP_MAX_DEG).contains(&error.abs());
+    if spread {
+        let (point, dir) = g.axis_at(stops[0].angles.1);
+        for (i, s) in fusion.stops[first..].iter_mut().enumerate() {
+            s.pose *= about(point, dir, error * i as f32 / n as f32);
+        }
+    }
+    let pass = &fusion.stops[first..];
+    if pass.len() >= MIN_CLUTTER_STOPS {
+        let frames: Vec<Arc<Vec<f32>>> = pass.iter().map(|s| Arc::new(s.depth())).collect();
+        let background = Background::from_frames_with(
+            &frames,
+            crate::rig::calib::BACKGROUND_TOL_MM,
+            CLUTTER_MIN_FRACTION,
+        );
+        let total: usize = pass.iter().map(|s| s.pixels.len()).sum();
+        let clutter: usize = pass
+            .iter()
+            .map(|s| {
+                s.pixels
+                    .iter()
+                    .filter(|(i, d)| background.is_static(*i as usize, *d))
+                    .count()
+            })
+            .sum();
+        if clutter > 0 && (clutter as f32) <= MAX_CLUTTER_FRACTION * total as f32 {
+            for s in &mut fusion.stops[first..] {
+                s.pixels
+                    .retain(|(i, d)| !background.is_static(*i as usize, *d));
+            }
+            out.clutter_pixels = clutter;
+        }
+    }
+    if !spread && out.clutter_pixels == 0 {
+        return out;
     }
     let mut volume = TsdfVolume::new(settings.tsdf());
     for s in &fusion.stops {
@@ -1069,8 +1119,10 @@ pub struct ReplayedScan {
     pub stops: Vec<ReplayedStop>,
     /// Loop closure error of the revolution (degrees), when measured.
     pub loop_error_deg: Option<f32>,
-    /// The loop error was spread and the model rebuilt.
+    /// The model was rebuilt (loop error spread, static clutter removed).
     pub loop_applied: bool,
+    /// Static clutter pixels removed from the stops.
+    pub clutter_pixels: usize,
     /// The fused cloud (world = camera at the first stop).
     pub cloud: PointCloud,
 }
@@ -1121,6 +1173,7 @@ pub fn fuse_recorded_stops(
         stops: out,
         loop_error_deg: closed.error_deg,
         loop_applied: closed.applied,
+        clutter_pixels: closed.clutter_pixels,
         cloud: fusion.volume.extract_cloud(),
     }
 }

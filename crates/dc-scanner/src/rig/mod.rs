@@ -315,9 +315,19 @@ pub struct Background {
 impl Background {
     /// Background of `frames` (same image size, `NaN` / `0` invalid).
     pub fn from_frames(frames: &[std::sync::Arc<Vec<f32>>], tol_mm: f32) -> Self {
+        Self::from_frames_with(frames, tol_mm, BACKGROUND_MIN_FRACTION)
+    }
+
+    /// [`Background::from_frames`] with the depth repeated in at least
+    /// `min_fraction` of the frames (and two).
+    pub fn from_frames_with(
+        frames: &[std::sync::Arc<Vec<f32>>],
+        tol_mm: f32,
+        min_fraction: f32,
+    ) -> Self {
         use rayon::prelude::*;
         let n = frames.iter().map(|f| f.len()).min().unwrap_or(0);
-        let need = ((BACKGROUND_MIN_FRACTION * frames.len() as f32).ceil() as usize).max(2);
+        let need = ((min_fraction * frames.len() as f32).ceil() as usize).max(2);
         let depth = (0..n)
             .into_par_iter()
             .with_min_len(4096)
