@@ -258,7 +258,7 @@ pub trait ScannerBackend: Send + Sync {
 
 /// The registered backends. The simulated backend `sim` is always present;
 /// `revopoint-sdk` lists no device until the Revopoint SDK is installed;
-/// `revopoint-usb` (Linux) lists the Revopoint scanners on USB.
+/// `revopoint-usb` (Linux, Windows) lists the Revopoint scanners on USB.
 pub fn backends() -> Vec<Box<dyn ScannerBackend>> {
     vec![
         Box::new(revopoint_sdk::RevopointSdkBackend::default()),
@@ -323,6 +323,12 @@ mod tests {
         let usb = backend("revopoint-usb").unwrap();
         if cfg!(target_os = "linux") {
             usb.availability().unwrap();
+        } else if cfg!(windows) {
+            // Media Foundation may be missing (Windows N without the Media
+            // Feature Pack)
+            if let Err(e) = usb.availability() {
+                assert_eq!(e.code(), "platform-unsupported");
+            }
         } else {
             assert_eq!(
                 usb.availability().unwrap_err().code(),
