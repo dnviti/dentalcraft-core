@@ -50,13 +50,15 @@ rayon = "1.12.0"
 # run-time loading of optional vendor SDKs (never linked)
 libloading = "0.8.9"
 
-# scanner USB video on Linux: device discovery, V4L2 ioctls (pure Rust, no libc/libusb)
+# scanner USB video: device discovery (Linux, Windows), V4L2 ioctls on Linux (pure Rust, no libc/libusb)
 nusb = "0.2.9"
 rustix = { version = "1.1.6", features = ["fs", "mm", "event"] }
 
-# Bluetooth LE (blocking, pure Rust): BlueZ over D-Bus on Linux, WinRT on Windows
+# Bluetooth LE (blocking, pure Rust): BlueZ over D-Bus on Linux, WinRT on Windows;
+# `windows` also binds Media Foundation for the scanner capture on Windows (dc-scanner)
 zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
 windows = "0.62.2"
+windows-core = "0.62.2"  # COM objects implemented in Rust (`#[implement]` needs the crate by name)
 
 # geometry: linear algebra (SVD, eigen) and k-d tree nearest neighbours
 nalgebra = "0.35.0"

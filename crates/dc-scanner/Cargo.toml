@@ -25,6 +25,17 @@ thiserror.workspace = true
 nusb.workspace = true
 rustix.workspace = true
 
+# Media Foundation capture (entry points loaded at run time) and the device
+# tree (cfgmgr32)
+[target.'cfg(windows)'.dependencies]
+nusb.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+] }
+windows-core.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 
