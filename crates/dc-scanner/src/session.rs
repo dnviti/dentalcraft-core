@@ -100,6 +100,10 @@ pub struct ScanSettings {
     /// Crop the frames to the turntable region of interest when a rig
     /// calibration is in use ([`crate::rig`]).
     pub use_roi: bool,
+    /// Keep the scanner's fill light steadily on while scanning (on a
+    /// device that supports it, see [`crate::revopoint_usb::light`]);
+    /// `false` turns it off or leaves it as the device keeps it.
+    pub fill_light: bool,
 }
 
 impl Default for ScanSettings {
@@ -112,6 +116,7 @@ impl Default for ScanSettings {
             roi_radius_mm: crate::rig::DEFAULT_ROI_RADIUS_MM,
             roi_height_mm: crate::rig::DEFAULT_ROI_HEIGHT_MM,
             use_roi: true,
+            fill_light: true,
         }
     }
 }
@@ -573,6 +578,7 @@ impl ScanSession {
             .settings
             .exposure_us
             .map_or(Ok(()), |us| device.set_exposure_us(us))
+            .and_then(|()| device.set_fill_light(self.settings.fill_light))
             .and_then(|()| device.start());
         if let Err(e) = started {
             self.device = Some(device);

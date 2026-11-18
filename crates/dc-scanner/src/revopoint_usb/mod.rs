@@ -6,11 +6,12 @@
 //! frames, the colour node (interface 2) `MJPG` 1600x1200. This backend
 //! reads the depth node with the standard capture API of the system, plain
 //! V4L2 calls on Linux (`v4l2`) and Media Foundation on Windows (`mf`, on
-//! the inbox UVC driver `usbvideo`), and needs neither the vendor SDK nor
-//! any vendor command: it sends no UVC extension-unit request, no HID
-//! report and no firmware, only format negotiation and streaming. The
-//! colour stream is not read (it is not registered to the depth image, and
-//! stopping it also resets the depth stream).
+//! the inbox UVC driver `usbvideo`), and needs no vendor SDK. Its only
+//! vendor command is the fill light ([`light`]: on while streaming, off
+//! after, a closed list of lines the user authorised on 2026-11-18, Linux
+//! only); it sends no other extension-unit request, no HID report and no
+//! firmware. The colour stream is not read (it is not registered to the
+//! depth image, and stopping it also resets the depth stream).
 //!
 //! * **Discovery.** [`ScannerBackend::list`] enumerates the USB devices with
 //!   `nusb` and keeps the `2207:110c` devices. On Linux their V4L2 nodes are
@@ -66,6 +67,7 @@ pub mod calib;
 #[cfg(any(target_os = "linux", windows))]
 mod device;
 pub mod frame;
+pub mod light;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(windows)]
@@ -90,6 +92,7 @@ pub use calib::{Calibration, CalibrationSource};
 #[cfg(any(target_os = "linux", windows))]
 pub use device::RevopointUsbDevice;
 pub use frame::StreamMode;
+pub use light::FillLight;
 
 #[cfg(not(any(target_os = "linux", windows)))]
 use crate::{DeviceInfo, Result, ScannerBackend, ScannerDevice};

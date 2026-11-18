@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use super::calib::{Calibration, load_calibration};
 use super::frame::{self, StreamMode};
+#[cfg(target_os = "linux")]
+use super::light::FillLight;
 use super::platform::{self, Address, Capture, PIX_FMT_Y16, find_devices, open_capture};
 use super::{BACKEND_ID, REENUMERATION_GRACE, UsbOptions};
 use crate::{
@@ -43,7 +45,13 @@ impl ScannerBackend for RevopointUsbBackend {
             .ok_or_else(|| ScanError::Device(found.no_node()))?;
         let (calibration, _) = load_calibration()?;
         // the node must open; it is closed again until `start`
-        open_capture(&node).map_err(|(_, e)| e)?;
+        let idle = open_capture(&node).map_err(|(_, e)| e)?;
+        // idle, the device blinks its LEDs: off until a stream turns them on
+        #[cfg(target_os = "linux")]
+        if found.has_shell_unit() {
+            let _ = idle.set_fill_light(FillLight::Off);
+        }
+        drop(idle);
         Ok(Box::new(RevopointUsbDevice {
             info: found.info,
             options: self.options.clone(),
@@ -56,6 +64,10 @@ impl ScannerBackend for RevopointUsbBackend {
             buf: Vec::new(),
             spare: Vec::new(),
             latest_ir: None,
+            fill_light: true,
+            shell_unit: false,
+            light_on: false,
+            light_note: None,
         }))
     }
 }
@@ -88,6 +100,14 @@ pub struct RevopointUsbDevice {
     /// Second frame buffer, to drain the queue down to the newest frame.
     spare: Vec<u8>,
     latest_ir: Option<Vec<u8>>,
+    /// Turn the fill light on while streaming (see [`super::light`]).
+    fill_light: bool,
+    /// The current enumeration has the vendor shell extension unit.
+    shell_unit: bool,
+    /// The fill light was turned on for the current stream.
+    light_on: bool,
+    /// Why the fill light was not driven, once.
+    light_note: Option<String>,
 }
 
 impl std::fmt::Debug for RevopointUsbDevice {
@@ -96,6 +116,9 @@ impl std::fmt::Debug for RevopointUsbDevice {
             .field("info", &self.info)
             .field("streaming", &self.capture.is_some())
             .field("mode", &self.mode)
+            .field("fill_light", &self.fill_light)
+            .field("shell_unit", &self.shell_unit)
+            .field("light_on", &self.light_on)
             .finish_non_exhaustive()
     }
 }
@@ -160,7 +183,43 @@ impl RevopointUsbDevice {
         self.capture = Some(capture);
         self.restart = None;
         self.reconnect_deadline = None;
+        #[cfg(target_os = "linux")]
+        {
+            self.shell_unit = found.has_shell_unit();
+            let light = if self.fill_light {
+                FillLight::On
+            } else {
+                FillLight::Off
+            };
+            self.light_on = self.send_light(light) && self.fill_light;
+        }
         Ok(())
+    }
+
+    /// Sends `light` on the open stream when the device has the vendor
+    /// shell unit; a refusal is noted once.
+    #[cfg(target_os = "linux")]
+    fn send_light(&mut self, light: FillLight) -> bool {
+        let result = match (&self.capture, self.shell_unit) {
+            (Some(capture), true) => capture.set_fill_light(light),
+            (Some(_), false) => Err(ScanError::Device(
+                "no extension unit 4 with the expected GUID: fill light left alone".into(),
+            )),
+            (None, _) => return false,
+        };
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                self.light_note.get_or_insert_with(|| e.to_string());
+                false
+            }
+        }
+    }
+
+    /// Why the fill light was not driven, when it was not (the first
+    /// reason only).
+    pub fn fill_light_note(&self) -> Option<&str> {
+        self.light_note.as_deref()
     }
 
     /// Sets the requested mode, else [`StreamMode::Depth`].
@@ -178,8 +237,15 @@ impl RevopointUsbDevice {
         ))
     }
 
-    /// The stream ended (stopped or lost): forget it.
+    /// The stream ended (stopped or lost): forget it, the fill light off
+    /// first (left on, or blinking, it would stay so after the scan).
     fn end_stream(&mut self) {
+        #[cfg(target_os = "linux")]
+        if self.capture.is_some() && self.shell_unit {
+            // a device that left the bus refuses it: nothing to do then
+            self.send_light(FillLight::Off);
+        }
+        self.light_on = false;
         if let Some(mut capture) = self.capture.take() {
             capture.stop();
             #[allow(
@@ -262,6 +328,16 @@ impl ScannerDevice for RevopointUsbDevice {
 
     fn stop(&mut self) {
         self.end_stream();
+    }
+
+    fn set_fill_light(&mut self, on: bool) -> Result<()> {
+        self.fill_light = on;
+        #[cfg(target_os = "linux")]
+        if self.capture.is_some() && on != self.light_on {
+            let sent = self.send_light(if on { FillLight::On } else { FillLight::Off });
+            self.light_on = on && sent;
+        }
+        Ok(())
     }
 
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<DepthFrame>> {

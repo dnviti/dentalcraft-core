@@ -254,6 +254,11 @@ pub trait ScannerDevice: Send {
     fn set_exposure_us(&mut self, _us: u32) -> Result<()> {
         Ok(())
     }
+    /// Keeps the device's fill light steadily on while streaming (`true`)
+    /// or leaves it alone (`false`), when the device has one it can drive.
+    fn set_fill_light(&mut self, _on: bool) -> Result<()> {
+        Ok(())
+    }
     /// How long before its arrival a frame shows the scene, about: the
     /// turntable angle of a frame is read that long before it arrived.
     fn latency(&self) -> Duration {

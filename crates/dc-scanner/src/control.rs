@@ -329,6 +329,9 @@ struct SettingsParams {
     /// Crop the frames to the turntable region of interest when a rig
     /// calibration is in use.
     use_roi: Option<bool>,
+    /// Keep the scanner's fill light steadily on while scanning (default
+    /// true; false turns it off).
+    fill_light: Option<bool>,
 }
 
 /// Parameters of `scan.cloud`.
@@ -716,7 +719,8 @@ impl ScanController {
             || p.exposure_us.is_some()
             || p.roi_radius_mm.is_some()
             || p.roi_height_mm.is_some()
-            || p.use_roi.is_some();
+            || p.use_roi.is_some()
+            || p.fill_light.is_some();
         if given {
             if let Some(v) = p.live_voxel_mm {
                 s.live_voxel_mm = v;
@@ -739,6 +743,9 @@ impl ScanController {
             if let Some(v) = p.use_roi {
                 s.use_roi = v;
             }
+            if let Some(v) = p.fill_light {
+                s.fill_light = v;
+            }
             self.session.set_settings(s)?;
         }
         let s = self.session.settings();
@@ -750,6 +757,7 @@ impl ScanController {
             "roi_radius_mm": s.roi_radius_mm,
             "roi_height_mm": s.roi_height_mm,
             "use_roi": s.use_roi,
+            "fill_light": s.fill_light,
         }))
     }
 
