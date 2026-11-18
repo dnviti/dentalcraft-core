@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0-alpha.5](https://github.com/dnviti-personal-org/dentalcraft-core/compare/v0.3.0-alpha.4...v0.3.0-alpha.5) (2026-11-18)
+
+
+### Bug Fixes
+
+* **scanner:** capture the MINI 2 on Windows through Media Foundation ([aa7fbb0](https://github.com/dnviti-personal-org/dentalcraft-core/commit/aa7fbb08299d2de7669f86ffec50ddf391b0c9da))
+* **scanner:** stop rejecting depth frame headers on a non-constant word ([aa7fbb0](https://github.com/dnviti-personal-org/dentalcraft-core/commit/aa7fbb08299d2de7669f86ffec50ddf391b0c9da))
+
 ## [0.3.0-alpha.4](https://github.com/dnviti-personal-org/dentalcraft-core/compare/v0.3.0-alpha.3...v0.3.0-alpha.4) (2026-11-18)
 
 
