@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0-alpha.4](https://github.com/dnviti-personal-org/dentalcraft-core/compare/v0.3.0-alpha.3...v0.3.0-alpha.4) (2026-11-18)
+
+
+### Features
+
+* **module-api:** let modules declare scanner input and roles ([#15](https://github.com/dnviti-personal-org/dentalcraft-core/issues/15)) ([4fd0ce8](https://github.com/dnviti-personal-org/dentalcraft-core/commit/4fd0ce8c3684cd8209e9b25fae769ac569243325))
+
 ## [0.3.0-alpha.3](https://github.com/dnviti-personal-org/dentalcraft-core/compare/v0.3.0-alpha.2...v0.3.0-alpha.3) (2026-11-17)
 
 
