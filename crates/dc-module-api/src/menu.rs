@@ -1,5 +1,7 @@
 //! Multi-level module menu.
 
+use dc_case::ScanRole;
+
 /// Whether a menu entry or command is implemented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MenuStatus {
@@ -36,6 +38,20 @@ pub enum LeafInput {
     },
 }
 
+/// A leaf whose scans can also come from a 3D scanner: the shell offers a
+/// "Scan" button beside the leaf's own action and opens its scan popup, which
+/// hands back the acquired surface as a file with one of `roles`. The shell
+/// then imports that file the way the leaf imports a file chosen by hand.
+///
+/// Declared on the "Import scans" leaf of a module
+/// ([`crate::is_import_scans_command`]), whose command receives the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScannerInput {
+    /// The roles the module accepts for a scan acquired with the scanner,
+    /// in the order the popup offers them (the first is preselected).
+    pub roles: &'static [ScanRole],
+}
+
 /// One menu entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuItem {
@@ -54,6 +70,8 @@ pub struct MenuItem {
     /// The leaf is a step of the workflow, counted in the progress. `false`
     /// for what is not one: a shortcut over the steps, an optional tool.
     pub counts_as_step: bool,
+    /// The scanner the shell also offers for the leaf's scans, if any.
+    pub scanner: Option<ScannerInput>,
 }
 
 impl MenuItem {
@@ -67,6 +85,7 @@ impl MenuItem {
             status: MenuStatus::Ready,
             input: None,
             counts_as_step: true,
+            scanner: None,
         }
     }
 
@@ -80,6 +99,7 @@ impl MenuItem {
             status: MenuStatus::Ready,
             input: None,
             counts_as_step: true,
+            scanner: None,
         }
     }
 
@@ -98,6 +118,13 @@ impl MenuItem {
     /// Same entry asking the user for `input` before running.
     pub fn with_input(mut self, input: LeafInput) -> Self {
         self.input = Some(input);
+        self
+    }
+
+    /// Same entry whose scans can also come from a 3D scanner, with one of
+    /// `roles` (see [`ScannerInput`]).
+    pub fn with_scanner(mut self, roles: &'static [ScanRole]) -> Self {
+        self.scanner = Some(ScannerInput { roles });
         self
     }
 
@@ -283,12 +310,18 @@ mod tests {
     }
 
     #[test]
-    fn a_leaf_starts_without_input_and_as_a_step() {
+    fn a_leaf_starts_without_input_or_scanner_and_as_a_step() {
         let item = MenuItem::command("a", "menu-a", "a");
         assert_eq!(item.input, None);
+        assert_eq!(item.scanner, None);
         assert!(item.counts_as_step);
         let input = LeafInput::Folder { param: "dir" };
-        assert_eq!(item.with_input(input).input, Some(input));
+        assert_eq!(item.clone().with_input(input).input, Some(input));
+        let roles = &[ScanRole::Upper, ScanRole::Lower];
+        assert_eq!(
+            item.with_scanner(roles).scanner,
+            Some(ScannerInput { roles })
+        );
     }
 
     #[test]
