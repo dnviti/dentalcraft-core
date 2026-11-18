@@ -173,16 +173,45 @@ fn recorded_revolution_calibrates_and_fuses() {
     };
 
     let t = Instant::now();
+    // DC_SCAN_STOPS: comma-separated stop indices to fuse (default all)
+    let only: Option<Vec<usize>> = std::env::var("DC_SCAN_STOPS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|k| k.trim().parse().ok()).collect());
+    // DC_SCAN_BG: remove the static background of the revolution first
+    let background = std::env::var_os("DC_SCAN_BG").map(|_| {
+        let frames: Vec<Arc<Vec<f32>>> = medians.iter().map(|s| Arc::clone(&s.depth)).collect();
+        dc_scanner::rig::Background::from_frames(&frames, calib::BACKGROUND_TOL_MM)
+    });
     let recorded: Vec<RecordedStop> = medians
         .iter()
-        .map(|s| ((s.rotate_deg, s.tilt_deg), Arc::clone(&s.depth)))
+        .enumerate()
+        .filter(|(k, _)| only.as_ref().is_none_or(|o| o.contains(k)))
+        .map(|(_, s)| {
+            let depth = match &background {
+                Some(b) => Arc::new(
+                    s.depth
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &d)| if b.is_static(i, d) { f32::NAN } else { d })
+                        .collect(),
+                ),
+                None => Arc::clone(&s.depth),
+            };
+            ((s.rotate_deg, s.tilt_deg), depth)
+        })
         .collect();
-    // DC_SCAN_ROI_MM: radius of the region of interest (default 45 mm)
-    let settings = ScanSettings {
-        roi_radius_mm: std::env::var("DC_SCAN_ROI_MM")
+    // DC_SCAN_ROI_MM / DC_SCAN_ROI_H_MM: radius and height of the region
+    // of interest (default 45 / 60 mm), DC_SCAN_NO_ROI: none
+    let env = |k: &str, d: f32| {
+        std::env::var(k)
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(ScanSettings::default().roi_radius_mm),
+            .unwrap_or(d)
+    };
+    let settings = ScanSettings {
+        roi_radius_mm: env("DC_SCAN_ROI_MM", ScanSettings::default().roi_radius_mm),
+        roi_height_mm: env("DC_SCAN_ROI_H_MM", ScanSettings::default().roi_height_mm),
+        use_roi: std::env::var_os("DC_SCAN_NO_ROI").is_none(),
         ..ScanSettings::default()
     };
     let scan = fuse_recorded_stops(&settings, &c, &intr, &recorded);

@@ -949,8 +949,15 @@ fn fuse_stop(
                 if accept {
                     r.pose
                 } else {
-                    // never drop a stop: the turntable pose is good to
-                    // about a tenth of a degree
+                    // never drop a stop: the turntable pose is exact to
+                    // the recorded data (a full turn ends on the very first
+                    // view); its residual is the one reported
+                    let at_prior = TrackParams {
+                        iterations_per_stage: 0,
+                        ..params
+                    };
+                    let r0 = track_frame(&fusion.volume, &s, &k, &prior, &at_prior);
+                    out.rms_mm = r0.rms_mm.is_finite().then_some(r0.rms_mm);
                     prior
                 }
             }
