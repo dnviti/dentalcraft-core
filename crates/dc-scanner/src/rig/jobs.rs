@@ -478,6 +478,17 @@ impl Ctx {
         }
     }
 
+    /// Tilts the table back to 0 and waits for it: a scan leaves it flat.
+    /// Best effort and not cancellable (it also runs after a cancel or a
+    /// failure): a table without a tilt axis or a link that is down is left
+    /// as it is.
+    fn tilt_home(&self) {
+        let mut t = lock(&self.table);
+        if t.move_to(AxisKind::Tilt, 0.0).is_ok() {
+            let _ = t.wait_settled(AxisKind::Tilt, TILT_TIMEOUT, &|| false);
+        }
+    }
+
     /// Captures the stop at `angles` from the frames after the settle.
     fn capture(&self, angles: (f32, f32), frames: usize, fuse: bool) -> Result<StopOutcome> {
         let request = CaptureRequest {
@@ -552,7 +563,11 @@ fn spawn(
                     // best effort: the table may be the thing that failed;
                     // a table the job let go of is left alone
                     if ctx.job.holds_table() {
-                        let _ = lock(&ctx.table).stop();
+                        let mut t = lock(&ctx.table);
+                        let _ = t.stop();
+                        drop(t);
+                        // and flat again, when the link is up
+                        ctx.tilt_home();
                     }
                 }
             }
@@ -618,10 +633,17 @@ impl AutoPlan {
 /// Starts `scan.auto` (the acquisition is running and held).
 pub(crate) fn start_auto(table: TableHandle, link: RigLink, plan: AutoPlan) -> Result<Job> {
     spawn(RigJobKind::Auto, plan.steps(), table, link, move |ctx| {
-        let quality = match plan.mode {
+        let acquired = match plan.mode {
             AutoMode::Stops { step_deg, frames } => auto_stops(ctx, &plan, step_deg, frames),
             AutoMode::Continuous => auto_continuous(ctx, &plan),
-        }?;
+        };
+        // the acquisition is over: the table goes back to 0 (the rotation
+        // stays) before the surface is built; a failed or cancelled job
+        // does the same when it ends
+        if acquired.is_ok() && plan.has_tilt {
+            ctx.tilt_home();
+        }
+        let quality = acquired?;
         let verdict = judge(&quality, plan.mode);
         ctx.job.lock().quality = Some(quality);
         verdict?;

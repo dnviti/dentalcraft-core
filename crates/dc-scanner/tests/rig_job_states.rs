@@ -256,3 +256,99 @@ fn the_finish_runs_with_the_acquisition_ended_and_the_table_free() {
     );
     assert_eq!(out["reconstruction"]["stops"], 10, "{out}");
 }
+
+/// The estimated tilt of the table (degrees), once nothing moves it.
+fn flat_tilt(c: &mut ScanController) -> f64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let t = run(c, "turntable.status", Value::Null);
+        if t["busy"] == false {
+            return t["tilt_deg"].as_f64().unwrap();
+        }
+        assert!(Instant::now() < deadline, "{t}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn the_table_tilts_back_to_zero_when_the_acquisition_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = rig(dir.path());
+    let mut params = auto_params();
+    params["tilts_deg"] = json!([20]);
+    run(&mut c, "scan.auto", params);
+    let job = wait_auto(&mut c);
+    assert_eq!(job["state"], "done", "{job}");
+    // the pass was tilted, the table is flat again, the rotation stays
+    let tilt = flat_tilt(&mut c);
+    assert!(tilt.abs() < 0.1, "the table stayed tilted at {tilt}");
+    let rotate = run(&mut c, "turntable.status", Value::Null)["rotate_deg"]
+        .as_f64()
+        .unwrap();
+    assert!(rotate.abs() > 45.0, "the rotation went back to {rotate}");
+    run(&mut c, "scan.stop", Value::Null);
+    let stops = c.session().kept_stops().expect("kept stops");
+    assert!(
+        stops.stops.iter().all(|s| (s.angles.1 - 20.0).abs() < 0.5),
+        "the stops were not taken at +20"
+    );
+}
+
+#[test]
+fn the_table_is_flat_before_the_surface_is_built() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = rig(dir.path());
+    let mut params = auto_params();
+    params["tilts_deg"] = json!([20]);
+    params["finish"] = json!(true);
+    params["resolution_mm"] = json!(0.4);
+    run(&mut c, "scan.auto", params);
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let mut tilts = Vec::new();
+    loop {
+        let job = c.auto_status().unwrap();
+        if job.state != RigJobState::Running {
+            break;
+        }
+        if job.phase.is_some_and(|p| p != RigJobPhase::Acquire) {
+            tilts.push(c.turntable_status().tilt_deg.unwrap());
+        }
+        assert!(Instant::now() < deadline, "{job:?}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!tilts.is_empty(), "the finish was never seen running");
+    assert!(
+        tilts.iter().all(|t| t.abs() < 0.1),
+        "tilted during the finish: {tilts:?}"
+    );
+}
+
+#[test]
+fn a_cancelled_scan_leaves_the_table_flat() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = rig(dir.path());
+    let mut params = auto_params();
+    params["tilts_deg"] = json!([20]);
+    run(&mut c, "scan.auto", params);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while run(&mut c, "scan.status", Value::Null)["auto"]["quality"]["stops"]
+        .as_u64()
+        .unwrap_or(0)
+        < 2
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let tilted = run(&mut c, "turntable.status", Value::Null)["tilt_deg"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (tilted - 20.0).abs() < 0.5,
+        "not tilted while scanning: {tilted}"
+    );
+    run(&mut c, "turntable.stop", Value::Null);
+    let status = run(&mut c, "scan.status", Value::Null);
+    assert_eq!(status["auto"]["state"], "cancelled", "{status}");
+    let tilt = flat_tilt(&mut c);
+    assert!(tilt.abs() < 0.1, "the table stayed tilted at {tilt}");
+}
