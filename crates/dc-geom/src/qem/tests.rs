@@ -316,6 +316,51 @@ fn deterministic() {
     assert_eq!(decimate(&mesh, &p).unwrap(), decimate(&mesh, &p).unwrap());
 }
 
+/// A mesh over [`PARALLEL_MIN_FACES`] without a face target is decimated in
+/// cells: the tolerance, the border and the topology hold as in a
+/// sequential run, and the result does not depend on the threads.
+#[test]
+fn parallel_cells_keep_tolerance_and_topology() {
+    let mesh = noisy_surface(185, 0.02); // 67712 faces
+    assert!(mesh.face_count() >= PARALLEL_MIN_FACES);
+    let (bp, bs) = boundary_of(&mesh);
+    let tol = 0.05;
+    let p = DecimateParams::to_tolerance(tol);
+    let run = |threads: usize| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| decimate(&mesh, &p).unwrap())
+    };
+    let d = run(4);
+    assert_eq!(d, run(1));
+    let h = hausdorff(&mesh, &d.mesh);
+    assert!(h <= tol + 1e-5, "hausdorff {h}");
+    assert_clean(&mesh, &d.mesh);
+    assert_vertex_map(&mesh, &d);
+    let (op, os) = boundary_of(&d.mesh);
+    assert!(to_segments(&op, &bs) <= tol + 1e-5);
+    assert!(to_segments(&bp, &os) <= tol + 1e-5);
+    assert!(
+        d.mesh.face_count() < mesh.face_count() / 4,
+        "{}",
+        d.mesh.face_count()
+    );
+
+    // closed: the Euler characteristic holds across the cell seams
+    let sphere = noisy_sphere(6, 0.01); // 81920 faces
+    let d = decimate(&sphere, &p).unwrap();
+    let h = hausdorff(&sphere, &d.mesh);
+    assert!(h <= tol + 1e-5, "hausdorff {h}");
+    assert_clean(&sphere, &d.mesh);
+    assert!(
+        d.mesh.face_count() < sphere.face_count() / 4,
+        "{}",
+        d.mesh.face_count()
+    );
+}
+
 #[test]
 fn vertex_labels_are_preserved() {
     let mut mesh = sphere(5);

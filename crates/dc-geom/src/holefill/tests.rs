@@ -146,3 +146,105 @@ fn faired_patch_spans_a_curved_hole() {
         assert!(out.face_normal(f).z > 0.9);
     }
 }
+
+/// The sorted-edge topology answers as [`dc_mesh::EdgeAdjacency`]: the same
+/// border loops in the same order, the same face counts, the same
+/// non-manifold edges.
+#[test]
+fn edges_match_the_mesh_adjacency() {
+    let mut mesh = punched_grid(
+        24,
+        &[
+            (Vec3::new(6.5, 6.5, 0.0), 2.2),
+            (Vec3::new(16.5, 15.5, 0.0), 3.1),
+            (Vec3::new(17.0, 5.0, 0.0), 1.2),
+        ],
+    );
+    // a third face on an edge, and a degenerate face
+    let [a, b, _] = mesh.tris[100];
+    let top = mesh.positions.len() as u32;
+    mesh.positions.push(Vec3::new(3.0, 3.0, 2.0));
+    mesh.tris.push([a, b, top]);
+    mesh.tris.push([a, a, b]);
+    let adj = mesh.edge_adjacency();
+    let edges = Edges::new(&mesh.tris, mesh.positions.len());
+    assert_eq!(edges.boundary_loops(), adj.boundary_loops());
+    assert_eq!(edges.non_manifold(), adj.non_manifold_edge_count());
+    assert_eq!(edges.non_manifold(), 1);
+    for t in &mesh.tris {
+        for k in 0..3 {
+            let (u, v) = (t[k], t[(k + 1) % 3]);
+            if u != v {
+                assert_eq!(edges.count(u, v) as usize, adj.faces_of(u, v).len());
+            }
+        }
+    }
+    assert_eq!(edges.count(0, top), 0);
+}
+
+/// The ear clipping of the module, with the heap, cuts the same ears in
+/// the same order as the direct search (the smallest angle of the current
+/// polygon, the first one on ties).
+#[test]
+fn ear_clip_heap_matches_the_direct_search() {
+    fn direct(p: &[Vec3], forbidden: &dyn Fn(usize, usize) -> bool) -> Option<Vec<[usize; 3]>> {
+        let n = p.len();
+        let mut normal = Vec3::ZERO;
+        for i in 0..n {
+            let (a, b) = (p[i], p[(i + 1) % n]);
+            normal += Vec3::new(
+                (a.y - b.y) * (a.z + b.z),
+                (a.z - b.z) * (a.x + b.x),
+                (a.x - b.x) * (a.y + b.y),
+            );
+        }
+        let normal = normal.normalize_or_zero();
+        let angle = |a: Vec3, v: Vec3, b: Vec3| {
+            let (e1, e2) = (a - v, b - v);
+            let a = normal.dot(e2.cross(e1)).atan2(e1.dot(e2));
+            if a < 0.0 {
+                a + std::f32::consts::TAU
+            } else {
+                a
+            }
+        };
+        let mut ring: Vec<usize> = (0..n).collect();
+        let mut tris = Vec::new();
+        while ring.len() > 3 {
+            let m = ring.len();
+            let t = (0..m)
+                .filter(|&x| !forbidden(ring[(x + m - 1) % m], ring[(x + 1) % m]))
+                .min_by(|&x, &y| {
+                    let ax = angle(p[ring[(x + m - 1) % m]], p[ring[x]], p[ring[(x + 1) % m]]);
+                    let ay = angle(p[ring[(y + m - 1) % m]], p[ring[y]], p[ring[(y + 1) % m]]);
+                    ax.total_cmp(&ay)
+                })?;
+            tris.push([ring[(t + m - 1) % m], ring[t], ring[(t + 1) % m]]);
+            ring.remove(t);
+        }
+        tris.push([ring[0], ring[1], ring[2]]);
+        Some(tris)
+    }
+    // star-shaped wobbly loops in 3D (with equal angles on the regular
+    // parts), with and without forbidden diagonals
+    let mut seed = 7u64;
+    let mut next = || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        (seed >> 33) as f32 / (1u64 << 31) as f32
+    };
+    for n in [5usize, 12, 40, 200, 333] {
+        for wobble in [0.0f32, 0.3] {
+            let p: Vec<Vec3> = (0..n)
+                .map(|i| {
+                    let t = std::f32::consts::TAU * i as f32 / n as f32;
+                    let r = 10.0 + wobble * 10.0 * next();
+                    Vec3::new(r * t.cos(), r * t.sin(), wobble * next())
+                })
+                .collect();
+            let none = |_: usize, _: usize| false;
+            assert_eq!(ear_clip(&p, &none), direct(&p, &none), "n {n}");
+            let some = |a: usize, b: usize| (a * 7 + b * 3).is_multiple_of(11);
+            assert_eq!(ear_clip(&p, &some), direct(&p, &some), "n {n}");
+        }
+    }
+}

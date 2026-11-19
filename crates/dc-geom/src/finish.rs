@@ -29,7 +29,7 @@ use glam::Vec3;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::holefill::{HoleFillParams, fill_holes};
+use crate::holefill::{Edges, HoleFillParams, fill_holes};
 use crate::qem::{DecimateParams, decimate};
 use crate::{GeomError, Result};
 
@@ -211,10 +211,10 @@ pub fn finish_mesh(
     check()?;
 
     out.update_normals();
-    let adj = out.edge_adjacency();
-    report.boundary_loops = adj.boundary_loops().len();
+    let edges = Edges::new(&out.tris, out.positions.len());
+    report.boundary_loops = edges.boundary_loops().len();
     report.holes_left = report.boundary_loops.saturating_sub(1);
-    report.non_manifold_edges = adj.non_manifold_edge_count();
+    report.non_manifold_edges = edges.non_manifold();
     report.components = out.connected_components().len();
     report.faces_after = out.face_count();
     report.vertices = out.vertex_count();
@@ -262,6 +262,36 @@ fn retain_faces(mesh: &mut TriMesh, keep: &[bool]) {
         let mut it = keep.iter();
         labels.retain(|_| *it.next().unwrap_or(&true));
     }
+}
+
+/// Drops the faces with a repeated vertex and the repeats of a face (the
+/// same three vertices, the first occurrence kept whatever its winding), as
+/// [`dc_mesh::cleanup::remove_bad_faces`] but with a parallel sort instead
+/// of a hash set; returns how many were dropped.
+fn remove_repeated_faces(mesh: &mut TriMesh) -> usize {
+    let mut keys: Vec<([u32; 3], u32)> = mesh
+        .tris
+        .par_iter()
+        .enumerate()
+        .filter(|(_, t)| t[0] != t[1] && t[1] != t[2] && t[0] != t[2])
+        .map(|(f, t)| {
+            let mut k = *t;
+            k.sort_unstable();
+            (k, f as u32)
+        })
+        .collect();
+    keys.par_sort_unstable();
+    let mut keep = vec![false; mesh.tris.len()];
+    for (i, &(k, f)) in keys.iter().enumerate() {
+        if i == 0 || keys[i - 1].0 != k {
+            keep[f as usize] = true;
+        }
+    }
+    let removed = keep.iter().filter(|k| !**k).count();
+    if removed > 0 {
+        retain_faces(mesh, &keep);
+    }
+    removed
 }
 
 /// Drops the vertices no face uses (attributes kept).
@@ -492,8 +522,7 @@ fn fix_spikes(mesh: &mut TriMesh) -> usize {
 /// The clean stage (see the module doc).
 fn clean(mesh: &TriMesh, island_fraction: f32, report: &mut FinishReport) -> TriMesh {
     let mut out = mesh.clone();
-    let bad = dc_mesh::cleanup::remove_bad_faces(&mut out);
-    report.degenerate_removed += bad.removed();
+    report.degenerate_removed += remove_repeated_faces(&mut out);
     let keep: Vec<bool> = (0..out.tris.len())
         .into_par_iter()
         .with_min_len(4096)
@@ -504,30 +533,42 @@ fn clean(mesh: &TriMesh, island_fraction: f32, report: &mut FinishReport) -> Tri
         retain_faces(&mut out, &keep);
         report.degenerate_removed += zero;
     }
-    // faces on non-manifold edges
-    let (edges, of_face) = edge_counts(&out.tris);
-    let keep: Vec<bool> = of_face
-        .iter()
-        .map(|es| es.iter().all(|&e| edges[e as usize].1 <= 2))
+    // faces on non-manifold edges, then the fins (faces with two or three
+    // border edges), round by round; the edge counts follow the removals
+    let (mut edges, of_face) = edge_counts(&out.tris);
+    let mut keep = vec![true; out.tris.len()];
+    let remove = |keep: &mut [bool], edges: &mut [(u64, u32)], gone: &[usize]| {
+        for &f in gone {
+            keep[f] = false;
+            for &e in &of_face[f] {
+                edges[e as usize].1 -= 1;
+            }
+        }
+    };
+    let gone: Vec<usize> = (0..of_face.len())
+        .filter(|&f| of_face[f].iter().any(|&e| edges[e as usize].1 > 2))
         .collect();
-    let dropped = keep.iter().filter(|k| !**k).count();
-    if dropped > 0 {
-        retain_faces(&mut out, &keep);
-        report.nonmanifold_fixed += dropped;
-    }
-    // fins: faces with two or three border edges
+    report.nonmanifold_fixed += gone.len();
+    remove(&mut keep, &mut edges, &gone);
     for _ in 0..FIN_ROUNDS {
-        let (edges, of_face) = edge_counts(&out.tris);
-        let keep: Vec<bool> = of_face
-            .iter()
-            .map(|es| es.iter().filter(|&&e| edges[e as usize].1 == 1).count() < 2)
+        let gone: Vec<usize> = (0..of_face.len())
+            .filter(|&f| {
+                keep[f]
+                    && of_face[f]
+                        .iter()
+                        .filter(|&&e| edges[e as usize].1 == 1)
+                        .count()
+                        >= 2
+            })
             .collect();
-        let fins = keep.iter().filter(|k| !**k).count();
-        if fins == 0 {
+        if gone.is_empty() {
             break;
         }
+        report.fins_removed += gone.len();
+        remove(&mut keep, &mut edges, &gone);
+    }
+    if keep.iter().any(|k| !k) {
         retain_faces(&mut out, &keep);
-        report.fins_removed += fins;
     }
     report.nonmanifold_fixed += split_nonmanifold_vertices(&mut out);
     report.islands_removed = remove_islands(&mut out, island_fraction);
