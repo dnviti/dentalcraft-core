@@ -40,6 +40,13 @@ impl Found {
     pub(super) fn no_node(&self) -> String {
         no_node(&self.sysfs)
     }
+
+    /// The device has the vendor shell extension unit (see
+    /// [`super::light`]), read from its sysfs USB descriptors.
+    pub(super) fn has_shell_unit(&self) -> bool {
+        std::fs::read(self.sysfs.join("descriptors"))
+            .is_ok_and(|d| super::light::has_shell_unit(&d))
+    }
 }
 
 /// The `2207:110c` devices on the bus.

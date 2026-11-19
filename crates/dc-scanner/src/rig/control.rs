@@ -14,22 +14,28 @@ use std::time::Duration;
 
 use dc_turntable::sim::{self as table_sim, SimRig, SimTurntableBackend};
 use dc_turntable::{
-    AngleProbe, AxisInfo, AxisKind, Turntable, TurntableBackend, TurntableError, TurntableInfo,
-    axis_of,
+    AngleProbe, AxisInfo, AxisKind, LinkProbe, Turntable, TurntableBackend, TurntableError,
+    TurntableInfo, axis_of,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::jobs::{self, AutoPlan, CalibrationPlan, Job, JobShared, TableHandle, lock};
-use super::{RigCalibration, RigJobKind, RigJobStatus, TurntableStatus, calibration_json};
+use super::jobs::{
+    self, AutoMode, AutoPlan, CalibrationPlan, FinishPlan, Job, JobShared, TableHandle, lock,
+};
+use super::{
+    AUTO_FRAMES_PER_STOP, AUTO_RESOLUTION_MM, AUTO_STEP_DEG, AUTO_TILTS_DEG,
+    RECONSTRUCT_RESOLUTION_MM, RigCalibration, RigJobKind, RigJobState, RigJobStatus,
+    TurntableStatus, calibration_json,
+};
 use crate::control::{
     NoParams, SCAN_AUTO, TURNTABLE_CALIBRATE, TURNTABLE_CALIBRATION, TURNTABLE_CONNECT,
     TURNTABLE_DEVICES, TURNTABLE_DISCONNECT, TURNTABLE_HOME, TURNTABLE_MOVE, TURNTABLE_SPEED,
     TURNTABLE_STATUS, TURNTABLE_STOP, parse,
 };
 use crate::session::ScanState;
-use crate::{Result, ScanController, ScanError};
+use crate::{Result, ScanController, ScanEditor, ScanError};
 
 /// Default discovery time of `turntable.devices` (seconds).
 const DEFAULT_DISCOVERY_S: f32 = 3.0;
@@ -96,30 +102,72 @@ pub(crate) struct SpeedParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct CalibrateParams {
-    /// Rotation steps, 3 to 36 (default 8).
+    /// Rotation steps, 3 to 36 (default 24).
     steps: Option<u32>,
-    /// Degrees per step, 5 to 120 (default 45); steps times step_deg must
+    /// Degrees per step, 5 to 120 (default 15); steps times step_deg must
     /// be 180 to 1080.
     step_deg: Option<f32>,
+    /// Frames averaged (per-pixel median) at each stop, 1 to 10 (default 3).
+    frames_per_stop: Option<u32>,
+    /// Wait after each move in seconds, 0 to 30 (default 0.5; at least the
+    /// scanner latency plus 0.4 s).
+    settle_s: Option<f32>,
+}
+
+/// How `scan.auto` turns the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AutoModeParam {
+    /// Stop every `step_deg`, capture, register from the turntable pose.
+    StopAndCapture,
+    /// Turn without stopping, tracking every frame.
+    Continuous,
 }
 
 /// Parameters of `scan.auto`.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct AutoParams {
-    /// Tilts of the passes in degrees (default [-20, 0, 20]); one rotation
-    /// per tilt.
+    /// Tilts of the passes in degrees (default [-20, -10, 0, 10, 20] with a
+    /// tilt axis, [0] without): one rotation per tilt. Within ±20 an object
+    /// only resting on the platter stays put (at ±30 a test arch slid).
     tilts_deg: Option<Vec<f32>>,
     /// Rotation of each pass in degrees (default 360).
     rotation_deg: Option<f32>,
-    /// Rotation speed in degrees per second (default: the table's).
+    /// `stop-and-capture` (default with a calibration) or `continuous`
+    /// (default without).
+    mode: Option<AutoModeParam>,
+    /// Stop-and-capture: degrees between stops, 2 to 45 (default 7.5).
+    step_deg: Option<f32>,
+    /// Stop-and-capture: frames averaged (per-pixel median) at each stop,
+    /// 1 to 10 (default 3).
+    frames_per_stop: Option<u32>,
+    /// Rotation speed in degrees per second (default: 30 between stops;
+    /// continuous, about 2 degrees per frame at the scanner's frame rate,
+    /// 4 to 30).
     deg_per_s: Option<f32>,
-    /// Wait after each tilt before scanning, in seconds (default 0.5).
+    /// Wait after each move in seconds (default 0.5; at least the scanner
+    /// latency plus 0.4 s).
     settle_s: Option<f32>,
     /// Run without a turntable calibration (default false): no region of
-    /// interest and no motion prior, so only for setups where the
-    /// background is beyond the depth range.
+    /// interest and no motion prior, so only continuous and only for setups
+    /// where the background is beyond the depth range.
     allow_uncalibrated: Option<bool>,
+    /// Stop-and-capture: at the end, stop the acquisition, rebuild the mesh
+    /// from the stops and finish it (clean, close the holes, optimise), so
+    /// the scan editor holds the finished mesh (default true). `false`
+    /// leaves the acquisition paused, without a mesh. Continuous scans keep
+    /// no stops and are never finished.
+    finish: Option<bool>,
+    /// Mesh resolution of the finish (voxel of the fine reconstruction),
+    /// 0.05 to 1 mm (default 0.1).
+    resolution_mm: Option<f32>,
+    /// Refine the poses of the stops before the fine fusion and leave out
+    /// the views that disagree with the others (an object that moved on the
+    /// platter), so they never make double walls: the reconstruction then
+    /// reports `rejected_stops`, `rejected_passes` and the warning
+    /// `scan-views-rejected` (default true).
+    refine: Option<bool>,
 }
 
 /// The connected table.
@@ -128,6 +176,8 @@ struct Connected {
     info: TurntableInfo,
     axes: Vec<AxisInfo>,
     probe: Option<AngleProbe>,
+    /// Whether its link is up, when it can drop.
+    link: Option<LinkProbe>,
 }
 
 /// Waits for the end of a manual move without holding the controller.
@@ -213,6 +263,14 @@ impl RigState {
 
     fn job_running(&self) -> bool {
         self.job.as_ref().is_some_and(|(_, j)| !j.finished())
+    }
+
+    /// A running job still uses the table: it is acquiring (the finish of
+    /// `scan.auto` only computes).
+    fn job_holds_table(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|(_, j)| !j.finished() && j.shared.holds_table())
     }
 
     fn table(&self) -> Result<&Connected> {
@@ -304,12 +362,12 @@ impl ScanController {
             .as_ref()
             .is_some_and(|w| !w.handle.is_finished());
         TurntableStatus {
-            connected: true,
+            connected: c.link.as_ref().is_none_or(|up| up()),
             info: Some(c.info.clone()),
             axes: c.axes.clone(),
             rotate_deg: angles.rotate_deg,
             tilt_deg: angles.tilt_deg,
-            busy: self.rig.job_running() || watching || angles.moving,
+            busy: self.rig.job_holds_table() || watching || angles.moving,
             calibrated: self.session.rig_calibration().is_some(),
             calibration_job,
         }
@@ -329,6 +387,45 @@ impl ScanController {
     /// `turntable.calibration`, replaced by `turntable.calibrate`).
     pub fn calibration(&self) -> Option<RigCalibration> {
         self.rig.calibration.clone()
+    }
+
+    /// A rig job (`scan.auto`, `turntable.calibrate`) ended and is not
+    /// finalised yet: until then the acquisition still runs held, as the
+    /// job left it. Every command finalises it first; a host that only
+    /// reads the controller calls [`ScanController::finish_rig_job`].
+    pub fn rig_job_ended(&self) -> bool {
+        self.rig.job.as_ref().is_some_and(|(_, j)| j.finished())
+    }
+
+    /// Finalises a rig job that ended, as any command does first: after a
+    /// calibration the acquisition is reset and the new calibration
+    /// applied, after `scan.auto` the acquisition goes on paused. Nothing
+    /// happens while the job runs.
+    pub fn finish_rig_job(&mut self) {
+        self.reap_rig(false);
+    }
+
+    /// Ends the scan session (`scan.close`): the scan and its edits are
+    /// discarded, the scanner and the turntable disconnected.
+    ///
+    /// # Errors
+    /// [`ScanError::InvalidState`] while a rig job runs or the acquisition
+    /// is scanning or paused (stop or reset it first).
+    pub(crate) fn close_scan(&mut self) -> Result<()> {
+        let state = self.session.status().state;
+        if self.rig.job_running() || matches!(state, ScanState::Scanning | ScanState::Paused) {
+            return Err(ScanError::InvalidState {
+                action: "close",
+                state,
+            });
+        }
+        self.reap_rig(true);
+        self.session.reset();
+        self.editor = None;
+        self.rig.table = None;
+        self.session.disconnect();
+        self.apply_rig();
+        Ok(())
     }
 
     /// Finalises a finished job: after a calibration the acquisition is
@@ -374,16 +471,55 @@ impl ScanController {
                 }
                 self.apply_rig();
             }
-            RigJobKind::Auto => self.session.end_hold(),
+            RigJobKind::Auto => {
+                self.session.end_hold();
+                // a finished scan: the acquisition stops, the editor gets
+                // the cloud, the fine mesh and the finished mesh (two undo
+                // steps)
+                if let Some((raw, finished)) = shared.take_meshes() {
+                    let handed = self.session.stop().and_then(|cloud| {
+                        let mut editor = ScanEditor::new(cloud);
+                        editor.replace_mesh(raw)?;
+                        editor.replace_mesh(finished)?;
+                        Ok(editor)
+                    });
+                    match handed {
+                        Ok(editor) => self.editor = Some(editor),
+                        Err(e) => shared.fail(&e),
+                    }
+                } else if Self::kept_partial(&shared.status()) {
+                    // a stop-and-capture scan that failed or was cancelled
+                    // keeps its stops: the acquisition stops, so they can be
+                    // rebuilt (`scan.reconstruct`) and exported; the job's
+                    // own error stays the one reported
+                    if let Ok(cloud) = self.session.stop() {
+                        self.editor = Some(ScanEditor::new(cloud));
+                    }
+                }
+                let kept = self.session.kept_stops().map(|k| k.stops.len() as u32);
+                shared.set_kept_stops(kept);
+            }
         }
     }
 
+    /// A `scan.auto` that ended without a finish (failed or cancelled)
+    /// after capturing stops.
+    fn kept_partial(s: &RigJobStatus) -> bool {
+        matches!(s.state, RigJobState::Failed | RigJobState::Cancelled)
+            && s.quality.as_ref().is_some_and(|q| q.stops > 0)
+    }
+
     /// Gives the session the calibration matching the connected scanner
-    /// and table, and the table's angle estimate.
+    /// and table, and the table's angle estimate; and, with or without a
+    /// table, the orientation of the scanner's IMU from the stored
+    /// calibration of this scanner.
     pub(crate) fn apply_rig(&mut self) {
+        // an unreadable calibration file must not prevent a connection:
+        // turntable.calibration reports it
+        let _ = self.rig.ensure_loaded();
+        let serial = self.session.status().device.and_then(|d| d.serial);
         let (calibration, probe) = match &self.rig.table {
             Some(c) => {
-                let serial = self.session.status().device.and_then(|d| d.serial);
                 let calibration = self
                     .rig
                     .calibration
@@ -394,7 +530,14 @@ impl ScanController {
             }
             None => (None, None),
         };
+        let imu = self
+            .rig
+            .calibration
+            .as_ref()
+            .filter(|cal| serial.is_some() && cal.scanner_serial == serial)
+            .and_then(RigCalibration::camera_from_imu);
         self.session.set_rig(calibration, probe);
+        self.session.set_imu_alignment(imu);
     }
 
     /// Runs a `turntable.*` command or `scan.auto`.
@@ -483,7 +626,7 @@ impl ScanController {
         moved: &[AxisKind],
         f: impl FnOnce(&mut dyn Turntable) -> dc_turntable::Result<()>,
     ) -> Result<()> {
-        if self.rig.job_running() {
+        if self.rig.job_holds_table() {
             return Err(TurntableError::Busy.into());
         }
         let table = Arc::clone(&self.rig.table()?.table);
@@ -583,15 +726,14 @@ impl ScanController {
         let info = table.info();
         let axes = table.axes();
         let probe = table.probe();
+        let link = table.link();
         self.rig.table = Some(Connected {
             table: Arc::new(Mutex::new(table)),
             info: info.clone(),
             axes: axes.clone(),
             probe,
+            link,
         });
-        // an unreadable calibration file must not prevent the connection:
-        // turntable.calibration reports it
-        let _ = self.rig.ensure_loaded();
         self.apply_rig();
         Ok(json!({
             "turntable": info,
@@ -621,10 +763,14 @@ impl ScanController {
         if self.session.rig_calibration().is_none() && p.allow_uncalibrated != Some(true) {
             return Err(ScanError::RigUncalibrated);
         }
-        let tilts = p
-            .tilts_deg
-            .clone()
-            .unwrap_or_else(|| vec![-20.0, 0.0, 20.0]);
+        let tilt_axis = axis_of(&axes, AxisKind::Tilt).ok();
+        let tilts = p.tilts_deg.clone().unwrap_or_else(|| {
+            if tilt_axis.is_some() {
+                AUTO_TILTS_DEG.to_vec()
+            } else {
+                vec![0.0]
+            }
+        });
         if tilts.is_empty() || tilts.len() > 12 {
             return Err(ScanError::InvalidParams(
                 "tilts_deg needs 1 to 12 tilts".into(),
@@ -661,6 +807,43 @@ impl ScanController {
                 "settle_s {settle_s} not in [0, 30]"
             )));
         }
+        let calibrated = self.session.rig_calibration().is_some();
+        let mode = match p.mode {
+            Some(AutoModeParam::Continuous) => AutoMode::Continuous,
+            Some(AutoModeParam::StopAndCapture) if !calibrated => {
+                return Err(ScanError::RigUncalibrated);
+            }
+            None if !calibrated => AutoMode::Continuous,
+            _ => {
+                let step_deg = p.step_deg.unwrap_or(AUTO_STEP_DEG);
+                let frames = p.frames_per_stop.unwrap_or(AUTO_FRAMES_PER_STOP);
+                if !(2.0..=45.0).contains(&step_deg) || !(1..=10).contains(&frames) {
+                    return Err(ScanError::InvalidParams(format!(
+                        "step_deg {step_deg} not in [2, 45] or frames_per_stop {frames} not in \
+                         [1, 10]"
+                    )));
+                }
+                AutoMode::Stops {
+                    step_deg,
+                    frames: frames as usize,
+                }
+            }
+        };
+        let resolution_mm = p.resolution_mm.unwrap_or(AUTO_RESOLUTION_MM);
+        let (lo, hi) = RECONSTRUCT_RESOLUTION_MM;
+        if !(lo..=hi).contains(&resolution_mm) {
+            return Err(ScanError::InvalidParams(format!(
+                "resolution_mm {resolution_mm} not in [{lo}, {hi}]"
+            )));
+        }
+        // continuous scans keep no stops: nothing to rebuild from
+        let finish =
+            (p.finish.unwrap_or(true) && matches!(mode, AutoMode::Stops { .. })).then(|| {
+                FinishPlan {
+                    resolution_mm,
+                    refine: p.refine.unwrap_or(true),
+                }
+            });
         match self.session.status().state {
             ScanState::Connected | ScanState::Stopped => self.session.start_held()?,
             ScanState::Scanning => self.session.rig_link().set_hold(true),
@@ -677,6 +860,8 @@ impl ScanController {
             deg_per_s: p.deg_per_s,
             settle: Duration::from_secs_f32(settle_s),
             has_tilt,
+            mode,
+            finish,
         };
         let steps = plan.steps();
         let job = jobs::start_auto(table, self.session.rig_link(), plan)?;
@@ -687,15 +872,21 @@ impl ScanController {
 
     fn calibrate(&mut self, p: &CalibrateParams) -> Result<Value> {
         let (table, axes, info) = self.job_prerequisites()?;
-        let steps = p.steps.unwrap_or(8);
-        let step_deg = p.step_deg.unwrap_or(45.0);
+        let steps = p.steps.unwrap_or(24);
+        let step_deg = p.step_deg.unwrap_or(15.0);
         let total = steps as f32 * step_deg;
+        let frames = p.frames_per_stop.unwrap_or(3);
+        let settle_s = p.settle_s.unwrap_or(0.5);
         if !(3..=36).contains(&steps)
             || !(5.0..=120.0).contains(&step_deg)
             || !(180.0..=1080.0).contains(&total)
+            || !(1..=10).contains(&frames)
+            || !(0.0..=30.0).contains(&settle_s)
         {
             return Err(ScanError::InvalidParams(format!(
-                "{steps} steps of {step_deg} degrees: steps 3 to 36, step_deg 5 to 120, 180 to 1080 degrees in all"
+                "{steps} steps of {step_deg} degrees, {frames} frames per stop, settle {settle_s} \
+                 s: steps 3 to 36, step_deg 5 to 120, 180 to 1080 degrees in all, 1 to 10 \
+                 frames, settle 0 to 30 s"
             )));
         }
         let status = self.session.status();
@@ -716,7 +907,8 @@ impl ScanController {
             steps,
             step_deg,
             tilt_deg,
-            roi_radius_mm: self.session.settings().roi_radius_mm,
+            frames: frames as usize,
+            settle: Duration::from_secs_f32(settle_s),
             scanner_serial: status.device.and_then(|d| d.serial),
             turntable_id: info.id,
             dir: self.rig.dir.clone(),
@@ -776,6 +968,30 @@ mod tests {
     fn run(c: &mut ScanController, id: &str, params: Value) -> Value {
         c.execute(id, &params, &|| false)
             .unwrap_or_else(|e| panic!("{id} {params}: {e}"))
+    }
+
+    #[test]
+    fn the_status_shows_a_dropped_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = ScanController::new();
+        c.set_rig_dir(dir.path());
+        run(&mut c, TURNTABLE_CONNECT, json!({"backend": "sim"}));
+        assert!(c.turntable_status().connected);
+        c.sim_rig().inject_link_drop(0, true);
+        let s = run(&mut c, TURNTABLE_STATUS, json!({}));
+        assert_eq!(s["connected"], false, "{s}");
+        assert_eq!(s["info"]["id"], "sim-turntable", "{s}");
+        let err = c
+            .execute(
+                TURNTABLE_MOVE,
+                &json!({"axis": "rotate", "by_deg": 10.0}),
+                &|| false,
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), "ble-disconnected");
+        // connecting again gives a working table
+        run(&mut c, TURNTABLE_CONNECT, json!({"backend": "sim"}));
+        assert!(c.turntable_status().connected);
     }
 
     #[test]

@@ -57,6 +57,7 @@
 
 pub mod control;
 pub mod editor;
+pub mod reconstruct;
 pub mod revopoint_sdk;
 pub mod revopoint_usb;
 pub mod rig;
@@ -145,6 +146,24 @@ pub enum ScanError {
     /// the table (allowed with `allow_uncalibrated`).
     #[error("no turntable calibration for this scanner and turntable: calibrate first")]
     RigUncalibrated,
+    /// `turntable.calibrate` measured an axis that fails its checks; `code`
+    /// says which (`calibration-no-object`, `calibration-tracking`,
+    /// `calibration-tilt`, `calibration-inaccurate`,
+    /// `calibration-implausible`).
+    #[error("turntable calibration refused ({code}): {detail}")]
+    CalibrationRefused {
+        /// Stable code of the failed check.
+        code: &'static str,
+        /// Technical detail with the measured values (untranslated).
+        detail: String,
+    },
+    /// `scan.auto` ended with too few views fused or registered.
+    #[error("the automatic scan is unusable: {0}")]
+    ScanQuality(String),
+    /// The scan kept no stops to rebuild from: only a stop-and-capture
+    /// `scan.auto` keeps them (hand-held and continuous scans do not).
+    #[error("the scan kept no stops (only stop-and-capture automatic scans keep them)")]
+    NoStops,
 }
 
 impl From<dc_turntable::TurntableError> for ScanError {
@@ -188,6 +207,9 @@ impl ScanError {
             Self::Turntable(e) => e.code(),
             Self::Calibration(_) => "calibration",
             Self::RigUncalibrated => "rig-uncalibrated",
+            Self::CalibrationRefused { code, .. } => code,
+            Self::ScanQuality(_) => "scan-quality-low",
+            Self::NoStops => "scan-no-stops",
         }
     }
 }
@@ -210,6 +232,10 @@ pub struct DepthFrame {
     /// Orientation of the device IMU when the frame was taken, when the
     /// device reports it (frame of the IMU, not of the camera).
     pub imu_orientation: Option<glam::Quat>,
+    /// The up direction measured by the device IMU when the frame was
+    /// taken (the accelerometer reading of a device at rest, unit, frame
+    /// of the IMU), when the device reports it.
+    pub imu_up: Option<glam::Vec3>,
 }
 
 /// Identity of a device as listed by its backend.
@@ -238,6 +264,23 @@ pub trait ScannerDevice: Send {
     /// Sets the exposure time, when the device supports it.
     fn set_exposure_us(&mut self, _us: u32) -> Result<()> {
         Ok(())
+    }
+    /// Keeps the device's fill light steadily on while streaming (`true`)
+    /// or leaves it alone (`false`), when the device has one it can drive.
+    fn set_fill_light(&mut self, _on: bool) -> Result<()> {
+        Ok(())
+    }
+    /// Runs the device at its fast frame rate from the next stream start
+    /// (`true`) or sends nothing (`false`), when the device has one it can
+    /// select.
+    fn set_fast_exposure(&mut self, _on: bool) -> Result<()> {
+        Ok(())
+    }
+    /// How long before its arrival a frame shows the scene, about: the
+    /// turntable angle of a frame is read that long before it arrived. It
+    /// may follow the frame rate: the acquisition asks at every frame.
+    fn latency(&self) -> Duration {
+        Duration::ZERO
     }
 }
 
@@ -300,6 +343,7 @@ mod tests {
             ScanError::from(dc_geom::GeomError::InvalidInput("x".into())),
             ScanError::PlatformUnsupported("x".into()),
             ScanError::DeviceLost("x".into()),
+            ScanError::NoStops,
         ];
         let codes: Vec<&str> = errors.iter().map(ScanError::code).collect();
         assert_eq!(
@@ -311,7 +355,8 @@ mod tests {
                 "cancelled",
                 "geometry",
                 "platform-unsupported",
-                "device-lost"
+                "device-lost",
+                "scan-no-stops"
             ]
         );
     }

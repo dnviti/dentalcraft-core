@@ -13,6 +13,10 @@
 //! * [`Turntable::probe`] returns an [`AngleProbe`]: a cheap, thread-safe
 //!   estimate of the current angles (no I/O), for live status and for the
 //!   motion prior of the scan tracking.
+//! * [`Turntable::link`] returns a [`LinkProbe`]: whether the link to the
+//!   table is up, without I/O. A table whose link dropped (Bluetooth) is
+//!   opened again by [`Turntable::reconnect`], keeping its angles
+//!   continuous, so a job can resume where it was.
 //!
 //! Backends:
 //!
@@ -135,6 +139,10 @@ pub struct Angles {
 /// [`Turntable::probe`]. It never does I/O.
 pub type AngleProbe = Arc<dyn Fn() -> Angles + Send + Sync>;
 
+/// Cheap thread-safe view of whether the link to a table is up, see
+/// [`Turntable::link`]. It never does I/O.
+pub type LinkProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Errors of the turntable layer. Every variant has a stable kebab-case
 /// [`TurntableError::code`]; Bluetooth errors keep their `ble-*` code.
 #[derive(Debug, thiserror::Error)]
@@ -184,6 +192,10 @@ pub enum TurntableError {
     /// The Bluetooth link failed.
     #[error(transparent)]
     Ble(#[from] BleError),
+    /// The link dropped and did not come back (code `ble-disconnected`,
+    /// like the drop itself): why the last reconnection failed.
+    #[error("Bluetooth device disconnected, reconnecting failed: {0}")]
+    Reconnect(String),
 }
 
 impl TurntableError {
@@ -202,7 +214,15 @@ impl TurntableError {
             Self::Cancelled => "cancelled",
             Self::InvalidParams(_) => "invalid-params",
             Self::Ble(e) => e.code(),
+            Self::Reconnect(_) => BleError::Disconnected.code(),
         }
+    }
+
+    /// The link to the table dropped (a Bluetooth disconnection): the
+    /// table may still be there, [`Turntable::reconnect`] may bring it
+    /// back.
+    pub fn link_lost(&self) -> bool {
+        matches!(self, Self::Ble(BleError::Disconnected))
     }
 }
 
@@ -239,6 +259,27 @@ pub trait Turntable: Send {
     /// Live estimate of the angles without I/O, when the backend has one.
     fn probe(&self) -> Option<AngleProbe> {
         None
+    }
+    /// Live state of the link without I/O: `false` once the link dropped,
+    /// until [`Turntable::reconnect`] succeeds. `None` for a table whose
+    /// link cannot drop.
+    fn link(&self) -> Option<LinkProbe> {
+        None
+    }
+    /// Opens the link again after it dropped, within `timeout`, polling
+    /// `cancel` between attempts. The table keeps its zero and its angles:
+    /// the rotation stays continuous with the readings before the drop,
+    /// and the speeds set before are set again. A motion under way is not
+    /// waited for and its target is forgotten: wait with
+    /// [`Turntable::wait_settled`], then move again to where the table
+    /// must be.
+    ///
+    /// # Errors
+    /// [`TurntableError::NotConnected`] when the backend cannot reconnect;
+    /// [`TurntableError::Cancelled`]; the error of the last attempt.
+    fn reconnect(&mut self, timeout: Duration, cancel: &dyn Fn() -> bool) -> Result<()> {
+        let _ = (timeout, cancel);
+        Err(TurntableError::NotConnected)
     }
 }
 

@@ -908,6 +908,7 @@ impl FrameGuard<'_> {
             timestamp_us: (timestamp_ms * 1000.0).max(0.0) as u64,
             color: None,
             imu_orientation: None,
+            imu_up: None,
         })
     }
 }

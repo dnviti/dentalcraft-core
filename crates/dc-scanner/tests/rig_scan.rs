@@ -55,6 +55,17 @@ fn off_line(p: Vec3, q: Vec3, d: Vec3) -> f32 {
     (v - v.dot(d) * d).length()
 }
 
+/// The scan world frame of `scan.status` (from the first camera frame).
+fn world_of(status: &Value) -> Affine3A {
+    let cols: Vec<f32> = status["world_from_camera"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no world frame: {status}"))
+        .iter()
+        .map(|v| v.as_f64().unwrap() as f32)
+        .collect();
+    Affine3A::from_cols_slice(&cols)
+}
+
 #[test]
 fn calibrated_turntable_scan_covers_the_model_and_ignores_the_enclosure() {
     let started = Instant::now();
@@ -147,17 +158,31 @@ fn calibrated_turntable_scan_covers_the_model_and_ignores_the_enclosure() {
     assert!(pivot_err < 1.0, "tilt axis off by {pivot_err} mm: {cal}");
     println!("calibrated in {:?}: {cal}", started.elapsed());
 
-    // --- automatic scan ---------------------------------------------------
+    // --- automatic scan (stop-and-capture and finish by default) ------------
     let r = run(
         &mut c,
         "scan.auto",
-        json!({"tilts_deg": [-15, 15], "rotation_deg": 360, "deg_per_s": 90, "settle_s": 0}),
+        json!({"tilts_deg": [-15, 15], "rotation_deg": 360, "deg_per_s": 90, "settle_s": 0,
+               "step_deg": 10, "resolution_mm": 0.5}),
     );
-    assert_eq!(r["steps"], 4);
+    // per tilt: the tilt, then 37 stops every 10 degrees; then the six
+    // phases of the finish
+    assert_eq!(r["steps"], 76 + 6);
     let job = wait_job(&mut c, "scan.status", "auto");
     assert_eq!(job["state"], "done", "{job}");
+    assert_eq!(job["phase"], "optimise", "{job}");
+    assert_eq!(job["reconstruction"]["stops"], 74, "{job}");
+    assert_eq!(job["finish"]["boundary_loops"], 1, "{job}");
+    assert_eq!(job["finish"]["non_manifold_edges"], 0, "{job}");
     let status = run(&mut c, "scan.status", Value::Null);
-    assert_eq!(status["state"], "paused", "{status}");
+    // the scan ended with the finished mesh in the editor (undo: the raw
+    // fine mesh)
+    assert_eq!(status["state"], "stopped", "{status}");
+    assert_eq!(
+        status["editor"]["mesh_faces"], job["finish"]["faces_after"],
+        "{status}"
+    );
+    assert_eq!(status["editor"]["can_undo"], true, "{status}");
     assert!(status["tracking_lost"].as_u64().unwrap() <= 3, "{status}");
     let world = status["world_angles_deg"].clone();
     let world = RigPose {
@@ -169,8 +194,30 @@ fn calibrated_turntable_scan_covers_the_model_and_ignores_the_enclosure() {
     let cloud = c.editor().unwrap().cloud().clone();
     println!("{} points after {:?}", cloud.len(), started.elapsed());
 
-    // world = camera at the first fused frame: back to model coordinates
-    let world_to_model: Affine3A = sim::rig_model_to_scene(&bounds, world).inverse() * camera;
+    // the world is the rig frame: +Z the axis of the platter as tilted at
+    // the first stop, origin on the platter, the scanner on the +X side
+    assert_eq!(status["rig_world"], true, "{status}");
+    let to_world = world_of(&status);
+    let scene_to_world = to_world * camera.inverse();
+    let platter = sim::rig_platter(world);
+    let up = scene_to_world.transform_vector3(platter.transform_vector3(Vec3::Z));
+    let up_err = up.angle_between(Vec3::Z).to_degrees();
+    assert!(up_err < 1.0, "platter normal {up_err} deg off +Z");
+    let origin = scene_to_world.transform_point3(platter.transform_point3(Vec3::ZERO));
+    assert!(origin.length() < 1.0, "platter centre at {origin}");
+    // the camera looks down at 60 degrees, the platter tilted by -15 about
+    // the scene X axis (across the line of sight): 45 degrees to it
+    let [tilt, yaw] = [0, 1].map(|i| status["scanner_deg"][i].as_f64().unwrap() as f32);
+    assert!((tilt - 45.0).abs() < 1.0 && yaw.abs() < 1.0, "{status}");
+    let eye = to_world.transform_point3(Vec3::ZERO);
+    assert!(
+        eye.x > 0.0 && eye.y.abs() < 1.0 && eye.z > 0.0,
+        "scanner at {eye}"
+    );
+
+    // back to model coordinates
+    let world_to_model: Affine3A =
+        sim::rig_model_to_scene(&bounds, world).inverse() * camera * to_world.inverse();
     let in_model: Vec<Vec3> = cloud
         .points
         .iter()
@@ -213,7 +260,8 @@ fn calibrated_turntable_scan_covers_the_model_and_ignores_the_enclosure() {
     run(
         &mut c,
         "scan.auto",
-        json!({"tilts_deg": [0], "rotation_deg": 90, "deg_per_s": 60, "settle_s": 0}),
+        json!({"tilts_deg": [0], "rotation_deg": 90, "deg_per_s": 60, "settle_s": 0,
+               "finish": false}),
     );
     let job = wait_job(&mut c, "scan.status", "auto");
     assert_eq!(job["state"], "done", "{job}");
@@ -224,7 +272,8 @@ fn calibrated_turntable_scan_covers_the_model_and_ignores_the_enclosure() {
         tilt_deg: world[1].as_f64().unwrap() as f32,
     };
     run(&mut c, "scan.stop", Value::Null);
-    let world_to_model = sim::rig_model_to_scene(&bounds, world).inverse() * camera;
+    let world_to_model =
+        sim::rig_model_to_scene(&bounds, world).inverse() * camera * world_of(&status).inverse();
     let in_model: Vec<Vec3> = c
         .editor()
         .unwrap()

@@ -20,14 +20,16 @@
 //! | `scan.stop` | none | `{points}` (the cloud becomes the editable scan) |
 //! | `scan.reset` | none | `{}` (discards the scan and its edits) |
 //! | `scan.status` | none | status + `editor` |
-//! | `scan.settings` | `live_voxel_mm?`, `min_depth_mm?`, `max_depth_mm?`, `exposure_us?`, `roi_radius_mm?`, `roi_height_mm?`, `use_roi?` | current settings |
+//! | `scan.settings` | `live_voxel_mm?`, `min_depth_mm?`, `max_depth_mm?`, `exposure_us?`, `roi_radius_mm?`, `roi_height_mm?`, `use_roi?`, `fill_light?`, `fast_exposure?` | current settings |
 //! | `scan.cloud` | `op`: a [`CloudOp`] | the op's summary + `editor` |
-//! | `scan.mesh-build` | `resolution_mm` | vertices / faces + `editor` |
-//! | `scan.mesh` | `op`: a [`MeshOp`] | the op's summary + `editor` |
+//! | `scan.mesh-build` | `resolution_mm` | vertices / faces, `method` (`stops`: fine reconstruction of the kept stops, while the cloud is unedited; `cloud`), `reconstruction` (stops) + `editor` |
+//! | `scan.reconstruct` | `resolution_mm?` (0.1), `refine?` (true) | vertices / faces, `reconstruction` + `editor` (fails with `scan-no-stops` without kept stops) |
+//! | `scan.mesh` | `op`: a [`MeshOp`] | the op's summary + `editor` (`finish` for the finish op) |
 //! | `scan.undo`, `scan.redo` | none | `{done, editor}` |
-//! | `scan.export` | `path`, `what` (`cloud` / `mesh`) | `{path, what}` |
+//! | `scan.export` | `path`, `what` (`cloud` / `mesh` / `stops`: a directory, see [`crate::reconstruct::write_stops`]) | `{path, what}` (+ `stops`) |
 //! | `scan.import` | `role?` | run by the host |
-//! | `scan.auto` | `tilts_deg?`, `rotation_deg?`, `deg_per_s?`, `settle_s?` | `{started, steps}`; runs in the background |
+//! | `scan.close` | none | `{}`; ends the session (discards the scan, disconnects the scanner and the turntable); refused with `invalid-state` while a scan or a job runs; a host with a scan window closes it |
+//! | `scan.auto` | `tilts_deg?`, `rotation_deg?`, `mode?`, `step_deg?`, `frames_per_stop?`, `deg_per_s?`, `settle_s?`, `finish?`, `resolution_mm?`, `refine?` | `{started, steps}`; runs in the background |
 //! | `turntable.devices` | `timeout_s?` | `{devices, backends}` |
 //! | `turntable.connect` | `backend?`, `device?`, `options?` (sim only) | `{turntable, axes, calibrated}` |
 //! | `turntable.disconnect` | none | `{}` |
@@ -51,6 +53,9 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
 use crate::editor::{CloudOp, MeshOp};
+use crate::reconstruct::{
+    DEFAULT_RESOLUTION_MM, RESOLUTION_RANGE_MM, ReconstructParams, reconstruct, write_stops,
+};
 use crate::rig::control::RigState;
 use crate::session::{ScanSession, ScanSettings, ScanState};
 use crate::sim::{self, SimBackend, SimOptions};
@@ -80,6 +85,8 @@ pub const SCAN_SETTINGS: &str = "scan.settings";
 pub const SCAN_CLOUD: &str = "scan.cloud";
 /// `scan.mesh-build`.
 pub const SCAN_MESH_BUILD: &str = "scan.mesh-build";
+/// `scan.reconstruct`: the fine mesh from the kept stops.
+pub const SCAN_RECONSTRUCT: &str = "scan.reconstruct";
 /// `scan.mesh`.
 pub const SCAN_MESH: &str = "scan.mesh";
 /// `scan.undo`.
@@ -91,6 +98,10 @@ pub const SCAN_EXPORT: &str = "scan.export";
 /// `scan.import`: executed by the host (it needs the case), not by the
 /// controller.
 pub const SCAN_IMPORT: &str = "scan.import";
+/// `scan.close`: ends the scan session (the scan is discarded, the scanner
+/// and the turntable are disconnected); a host with a scan window closes it
+/// too. Refused while a scan or a job runs.
+pub const SCAN_CLOSE: &str = "scan.close";
 /// `scan.auto`: automatic turntable scan, in the background.
 pub const SCAN_AUTO: &str = "scan.auto";
 /// `turntable.devices`.
@@ -161,11 +172,13 @@ pub fn command_infos() -> Vec<ScanCommandInfo> {
         info!(SCAN_SETTINGS, "settings", SettingsParams),
         info!(SCAN_CLOUD, "cloud", CloudParams),
         info!(SCAN_MESH_BUILD, "mesh-build", MeshBuildParams),
+        info!(SCAN_RECONSTRUCT, "reconstruct", ReconstructCmdParams),
         info!(SCAN_MESH, "mesh", MeshParams),
         info!(SCAN_UNDO, "undo", NoParams),
         info!(SCAN_REDO, "redo", NoParams),
         info!(SCAN_EXPORT, "export", ExportParams),
         info!(SCAN_IMPORT, "import", ImportParams),
+        info!(SCAN_CLOSE, "close", NoParams),
         info!(SCAN_AUTO, "auto", rig::AutoParams),
         info!(
             TURNTABLE_DEVICES,
@@ -329,6 +342,12 @@ struct SettingsParams {
     /// Crop the frames to the turntable region of interest when a rig
     /// calibration is in use.
     use_roi: Option<bool>,
+    /// Keep the scanner's fill light steadily on while scanning (default
+    /// true; false turns it off).
+    fill_light: Option<bool>,
+    /// Run the scanner at its fast frame rate (default true; on the MINI 2
+    /// about 6.8 instead of 2.7 frames per second).
+    fast_exposure: Option<bool>,
 }
 
 /// Parameters of `scan.cloud`.
@@ -343,15 +362,30 @@ struct CloudParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct MeshBuildParams {
-    /// Mesh resolution (grid cell edge) in millimetres, 0.05 to 5.
+    /// Mesh resolution (grid cell edge) in millimetres, 0.05 to 5. A scan
+    /// that kept its stops (automatic stop-and-capture) and whose cloud is
+    /// unedited is rebuilt from the stops (0.05 to 1 mm, see
+    /// `scan.reconstruct`); others are meshed from the cloud.
     resolution_mm: f32,
+}
+
+/// Parameters of `scan.reconstruct`.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+struct ReconstructCmdParams {
+    /// Mesh resolution (voxel of the fine volume) in millimetres, 0.05 to 1
+    /// (default 0.1).
+    resolution_mm: Option<f32>,
+    /// Refine the poses of the stops before fusing them (default true).
+    refine: Option<bool>,
 }
 
 /// Parameters of `scan.mesh`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct MeshParams {
-    /// The mesh repair (`{"op": "fill-holes", "max_edges": 60}`).
+    /// The mesh repair (`{"op": "fill-holes", "max_edges": 60}`, `{"op":
+    /// "finish"}`).
     op: MeshOp,
 }
 
@@ -364,15 +398,19 @@ enum ExportKind {
     /// The mesh, as STL, PLY or OBJ by the extension of the path (PLY for
     /// any other extension).
     Mesh,
+    /// The kept stops of an automatic stop-and-capture scan, into the
+    /// directory `path` (`stops.json` and one depth file per stop), for
+    /// offline analysis.
+    Stops,
 }
 
 /// Parameters of `scan.export`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ExportParams {
-    /// Output file.
+    /// Output file (a directory for `stops`).
     path: String,
-    /// `cloud` or `mesh`.
+    /// `cloud`, `mesh` or `stops`.
     what: ExportKind,
 }
 
@@ -434,7 +472,7 @@ pub(crate) fn parse<T: DeserializeOwned>(params: &Value) -> Result<T> {
 #[derive(Debug)]
 pub struct ScanController {
     pub(crate) session: ScanSession,
-    editor: Option<ScanEditor>,
+    pub(crate) editor: Option<ScanEditor>,
     pub(crate) rig: RigState,
 }
 
@@ -566,15 +604,47 @@ impl ScanController {
             }
             SCAN_MESH_BUILD => {
                 let p: MeshBuildParams = parse(params)?;
-                let mut out = self
-                    .editor_required()?
-                    .build_mesh(p.resolution_mm, cancel)?;
+                let (lo, hi) = RESOLUTION_RANGE_MM;
+                let from_stops = self
+                    .editor
+                    .as_ref()
+                    .is_some_and(ScanEditor::cloud_is_acquired)
+                    && (lo..=hi).contains(&p.resolution_mm)
+                    && self.session.kept_stops().is_some();
+                let mut out = if from_stops {
+                    let params = ReconstructParams {
+                        resolution_mm: p.resolution_mm,
+                        ..ReconstructParams::default()
+                    };
+                    let mut out = self.reconstruct(&params, cancel)?;
+                    out["method"] = json!("stops");
+                    out
+                } else {
+                    let mut out = self
+                        .editor_required()?
+                        .build_mesh(p.resolution_mm, cancel)?;
+                    out["method"] = json!("cloud");
+                    out
+                };
+                self.add_editor(&mut out);
+                Ok(out)
+            }
+            SCAN_RECONSTRUCT => {
+                let p: ReconstructCmdParams = parse(params)?;
+                let params = ReconstructParams {
+                    resolution_mm: p.resolution_mm.unwrap_or(DEFAULT_RESOLUTION_MM),
+                    refine: p.refine.unwrap_or(true),
+                    ..ReconstructParams::default()
+                };
+                let mut out = self.reconstruct(&params, cancel)?;
                 self.add_editor(&mut out);
                 Ok(out)
             }
             SCAN_MESH => {
                 let p: MeshParams = parse(params)?;
-                let mut out = self.editor_required()?.apply_mesh(&p.op)?;
+                let mut out = self
+                    .editor_required()?
+                    .apply_mesh_cancellable(&p.op, cancel)?;
                 self.add_editor(&mut out);
                 Ok(out)
             }
@@ -593,6 +663,11 @@ impl ScanController {
             SCAN_EXPORT => {
                 let p: ExportParams = parse(params)?;
                 self.export(&p)
+            }
+            SCAN_CLOSE => {
+                let NoParams {} = parse(params)?;
+                self.close_scan()?;
+                Ok(json!({}))
             }
             SCAN_IMPORT => Err(ScanError::InvalidParams(format!(
                 "{SCAN_IMPORT} is run by the host (it needs the case)"
@@ -629,6 +704,22 @@ impl ScanController {
         self.editor
             .as_mut()
             .ok_or(ScanError::Empty("no scan: stop the acquisition first"))
+    }
+
+    /// Rebuilds the mesh of the editable scan from its kept stops
+    /// ([`reconstruct`], one undoable step): `{vertices, faces,
+    /// reconstruction}`.
+    fn reconstruct(
+        &mut self,
+        params: &ReconstructParams,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Value> {
+        self.editor_required()?;
+        let stops = self.session.kept_stops().ok_or(ScanError::NoStops)?;
+        let rec = reconstruct(&stops, params, &|_| {}, cancel)?;
+        let mut out = self.editor_required()?.replace_mesh(rec.mesh)?;
+        out["reconstruction"] = json!(rec.report);
+        Ok(out)
     }
 
     /// Summary of the editable scan, `null` without one.
@@ -716,7 +807,9 @@ impl ScanController {
             || p.exposure_us.is_some()
             || p.roi_radius_mm.is_some()
             || p.roi_height_mm.is_some()
-            || p.use_roi.is_some();
+            || p.use_roi.is_some()
+            || p.fill_light.is_some()
+            || p.fast_exposure.is_some();
         if given {
             if let Some(v) = p.live_voxel_mm {
                 s.live_voxel_mm = v;
@@ -739,6 +832,12 @@ impl ScanController {
             if let Some(v) = p.use_roi {
                 s.use_roi = v;
             }
+            if let Some(v) = p.fill_light {
+                s.fill_light = v;
+            }
+            if let Some(v) = p.fast_exposure {
+                s.fast_exposure = v;
+            }
             self.session.set_settings(s)?;
         }
         let s = self.session.settings();
@@ -750,26 +849,34 @@ impl ScanController {
             "roi_radius_mm": s.roi_radius_mm,
             "roi_height_mm": s.roi_height_mm,
             "use_roi": s.use_roi,
+            "fill_light": s.fill_light,
+            "fast_exposure": s.fast_exposure,
         }))
     }
 
     fn export(&self, p: &ExportParams) -> Result<Value> {
+        let path = Path::new(&p.path);
+        if let ExportKind::Stops = p.what {
+            let stops = self.session.kept_stops().ok_or(ScanError::NoStops)?;
+            let n = write_stops(path, &stops)?;
+            return Ok(json!({ "path": p.path, "what": "stops", "stops": n }));
+        }
         let editor = self
             .editor
             .as_ref()
             .ok_or(ScanError::Empty("no scan: stop the acquisition first"))?;
-        let path = Path::new(&p.path);
-        match p.what {
-            ExportKind::Cloud => dc_mesh::io::write_ply(editor.cloud(), path)?,
+        let what = match p.what {
+            ExportKind::Cloud => {
+                dc_mesh::io::write_ply(editor.cloud(), path)?;
+                "cloud"
+            }
             ExportKind::Mesh => {
                 let mesh = editor.mesh().ok_or(ScanError::NoMesh)?;
                 let format = MeshFormat::from_path(path).unwrap_or(MeshFormat::Ply);
                 dc_mesh::io::write(path, mesh, format)?;
+                "mesh"
             }
-        }
-        let what = match p.what {
-            ExportKind::Cloud => "cloud",
-            ExportKind::Mesh => "mesh",
+            ExportKind::Stops => "stops",
         };
         Ok(json!({ "path": p.path, "what": what }))
     }
@@ -831,7 +938,7 @@ mod tests {
             assert_eq!(i.doc_key, format!("{prefix}{name}-doc"));
             assert_eq!((i.params_schema)()["type"], "object", "{}", i.id);
         }
-        assert_eq!(infos.len(), 28);
+        assert_eq!(infos.len(), 30);
         assert!(is_scan_command(TURNTABLE_MOVE) && is_turntable_command(TURNTABLE_MOVE));
         assert!(!is_turntable_command(SCAN_AUTO));
         assert!(!is_scan_command("case.import"));
@@ -857,6 +964,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn close_ends_the_session_unless_a_scan_runs() {
+        let mut c = ScanController::new();
+        // nothing connected: closing is fine and does nothing
+        run(&mut c, SCAN_CLOSE, json!({})).unwrap();
+        assert_eq!(
+            run(&mut c, SCAN_CLOSE, json!({"x": 1})).unwrap_err().code(),
+            "invalid-params"
+        );
+        let sim = json!({"backend": "sim", "options": {"realtime": false, "frames": 5,
+                         "width": 80, "height": 50}});
+        run(&mut c, SCAN_CONNECT, sim).unwrap();
+        run(&mut c, SCAN_START, json!({})).unwrap();
+        // scanning: refused, the scan goes on
+        let refused = run(&mut c, SCAN_CLOSE, json!({})).unwrap_err();
+        assert_eq!(refused.code(), "invalid-state");
+        assert_eq!(c.session().status().state, ScanState::Scanning);
+        run(&mut c, SCAN_STOP, json!({})).unwrap();
+        // stopped: closing discards the scan and disconnects the scanner
+        run(&mut c, SCAN_CLOSE, json!({})).unwrap();
+        assert_eq!(c.session().status().state, ScanState::Idle);
+        assert!(c.editor().is_none());
+    }
     #[test]
     fn bad_parameters_and_states_are_refused() {
         let mut c = ScanController::new();

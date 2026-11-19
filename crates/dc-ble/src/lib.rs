@@ -14,6 +14,8 @@
 //! hardware yet; the protocol logic on top ([`chunks`], profiles) is tested
 //! with fakes.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -87,6 +89,31 @@ impl BleError {
     }
 }
 
+/// Whether a link is still up, shared by the link and its observers: the
+/// platform marks it lost as soon as the system reports the device
+/// disconnected (BlueZ `Connected` false, WinRT connection status), before
+/// any read or write fails, and [`BleLink::close`] marks it too. Cheap to
+/// clone and to read from any thread; never does I/O.
+#[derive(Clone, Debug, Default)]
+pub struct LinkState(Arc<AtomicBool>);
+
+impl LinkState {
+    /// A link that is up.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The link is up: not lost nor closed.
+    pub fn is_connected(&self) -> bool {
+        !self.0.load(Ordering::Acquire)
+    }
+
+    /// The link is gone (for good: a new connection has a new state).
+    pub fn mark_lost(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// An open BLE serial connection.
 pub trait BleLink: Send {
     /// Write bytes to the device, split into chunks of at most
@@ -99,6 +126,8 @@ pub trait BleLink: Send {
     fn recv(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, BleError>;
     /// Stop notifications and disconnect. Idempotent; also done on drop.
     fn close(&mut self);
+    /// The live state of this link (see [`LinkState`]).
+    fn state(&self) -> LinkState;
 }
 
 /// The GATT layout of a serial-over-BLE service.
@@ -206,6 +235,16 @@ mod tests {
         assert_eq!(parts[1].len(), 20);
         assert_eq!(parts[2].len(), 5);
         assert_eq!(parts.concat(), data);
+    }
+
+    #[test]
+    fn a_lost_link_shows_in_every_clone_of_its_state() {
+        let state = LinkState::new();
+        let observer = state.clone();
+        assert!(observer.is_connected());
+        state.mark_lost();
+        assert!(!observer.is_connected());
+        assert!(LinkState::new().is_connected(), "a new link starts up");
     }
 
     #[test]

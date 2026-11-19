@@ -5,8 +5,13 @@
 
 use std::time::{Duration, Instant};
 
-use super::calib::{Calibration, load_calibration};
+use super::calib::{Calibration, CalibrationSource, load_calibration};
+#[cfg(target_os = "linux")]
+use super::exposure::ExposureProfile;
+use super::factory;
 use super::frame::{self, StreamMode};
+#[cfg(target_os = "linux")]
+use super::light::FillLight;
 use super::platform::{self, Address, Capture, PIX_FMT_Y16, find_devices, open_capture};
 use super::{BACKEND_ID, REENUMERATION_GRACE, UsbOptions};
 use crate::{
@@ -41,20 +46,71 @@ impl ScannerBackend for RevopointUsbBackend {
         let node = found
             .depth_node()
             .ok_or_else(|| ScanError::Device(found.no_node()))?;
-        let (calibration, _) = load_calibration()?;
+        let (mut calibration, mut calibration_source) = load_calibration()?;
         // the node must open; it is closed again until `start`
-        open_capture(&node).map_err(|(_, e)| e)?;
+        let idle = open_capture(&node).map_err(|(_, e)| e)?;
+        #[cfg(target_os = "linux")]
+        let shell_unit = found.has_shell_unit();
+        let mut calibration_note = None;
+        // no user file: the factory calibration, cached or read now (the
+        // stream is idle, as the file channel requires)
+        if calibration_source == CalibrationSource::Defaults {
+            match found.info.serial.as_deref().and_then(factory::cache_dir) {
+                Some(dir) => {
+                    let read = |file| {
+                        #[cfg(target_os = "linux")]
+                        if shell_unit {
+                            return idle.read_factory_file(file);
+                        }
+                        let _ = file;
+                        Err(ScanError::Device(
+                            "the factory calibration is read on Linux, from a device with \
+                             the vendor extension unit"
+                                .into(),
+                        ))
+                    };
+                    match factory::load_or_read(&dir, read) {
+                        Ok((c, path)) => {
+                            calibration = c;
+                            calibration_source = CalibrationSource::Factory(path);
+                        }
+                        Err(e) => calibration_note = Some(e.to_string()),
+                    }
+                }
+                None => {
+                    calibration_note =
+                        Some("no serial number or data directory to cache the factory file".into());
+                }
+            }
+        }
+        // idle, the device blinks its LEDs: off until a stream turns them on
+        #[cfg(target_os = "linux")]
+        if shell_unit {
+            let _ = idle.set_fill_light(FillLight::Off);
+        }
+        drop(idle);
         Ok(Box::new(RevopointUsbDevice {
             info: found.info,
             options: self.options.clone(),
             calibration,
+            calibration_source,
+            calibration_note,
             address: found.address,
             capture: None,
-            mode: self.options.mode,
+            mode: self.options.stream_mode(),
             restart: None,
             reconnect_deadline: None,
             buf: Vec::new(),
+            spare: Vec::new(),
             latest_ir: None,
+            fill_light: true,
+            shell_unit: false,
+            light_on: false,
+            light_note: None,
+            fast_exposure: false,
+            exposure_note: None,
+            last_frame_us: None,
+            period: None,
         }))
     }
 }
@@ -74,6 +130,10 @@ pub struct RevopointUsbDevice {
     info: DeviceInfo,
     options: UsbOptions,
     calibration: Calibration,
+    /// Where `calibration` comes from.
+    calibration_source: CalibrationSource,
+    /// Why the factory calibration is not in use, when it is not.
+    calibration_note: Option<String>,
     /// USB address of the current enumeration.
     address: Address,
     capture: Option<Capture>,
@@ -84,7 +144,53 @@ pub struct RevopointUsbDevice {
     /// Set while a start waits for the device to come back.
     reconnect_deadline: Option<Instant>,
     buf: Vec<u8>,
+    /// Second frame buffer, to drain the queue down to the newest frame.
+    spare: Vec<u8>,
     latest_ir: Option<Vec<u8>>,
+    /// Turn the fill light on while streaming (see [`super::light`]).
+    fill_light: bool,
+    /// The current enumeration has the vendor shell extension unit.
+    shell_unit: bool,
+    /// The fill light was turned on for the current stream.
+    light_on: bool,
+    /// Why the fill light was not driven, once.
+    light_note: Option<String>,
+    /// Apply [`ExposureProfile::Fast`] when a stream starts.
+    fast_exposure: bool,
+    /// Why the exposure profile was not applied, once.
+    exposure_note: Option<String>,
+    /// Driver timestamp of the latest complete frame dequeued (µs).
+    last_frame_us: Option<u64>,
+    /// Smoothed frame period of the stream, once two frames came.
+    period: Option<Duration>,
+}
+
+/// Latency of a frame beyond its period, and in frame periods: a MINI 2
+/// frame shows the scene `LATENCY_BASE + LATENCY_PERIODS × period` before
+/// it arrives (against the turntable's own angle estimate). Fitted on the
+/// rig: 0.7 to 1.1 s at 2.74 frames per second (2026-11-18), 0.35 to 0.40 s
+/// at 11.2 (fast exposure, 2026-11-19).
+const LATENCY_BASE: Duration = Duration::from_millis(200);
+const LATENCY_PERIODS: f32 = 1.9;
+
+/// The latency of a frame of a stream with frame period `period` (see
+/// [`LATENCY_BASE`]); `fallback` before the period is known.
+fn latency_of(period: Option<Duration>, fallback: Duration) -> Duration {
+    period.map_or(fallback, |p| LATENCY_BASE + p.mul_f32(LATENCY_PERIODS))
+}
+
+/// Updates the smoothed frame `period` with a frame dequeued at
+/// `timestamp_us` (driver clock), `last_us` being the previous one; gaps
+/// outside 5 ms to 1 s (a restart, a stall) do not count.
+fn note_frame(last_us: &mut Option<u64>, period: &mut Option<Duration>, timestamp_us: u64) {
+    if let Some(dt) = last_us
+        .and_then(|last| timestamp_us.checked_sub(last))
+        .filter(|dt| (5_000..=1_000_000).contains(dt))
+    {
+        let dt = Duration::from_micros(dt);
+        *period = Some(period.map_or(dt, |p| p.mul_f32(0.9) + dt.mul_f32(0.1)));
+    }
+    *last_us = Some(timestamp_us);
 }
 
 impl std::fmt::Debug for RevopointUsbDevice {
@@ -93,6 +199,10 @@ impl std::fmt::Debug for RevopointUsbDevice {
             .field("info", &self.info)
             .field("streaming", &self.capture.is_some())
             .field("mode", &self.mode)
+            .field("fill_light", &self.fill_light)
+            .field("fast_exposure", &self.fast_exposure)
+            .field("shell_unit", &self.shell_unit)
+            .field("light_on", &self.light_on)
             .finish_non_exhaustive()
     }
 }
@@ -109,6 +219,17 @@ impl RevopointUsbDevice {
     /// The calibration in use (loaded when the device was opened).
     pub fn calibration(&self) -> &Calibration {
         &self.calibration
+    }
+
+    /// Where the calibration in use comes from.
+    pub fn calibration_source(&self) -> &CalibrationSource {
+        &self.calibration_source
+    }
+
+    /// Why the factory calibration is not in use, when there is no user
+    /// file and it could not be read or parsed.
+    pub fn calibration_note(&self) -> Option<&str> {
+        self.calibration_note.as_deref()
     }
 
     /// The negotiated stream mode (the requested one until a stream ran).
@@ -157,12 +278,63 @@ impl RevopointUsbDevice {
         self.capture = Some(capture);
         self.restart = None;
         self.reconnect_deadline = None;
+        #[cfg(target_os = "linux")]
+        {
+            self.shell_unit = found.has_shell_unit();
+            let light = if self.fill_light {
+                FillLight::On
+            } else {
+                FillLight::Off
+            };
+            self.light_on = self.send_light(light) && self.fill_light;
+            if self.fast_exposure && self.shell_unit {
+                let sent = self
+                    .capture
+                    .as_ref()
+                    .map(|c| c.set_exposure_profile(ExposureProfile::Fast));
+                if let Some(Err(e)) = sent {
+                    self.exposure_note.get_or_insert_with(|| e.to_string());
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Sends `light` on the open stream when the device has the vendor
+    /// shell unit; a refusal is noted once.
+    #[cfg(target_os = "linux")]
+    fn send_light(&mut self, light: FillLight) -> bool {
+        let result = match (&self.capture, self.shell_unit) {
+            (Some(capture), true) => capture.set_fill_light(light),
+            (Some(_), false) => Err(ScanError::Device(
+                "no extension unit 4 with the expected GUID: fill light left alone".into(),
+            )),
+            (None, _) => return false,
+        };
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                self.light_note.get_or_insert_with(|| e.to_string());
+                false
+            }
+        }
+    }
+
+    /// Why the fill light was not driven, when it was not (the first
+    /// reason only).
+    pub fn fill_light_note(&self) -> Option<&str> {
+        self.light_note.as_deref()
+    }
+
+    /// Why the exposure profile was not applied, when it was not (the
+    /// first reason only).
+    pub fn exposure_note(&self) -> Option<&str> {
+        self.exposure_note.as_deref()
     }
 
     /// Sets the requested mode, else [`StreamMode::Depth`].
     fn negotiate(&self, capture: &mut Capture) -> Result<StreamMode> {
-        for mode in [self.options.mode, StreamMode::Depth] {
+        for mode in [self.options.stream_mode(), StreamMode::Depth] {
             let (w, h) = mode.size();
             if let Some(size) = capture.set_format(w, h, PIX_FMT_Y16)?
                 && size >= mode.frame_bytes()
@@ -175,8 +347,15 @@ impl RevopointUsbDevice {
         ))
     }
 
-    /// The stream ended (stopped or lost): forget it.
+    /// The stream ended (stopped or lost): forget it, the fill light off
+    /// first (left on, or blinking, it would stay so after the scan).
     fn end_stream(&mut self) {
+        #[cfg(target_os = "linux")]
+        if self.capture.is_some() && self.shell_unit {
+            // a device that left the bus refuses it: nothing to do then
+            self.send_light(FillLight::Off);
+        }
+        self.light_on = false;
         if let Some(mut capture) = self.capture.take() {
             capture.stop();
             #[allow(
@@ -190,6 +369,9 @@ impl RevopointUsbDevice {
             });
         }
         self.reconnect_deadline = None;
+        // the next stream may run at another rate
+        self.last_frame_us = None;
+        self.period = None;
     }
 
     /// One reconnection step: waits at most `timeout`.
@@ -229,6 +411,7 @@ impl RevopointUsbDevice {
                 .map_or(driver_timestamp_us, |h| u64::from(h.timestamp_ms) * 1000),
             color: None,
             imu_orientation: planes.header.and_then(|h| h.orientation),
+            imu_up: planes.header.and_then(|h| h.up()),
         })
     }
 }
@@ -261,6 +444,23 @@ impl ScannerDevice for RevopointUsbDevice {
         self.end_stream();
     }
 
+    fn set_fill_light(&mut self, on: bool) -> Result<()> {
+        self.fill_light = on;
+        #[cfg(target_os = "linux")]
+        if self.capture.is_some() && on != self.light_on {
+            let sent = self.send_light(if on { FillLight::On } else { FillLight::Off });
+            self.light_on = on && sent;
+        }
+        Ok(())
+    }
+
+    fn set_fast_exposure(&mut self, on: bool) -> Result<()> {
+        // applied when the next stream starts (the registers stay set
+        // across restarts until the scanner is unplugged)
+        self.fast_exposure = on;
+        Ok(())
+    }
+
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<DepthFrame>> {
         if let Some(deadline) = self.reconnect_deadline {
             self.reconnect(timeout, deadline)?;
@@ -269,13 +469,30 @@ impl ScannerDevice for RevopointUsbDevice {
         let Some(capture) = self.capture.as_mut() else {
             return Err(ScanError::Device("the depth stream is not started".into()));
         };
+        let full = self.mode.frame_bytes();
         match capture.next(timeout, &mut self.buf) {
             Ok(Some(dq)) => {
-                if dq.bytes < self.mode.frame_bytes() {
+                if dq.bytes < full {
                     // a short (incomplete) frame: skip it
                     return Ok(None);
                 }
-                self.depth_frame(dq.timestamp_us).map(Some)
+                // frames queued behind it are newer: keep the newest, so
+                // the frame and the turntable angle read now stay close
+                let mut timestamp_us = dq.timestamp_us;
+                note_frame(&mut self.last_frame_us, &mut self.period, timestamp_us);
+                for _ in 0..self.options.buffers {
+                    match capture.next(Duration::ZERO, &mut self.spare) {
+                        Ok(Some(next)) if next.bytes >= full => {
+                            std::mem::swap(&mut self.buf, &mut self.spare);
+                            timestamp_us = next.timestamp_us;
+                            note_frame(&mut self.last_frame_us, &mut self.period, timestamp_us);
+                        }
+                        Ok(Some(_)) => {}
+                        // a failure surfaces at the next call
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                self.depth_frame(timestamp_us).map(Some)
             }
             Ok(None) => Ok(None),
             Err(e) => {
@@ -285,6 +502,10 @@ impl ScannerDevice for RevopointUsbDevice {
                 Err(e)
             }
         }
+    }
+
+    fn latency(&self) -> Duration {
+        latency_of(self.period, self.options.latency)
     }
 }
 
@@ -311,5 +532,32 @@ mod tests {
                 .code(),
             "device-not-found"
         );
+    }
+
+    #[test]
+    fn latency_follows_the_frame_period_measured_on_the_rig() {
+        let fallback = UsbOptions::default().latency;
+        assert_eq!(latency_of(None, fallback), fallback);
+        let at = |fps: f64| latency_of(Some(Duration::from_secs_f64(1.0 / fps)), fallback);
+        // 0.7 to 1.1 s at 2.74 fps, 0.35 to 0.40 s at 11.2 fps (fast exposure)
+        assert!(
+            (0.7..=1.1).contains(&at(2.74).as_secs_f64()),
+            "{:?}",
+            at(2.74)
+        );
+        assert!(
+            (0.35..=0.40).contains(&at(11.2).as_secs_f64()),
+            "{:?}",
+            at(11.2)
+        );
+
+        // the period comes from consecutive frames; a stall does not count
+        let (mut last, mut period) = (None, None);
+        for k in 0..20u64 {
+            note_frame(&mut last, &mut period, 1_000_000 + k * 89_000);
+        }
+        note_frame(&mut last, &mut period, 1_000_000 + 19 * 89_000 + 3_000_000);
+        let p = period.unwrap().as_secs_f64();
+        assert!((p - 0.089).abs() < 1e-4, "{p}");
     }
 }

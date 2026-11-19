@@ -6,11 +6,14 @@
 //! frames, the colour node (interface 2) `MJPG` 1600x1200. This backend
 //! reads the depth node with the standard capture API of the system, plain
 //! V4L2 calls on Linux (`v4l2`) and Media Foundation on Windows (`mf`, on
-//! the inbox UVC driver `usbvideo`), and needs neither the vendor SDK nor
-//! any vendor command: it sends no UVC extension-unit request, no HID
-//! report and no firmware, only format negotiation and streaming. The
-//! colour stream is not read (it is not registered to the depth image, and
-//! stopping it also resets the depth stream).
+//! the inbox UVC driver `usbvideo`), and needs no vendor SDK. Its vendor
+//! commands are closed lists the user authorised on 2026-11-18, Linux only:
+//! the fill light ([`light`]: on while streaming, off after), the fast
+//! exposure profile ([`exposure`]) and the read-only factory calibration
+//! file read ([`factory`]). It sends no other extension-unit request, no
+//! HID report and no firmware. The colour stream is not read (it is not
+//! registered to the depth image, and stopping it also resets the depth
+//! stream).
 //!
 //! * **Discovery.** [`ScannerBackend::list`] enumerates the USB devices with
 //!   `nusb` and keeps the `2207:110c` devices. On Linux their V4L2 nodes are
@@ -28,13 +31,15 @@
 //!   a header (device time, IMU orientation), the rest is depth as `u16`
 //!   times the depth scale; `0` is no depth. Frames are copied out of the
 //!   driver buffers before these are queued again.
-//! * **Calibration.** Intrinsics and depth scale come from a user file or
-//!   the alpha defaults, see [`calib`]. Without a calibration file the
-//!   geometry is an estimate (focal length from the published field of
-//!   view, depth scale measured on one unit).
+//! * **Calibration.** Intrinsics and depth scale come from a user file, else
+//!   the factory calibration read from the scanner and cached, else the
+//!   alpha defaults, see [`calib`] and [`factory`]. The depth scale is an
+//!   estimate measured on one unit in every case but a user file.
 //! * **Exposure.** The device runs its own auto exposure; V4L2 offers only
-//!   brightness and gain, which are not an exposure time.
-//!   [`ScannerDevice::set_exposure_us`] is therefore a no-op.
+//!   brightness and gain, which are not an exposure time, so
+//!   [`ScannerDevice::set_exposure_us`] is a no-op. The fast profile
+//!   ([`exposure`], [`crate::ScanSettings::fast_exposure`]) shortens the
+//!   pattern time: about 6.8 instead of 2.7 frames per second.
 //!
 //! # Stop and restart
 //!
@@ -65,7 +70,10 @@
 pub mod calib;
 #[cfg(any(target_os = "linux", windows))]
 mod device;
+pub mod exposure;
+pub mod factory;
 pub mod frame;
+pub mod light;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(windows)]
@@ -89,7 +97,10 @@ use serde::{Deserialize, Serialize};
 pub use calib::{Calibration, CalibrationSource};
 #[cfg(any(target_os = "linux", windows))]
 pub use device::RevopointUsbDevice;
+pub use exposure::ExposureProfile;
+pub use factory::FactoryFile;
 pub use frame::StreamMode;
+pub use light::FillLight;
 
 #[cfg(not(any(target_os = "linux", windows)))]
 use crate::{DeviceInfo, Result, ScannerBackend, ScannerDevice};
@@ -119,7 +130,10 @@ pub fn device_name(bcd_device: u16) -> &'static str {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UsbOptions {
     /// `Y16` mode to negotiate; [`StreamMode::Depth`] is the fallback when
-    /// the driver refuses it.
+    /// the driver refuses it. The default, `Depth`, moves a third of the
+    /// bytes of `Full`; with [`UsbOptions::keep_ir`] a `Depth` mode is
+    /// raised to `Full`, the only one known to carry the infrared pair on
+    /// every unit.
     pub mode: StreamMode,
     /// Frame rate asked for (the device offers 5, 10 and 15).
     pub fps: u32,
@@ -130,16 +144,33 @@ pub struct UsbOptions {
     /// Keep the infrared pair of the latest frame
     /// ([`RevopointUsbDevice::latest_ir`]).
     pub keep_ir: bool,
+    /// How long before its arrival a frame shows the scene until the frame
+    /// period of the stream is known (then it follows the period): 0.7 to
+    /// 1.1 s measured on a MINI 2 at 2.74 frames per second (2026-11-18),
+    /// see [`crate::ScannerDevice::latency`].
+    pub latency: Duration,
+}
+
+impl UsbOptions {
+    /// The mode actually negotiated first.
+    pub fn stream_mode(&self) -> StreamMode {
+        if self.keep_ir && self.mode == StreamMode::Depth {
+            StreamMode::Full
+        } else {
+            self.mode
+        }
+    }
 }
 
 impl Default for UsbOptions {
     fn default() -> Self {
         Self {
-            mode: StreamMode::Full,
+            mode: StreamMode::Depth,
             fps: 15,
             buffers: 4,
             reconnect_timeout: Duration::from_secs(8),
             keep_ir: false,
+            latency: Duration::from_millis(800),
         }
     }
 }

@@ -40,10 +40,26 @@
 //! triangles keep their attributes; [`Decimation::vertex_map`] maps every
 //! input vertex to the output vertex it merged into.
 //!
-//! The run is sequential and deterministic: ties in cost go to the smaller
-//! vertex indices, the survivor of a free collapse is the smaller index.
+//! The run is deterministic: ties in cost go to the smaller vertex indices,
+//! the survivor of a free collapse is the smaller index. After the first
+//! round only the edges around the collapses of the previous round are
+//! queued again (the others would fail the same checks again).
+//!
+//! Without a face target (the stop is local: the tolerance or the quadric
+//! error) a large mesh is decimated in parallel: its faces are split into
+//! cubic cells of about [`CELL_FACES`] faces, and every cell is decimated on
+//! its own with the vertices it shares with another cell frozen (they
+//! neither move nor take part in a collapse), so the cells never touch the
+//! same faces and every check sees the whole neighbourhood of the edge. A
+//! second pass does the same on cells shifted by half a cell, whose interiors
+//! hold the frozen seams of the first; a last sequential pass collapses
+//! around the vertices both passes left frozen. Quadrics and the assignment
+//! of the original vertices carry over between the passes, so the tolerance
+//! holds against the input exactly as in a sequential run. The cells depend
+//! on the mesh only, never on the number of threads.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use glam::DVec3;
 use nalgebra::{Matrix3, Vector3};
@@ -72,6 +88,10 @@ const MAX_ROUNDS: usize = 8;
 /// Relative slack of the bounding-sphere test of the tolerance check (a
 /// face is skipped only when it is certainly farther than the bound).
 const PRUNE_SLACK: f64 = 1.0 + 1e-9;
+/// Faces per cell of the parallel decimation (about).
+pub const CELL_FACES: usize = 16_384;
+/// Fewest faces decimated in parallel cells.
+const PARALLEL_MIN_FACES: usize = 4 * CELL_FACES;
 
 /// Decimation parameters.
 #[derive(Debug, Clone, PartialEq)]
@@ -97,6 +117,18 @@ pub struct DecimateParams {
     /// limit). Large flat regions otherwise end in fans of dozens of thin
     /// triangles, whose tolerance check dominates the run.
     pub max_valence: usize,
+    /// With a tolerance, the midpoints of the new edges and the centroid of
+    /// every new face must also lie within it of the input surface: a
+    /// bound on the surface, not only on its vertices (a face can no longer
+    /// bridge a concave notch).
+    pub surface_tolerance: bool,
+    /// With a tolerance, no new face may turn more than this from the input
+    /// surface (degrees; the input's vertex normals interpolated at the
+    /// closest point to the face centroid; 0: no limit). Keeps curved
+    /// surfaces in enough faces to look smooth when shaded flat.
+    pub max_normal_angle_deg: f64,
+    /// No collapse may leave an edge longer than this (mm, 0: no limit).
+    pub max_edge: f64,
 }
 
 impl Default for DecimateParams {
@@ -110,6 +142,9 @@ impl Default for DecimateParams {
             boundary_weight: 100.0,
             preserve_labels: true,
             max_valence: 0,
+            surface_tolerance: false,
+            max_normal_angle_deg: 0.0,
+            max_edge: 0.0,
         }
     }
 }
@@ -163,6 +198,25 @@ pub struct Decimation {
 /// non-finite positions or invalid parameters; [`GeomError::Mesh`] for
 /// indices out of range or attributes of the wrong length.
 pub fn decimate(mesh: &TriMesh, params: &DecimateParams) -> Result<Decimation> {
+    decimate_against(mesh, mesh, params)
+}
+
+/// [`decimate`] with the tolerance measured against `reference`: the same
+/// triangles as `mesh`, every vertex at most the tolerance away from its
+/// place in `mesh` (e.g. `mesh` is `reference` denoised). Every vertex of
+/// `reference` stays within the tolerance of the result and every vertex
+/// of the result (and with [`DecimateParams::surface_tolerance`] every
+/// edge midpoint and face centroid of the new faces) within it of
+/// `reference`.
+///
+/// # Errors
+/// As [`decimate`]; [`GeomError::InvalidInput`] when `reference` has other
+/// triangles or a vertex farther than the tolerance.
+pub fn decimate_against(
+    mesh: &TriMesh,
+    reference: &TriMesh,
+    params: &DecimateParams,
+) -> Result<Decimation> {
     mesh.check()?;
     if mesh.tris.is_empty() {
         return Err(GeomError::InvalidInput("mesh has no triangles".into()));
@@ -180,18 +234,47 @@ pub fn decimate(mesh: &TriMesh, params: &DecimateParams) -> Result<Decimation> {
     {
         return Err(GeomError::InvalidInput(format!("tolerance {t} invalid")));
     }
-    if params.max_error.is_nan() || params.boundary_weight.is_nan() || params.boundary_weight < 0.0
+    if params.max_error.is_nan()
+        || params.boundary_weight.is_nan()
+        || params.boundary_weight < 0.0
+        || !(params.max_normal_angle_deg >= 0.0 && params.max_edge >= 0.0)
     {
         return Err(GeomError::InvalidInput(
-            "max_error and boundary_weight must be numbers (weight >= 0)".into(),
+            "max_error, boundary_weight, max_normal_angle_deg and max_edge must be numbers (>= 0)"
+                .into(),
         ));
+    }
+    if !std::ptr::eq(mesh, reference) {
+        if reference.tris != mesh.tris || reference.positions.len() != mesh.positions.len() {
+            return Err(GeomError::InvalidInput(
+                "the reference must have the triangles of the mesh".into(),
+            ));
+        }
+        let t = params.tolerance.unwrap_or(0.0) as f32;
+        if mesh
+            .positions
+            .iter()
+            .zip(&reference.positions)
+            .any(|(p, q)| {
+                let d = p.distance(*q);
+                d.is_nan() || d > t
+            })
+        {
+            return Err(GeomError::InvalidInput(
+                "a vertex lies farther than the tolerance from the reference".into(),
+            ));
+        }
     }
     let target = match params.ratio {
         Some(r) => (r * mesh.tris.len() as f64).ceil() as usize,
         None => params.target_faces,
     };
-    let mut d = Decimator::new(mesh, params)?;
-    d.run(target, params.max_error);
+    let mut d = Decimator::new(mesh, reference, params)?;
+    if target == 0 && d.live_faces >= PARALLEL_MIN_FACES {
+        d.run_partitioned(params.max_error);
+    } else {
+        d.run(target, params.max_error);
+    }
     Ok(d.finish(mesh))
 }
 
@@ -382,17 +465,32 @@ struct NewFace {
 struct Tolerance {
     tol2: f64,
     tol: f32,
-    /// Original positions (centred, f64).
-    orig: Vec<DVec3>,
+    /// Original positions (centred, f64), shared by the cells.
+    orig: Arc<[DVec3]>,
     /// Original vertices assigned to every face.
     face_pts: Vec<Vec<u32>>,
-    /// BVH of the original mesh (input coordinates).
-    bvh: Bvh,
+    /// BVH of the original mesh (input coordinates), shared by the cells.
+    bvh: Arc<Bvh>,
     /// Assignment computed by the last successful check.
     scratch: Vec<(u32, u32)>,
+    /// Check the edge midpoints and centroids of the new faces too.
+    surface: bool,
+    /// Smallest cosine between a new face and the input surface, with the
+    /// input's triangles and unit vertex normals (`None`: no limit).
+    normals: Option<NormalCap>,
 }
 
-struct Decimator<'a> {
+/// The normal deviation limit of the tolerance check.
+#[derive(Clone)]
+struct NormalCap {
+    min_cos: f64,
+    tris: Arc<[[u32; 3]]>,
+    normals: Arc<[DVec3]>,
+}
+
+/// The working mesh of a run: the whole mesh, or one cell of a parallel
+/// pass (local indices).
+struct Decimator {
     center: DVec3,
     pos: Vec<DVec3>,
     quad: Vec<Quadric>,
@@ -403,8 +501,13 @@ struct Decimator<'a> {
     stamp: Vec<u32>,
     boundary: Vec<bool>,
     pinned: Vec<bool>,
+    /// Vertices shared with another cell: never moved, never collapsed.
+    frozen: Vec<bool>,
+    /// Vertices whose ring changed since the queue was seeded; the next
+    /// round queues only the edges at them.
+    touched: Vec<bool>,
     parent: Vec<u32>,
-    labels: Option<&'a [u16]>,
+    labels: Option<Vec<u16>>,
     preserve_boundary: bool,
     live_faces: usize,
     collapses: usize,
@@ -415,6 +518,17 @@ struct Decimator<'a> {
     ng: Vec<u32>,
     nw: Vec<u32>,
     max_valence: usize,
+    /// Squared longest edge a collapse may leave (0: no limit).
+    max_edge2: f64,
+}
+
+/// One cell of a parallel pass, decimated: its vertices (global indices,
+/// sorted; local index = position), its faces (global indices, in local
+/// order) and the run.
+struct Cell {
+    verts: Vec<u32>,
+    faces: Vec<u32>,
+    run: Decimator,
 }
 
 /// Sorted distinct neighbours of `v` (excluding `v`) into `out`.
@@ -444,8 +558,8 @@ fn degenerate(n: DVec3, a: DVec3, b: DVec3, c: DVec3) -> bool {
     n.length() <= DEGENERATE * l2
 }
 
-impl<'a> Decimator<'a> {
-    fn new(mesh: &'a TriMesh, params: &DecimateParams) -> Result<Self> {
+impl Decimator {
+    fn new(mesh: &TriMesh, reference: &TriMesh, params: &DecimateParams) -> Result<Self> {
         let nv = mesh.positions.len();
         let nf = mesh.tris.len();
         let center = mesh.aabb().map_or(DVec3::ZERO, |b| b.center().as_dvec3());
@@ -589,13 +703,44 @@ impl<'a> Decimator<'a> {
                         face_pts[f as usize].push(v as u32);
                     }
                 }
+                let orig: Arc<[DVec3]> = if std::ptr::eq(mesh, reference) {
+                    pos.clone().into()
+                } else {
+                    reference
+                        .positions
+                        .iter()
+                        .map(|p| p.as_dvec3() - center)
+                        .collect()
+                };
+                // area-weighted unit vertex normals of the input
+                let normals = (params.max_normal_angle_deg > 0.0).then(|| {
+                    let normals: Arc<[DVec3]> = vfaces
+                        .par_iter()
+                        .map(|fs| {
+                            fs.iter()
+                                .map(|&f| {
+                                    let [a, b, c] = tris[f as usize].map(|v| pos[v as usize]);
+                                    normal(a, b, c)
+                                })
+                                .sum::<DVec3>()
+                                .normalize_or_zero()
+                        })
+                        .collect();
+                    NormalCap {
+                        min_cos: params.max_normal_angle_deg.to_radians().cos(),
+                        tris: tris.clone().into(),
+                        normals,
+                    }
+                });
                 Some(Tolerance {
                     tol2: t * t,
                     tol: t as f32,
-                    orig: pos.clone(),
+                    orig,
                     face_pts,
-                    bvh: Bvh::build(mesh)?,
+                    bvh: Arc::new(Bvh::build(reference)?),
                     scratch: Vec::new(),
+                    surface: params.surface_tolerance,
+                    normals,
                 })
             }
             None => None,
@@ -612,8 +757,10 @@ impl<'a> Decimator<'a> {
             stamp: vec![0; nv],
             boundary,
             pinned,
+            frozen: vec![false; nv],
+            touched: Vec::new(),
             parent: (0..nv as u32).collect(),
-            labels: labels_v,
+            labels: labels_v.map(<[u16]>::to_vec),
             preserve_boundary: params.preserve_boundary,
             live_faces,
             collapses: 0,
@@ -624,6 +771,7 @@ impl<'a> Decimator<'a> {
             ng: Vec::new(),
             nw: Vec::new(),
             max_valence: params.max_valence,
+            max_edge2: params.max_edge * params.max_edge,
         })
     }
 
@@ -642,11 +790,14 @@ impl<'a> Decimator<'a> {
 
     /// Placement and cost of collapsing the edge `a < b`.
     fn plan(&self, a: u32, b: u32, alt: u8) -> Option<Plan> {
+        if self.frozen[a as usize] || self.frozen[b as usize] {
+            return None;
+        }
         let (ka, kb) = (self.must_keep(a, b), self.must_keep(b, a));
         if ka && kb {
             return None;
         }
-        if let Some(l) = self.labels
+        if let Some(l) = &self.labels
             && l[a as usize] != l[b as usize]
         {
             return None;
@@ -690,20 +841,45 @@ impl<'a> Decimator<'a> {
         }
     }
 
-    /// Queues every live edge.
+    /// Queues every live edge, or with [`Decimator::touched`] set only the
+    /// edges at a touched vertex; clears the touched marks.
     fn seed(&mut self) {
         self.heap.0.clear();
-        let mut nb = Vec::new();
-        let mut entries = Vec::new();
-        for u in 0..self.pos.len() as u32 {
-            if !self.alive[u as usize] || self.vfaces[u as usize].is_empty() {
-                continue;
+        let mut mask = std::mem::take(&mut self.touched);
+        let vertex = |u: u32| self.alive[u as usize] && !self.vfaces[u as usize].is_empty();
+        let entries: Vec<(u32, u32)> = if mask.is_empty() {
+            (0..self.pos.len() as u32)
+                .into_par_iter()
+                .with_min_len(1024)
+                .filter(|&u| vertex(u))
+                .map_init(Vec::new, |nb, u| {
+                    neighbours(&self.vfaces, &self.tris, u, nb);
+                    nb.iter()
+                        .filter(|&&w| w > u)
+                        .map(|&w| (u, w))
+                        .collect::<Vec<_>>()
+                })
+                .flatten_iter()
+                .collect()
+        } else {
+            let mut nb = Vec::new();
+            let mut out = Vec::new();
+            for u in 0..self.pos.len() as u32 {
+                if mask[u as usize] && vertex(u) {
+                    neighbours(&self.vfaces, &self.tris, u, &mut nb);
+                    out.extend(nb.iter().map(|&w| (u.min(w), u.max(w))));
+                }
             }
-            neighbours(&self.vfaces, &self.tris, u, &mut nb);
-            for &w in nb.iter().filter(|&&w| w > u) {
-                entries.push((u, w));
-            }
+            out.par_sort_unstable();
+            out.dedup();
+            out
+        };
+        if mask.is_empty() {
+            mask = vec![false; self.pos.len()];
+        } else {
+            mask.fill(false);
         }
+        self.touched = mask;
         let mut planned: Vec<u128> = entries
             .par_iter()
             .filter_map(|&(a, b)| {
@@ -779,6 +955,203 @@ impl<'a> Decimator<'a> {
         }
     }
 
+    /// The parallel run (see the module doc).
+    fn run_partitioned(&mut self, max_error: f64) {
+        let cell = self.cell_size();
+        let mut frozen = Vec::new();
+        for shift in [0.0, 0.5] {
+            frozen = self.run_cells(cell, shift, max_error);
+        }
+        // the last pass: around what the second pass left frozen
+        self.touched = frozen;
+        self.run(0, max_error);
+    }
+
+    /// Edge of a cube holding about [`CELL_FACES`] faces of the surface.
+    fn cell_size(&self) -> f64 {
+        let area: f64 = (0..self.tris.len())
+            .into_par_iter()
+            .filter(|&f| self.face_alive[f])
+            .map(|f| {
+                let [a, b, c] = self.tris[f].map(|v| self.pos[v as usize]);
+                0.5 * normal(a, b, c).length()
+            })
+            .sum();
+        (CELL_FACES as f64 * area / self.live_faces.max(1) as f64)
+            .sqrt()
+            .max(f64::MIN_POSITIVE)
+    }
+
+    /// One parallel pass: the live faces split into cubes of edge `cell`
+    /// (shifted by `shift` cells), every cube decimated on its own with
+    /// the vertices it shares with another cube frozen. Returns those
+    /// vertices.
+    fn run_cells(&mut self, cell: f64, shift: f64, max_error: f64) -> Vec<bool> {
+        let key = |f: usize| {
+            let [a, b, c] = self.tris[f].map(|v| self.pos[v as usize]);
+            let q = ((a + b + c) / (3.0 * cell) + shift).floor();
+            let k = |x: f64| (x.clamp(-1_048_576.0, 1_048_575.0) as i64 + 1_048_576) as u64;
+            (k(q.x) << 42) | (k(q.y) << 21) | k(q.z)
+        };
+        let mut faces: Vec<(u64, u32)> = (0..self.tris.len())
+            .into_par_iter()
+            .filter(|&f| self.face_alive[f])
+            .map(|f| (key(f), f as u32))
+            .collect();
+        faces.par_sort_unstable();
+        let mut face_cell = vec![u64::MAX; self.tris.len()];
+        for &(k, f) in &faces {
+            face_cell[f as usize] = k;
+        }
+        let frozen: Vec<bool> = self
+            .vfaces
+            .par_iter()
+            .map(|fs| {
+                fs.first().is_some_and(|&f0| {
+                    let k0 = face_cell[f0 as usize];
+                    fs.iter().any(|&f| face_cell[f as usize] != k0)
+                })
+            })
+            .collect();
+        let groups: Vec<Vec<u32>> = faces
+            .chunk_by(|x, y| x.0 == y.0)
+            .map(|g| g.iter().map(|&(_, f)| f).collect())
+            .collect();
+        drop(faces);
+        drop(face_cell);
+        let mut points: Vec<Vec<Vec<u32>>> = match self.tol.as_mut() {
+            Some(tol) => groups
+                .iter()
+                .map(|g| {
+                    g.iter()
+                        .map(|&f| std::mem::take(&mut tol.face_pts[f as usize]))
+                        .collect()
+                })
+                .collect(),
+            None => vec![Vec::new(); groups.len()],
+        };
+        let cells: Vec<Cell> = groups
+            .into_par_iter()
+            .zip(points.par_drain(..))
+            .map(|(faces, pts)| self.cell(faces, pts, &frozen, max_error))
+            .collect();
+        for c in cells {
+            self.absorb(c, &frozen);
+        }
+        for fs in &mut self.vfaces {
+            fs.clear();
+        }
+        for (f, t) in self.tris.iter().enumerate() {
+            if self.face_alive[f] {
+                for &v in t {
+                    self.vfaces[v as usize].push(f as u32);
+                }
+            }
+        }
+        frozen
+    }
+
+    /// Decimates the cell made of `faces` (live, global indices), whose
+    /// assigned original vertices are `points`.
+    fn cell(
+        &self,
+        faces: Vec<u32>,
+        points: Vec<Vec<u32>>,
+        frozen: &[bool],
+        max_error: f64,
+    ) -> Cell {
+        let mut verts: Vec<u32> = faces.iter().flat_map(|&f| self.tris[f as usize]).collect();
+        verts.sort_unstable();
+        verts.dedup();
+        let local = |v: u32| verts.binary_search(&v).map_or(u32::MAX, |i| i as u32);
+        let tris: Vec<[u32; 3]> = faces
+            .iter()
+            .map(|&f| self.tris[f as usize].map(local))
+            .collect();
+        let mut vfaces = vec![Vec::new(); verts.len()];
+        for (f, t) in tris.iter().enumerate() {
+            for &v in t {
+                vfaces[v as usize].push(f as u32);
+            }
+        }
+        fn pick<T: Copy>(all: &[T], verts: &[u32]) -> Vec<T> {
+            verts.iter().map(|&v| all[v as usize]).collect()
+        }
+        let n = verts.len();
+        let mut run = Decimator {
+            center: self.center,
+            pos: pick(&self.pos, &verts),
+            quad: pick(&self.quad, &verts),
+            face_alive: vec![true; tris.len()],
+            live_faces: tris.len(),
+            tris,
+            vfaces,
+            alive: vec![true; n],
+            stamp: vec![0; n],
+            boundary: pick(&self.boundary, &verts),
+            pinned: pick(&self.pinned, &verts),
+            frozen: pick(frozen, &verts),
+            touched: Vec::new(),
+            parent: (0..n as u32).collect(),
+            labels: self.labels.as_deref().map(|l| pick(l, &verts)),
+            preserve_boundary: self.preserve_boundary,
+            collapses: 0,
+            max_cost: 0.0,
+            tol: self.tol.as_ref().map(|t| Tolerance {
+                tol2: t.tol2,
+                tol: t.tol,
+                orig: Arc::clone(&t.orig),
+                face_pts: points,
+                bvh: Arc::clone(&t.bvh),
+                scratch: Vec::new(),
+                surface: t.surface,
+                normals: t.normals.clone(),
+            }),
+            heap: Queue::default(),
+            nk: Vec::new(),
+            ng: Vec::new(),
+            nw: Vec::new(),
+            max_valence: self.max_valence,
+            max_edge2: self.max_edge2,
+        };
+        run.run(0, max_error);
+        Cell { verts, faces, run }
+    }
+
+    /// Takes over the result of a cell (its non-frozen vertices and its
+    /// faces are its own). The vertex fans are rebuilt by the caller.
+    fn absorb(&mut self, c: Cell, frozen: &[bool]) {
+        let Cell {
+            verts,
+            faces,
+            mut run,
+        } = c;
+        for (l, &v) in verts.iter().enumerate() {
+            let v = v as usize;
+            if frozen[v] {
+                continue;
+            }
+            self.pos[v] = run.pos[l];
+            self.quad[v] = run.quad[l];
+            self.alive[v] = run.alive[l];
+            self.boundary[v] = run.boundary[l];
+            self.parent[v] = verts[run.parent[l] as usize];
+        }
+        for (l, &f) in faces.iter().enumerate() {
+            let f = f as usize;
+            if !run.face_alive[l] {
+                self.face_alive[f] = false;
+                self.live_faces -= 1;
+            }
+            self.tris[f] = run.tris[l].map(|v| verts[v as usize]);
+            if let (Some(tol), Some(cell)) = (self.tol.as_mut(), run.tol.as_mut()) {
+                tol.face_pts[f] = std::mem::take(&mut cell.face_pts[l]);
+            }
+        }
+        self.collapses += run.collapses;
+        self.max_cost = self.max_cost.max(run.max_cost);
+    }
+
     /// Topological, geometric and tolerance checks of `p`. On success with a
     /// tolerance, the new assignment of the original vertices is left in
     /// the scratch buffer for [`Decimator::collapse`].
@@ -851,6 +1224,17 @@ impl<'a> Decimator<'a> {
         if !ok {
             return false;
         }
+        // edge length: every neighbour of either end joins the merged vertex
+        if self.max_edge2 > 0.0
+            && self
+                .nk
+                .iter()
+                .chain(&self.ng)
+                .filter(|&&w| w != k && w != g)
+                .any(|&w| p.x.distance_squared(self.pos[w as usize]) > self.max_edge2)
+        {
+            return false;
+        }
         // fold-over
         for &v in &[k, g] {
             for &f in &self.vfaces[v as usize] {
@@ -921,6 +1305,38 @@ impl<'a> Decimator<'a> {
                     centre,
                     radius,
                 });
+            }
+        }
+        // the surface of the new faces: centroid and the midpoints of the
+        // edges at the merged vertex near the input, and the face turned
+        // little from it
+        if tol.surface || tol.normals.is_some() {
+            let center = self.center;
+            let near = |q: DVec3| tol.bvh.closest_point((q + center).as_vec3(), tol.tol);
+            for nf in &new_faces {
+                let Some(hit) = near(nf.centre) else {
+                    return false;
+                };
+                if let Some(cap) = &tol.normals {
+                    let t = cap.tris[hit.face as usize];
+                    let b = hit.barycentric.as_dvec3();
+                    let reference = (cap.normals[t[0] as usize] * b.x
+                        + cap.normals[t[1] as usize] * b.y
+                        + cap.normals[t[2] as usize] * b.z)
+                        .normalize_or_zero();
+                    let n = normal(nf.c[0], nf.c[1], nf.c[2]).normalize_or_zero();
+                    if reference != DVec3::ZERO && n.dot(reference) < cap.min_cos {
+                        return false;
+                    }
+                }
+                if tol.surface {
+                    for i in 0..3 {
+                        let (a, b) = (nf.c[i], nf.c[(i + 1) % 3]);
+                        if (a == p.x || b == p.x) && near((a + b) * 0.5).is_none() {
+                            return false;
+                        }
+                    }
+                }
             }
         }
         tol.scratch.clear();
@@ -1005,7 +1421,13 @@ impl<'a> Decimator<'a> {
         self.max_cost = self.max_cost.max(p.cost);
         let mut nb = std::mem::take(&mut self.nk);
         neighbours(&self.vfaces, &self.tris, k, &mut nb);
+        if !self.touched.is_empty() {
+            self.touched[ku] = true;
+        }
         for &w in &nb {
+            if !self.touched.is_empty() {
+                self.touched[w as usize] = true;
+            }
             self.push_edge(k, w);
         }
         self.nk = nb;

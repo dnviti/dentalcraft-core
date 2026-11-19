@@ -444,3 +444,52 @@ fn oracle_ficp_overlap() {
     assert_eq!(pairs.len(), keep);
     assert_eq!(pairs.len() as f64 / 80.0, o.f64s("ficp_xi")[0]);
 }
+
+#[test]
+fn conditioned_solve_keeps_the_start_along_weak_directions() {
+    // points on two perpendicular planes, moved by a known small motion
+    let truth =
+        DAffine3::from_rotation_z(0.01) * DAffine3::from_translation(DVec3::new(0.2, -0.1, 0.3));
+    let mut p = Vec::new();
+    let mut n = Vec::new();
+    for i in 0..20 {
+        for j in 0..20 {
+            let (a, b) = (i as f64 - 10.0, j as f64 - 10.0);
+            p.push(DVec3::new(a, b, 0.0));
+            n.push(DVec3::Z);
+            p.push(DVec3::new(a, 0.0, b + 12.0));
+            n.push(DVec3::Y);
+            p.push(DVec3::new(0.0, a, b + 12.0));
+            n.push(DVec3::X);
+        }
+    }
+    let q: Vec<DVec3> = p.iter().map(|x| truth.transform_point3(*x)).collect();
+    let nq: Vec<DVec3> = n.iter().map(|x| truth.transform_vector3(*x)).collect();
+    let s = point_to_plane_solve(&p, &q, &nq, None, 1e-3).unwrap();
+    assert_eq!(s.weak, 0);
+    assert!(s.conditioning > 1e-3, "{s:?}");
+    let moved = s.delta.transform_point3(DVec3::new(5.0, 5.0, 5.0));
+    assert!(moved.distance(truth.transform_point3(DVec3::new(5.0, 5.0, 5.0))) < 0.01);
+
+    // one plane only: sliding and turning in it are left alone
+    let (p1, q1, n1): (Vec<DVec3>, Vec<DVec3>, Vec<DVec3>) = (0..400)
+        .map(|k| {
+            let x = DVec3::new((k % 20) as f64, (k / 20) as f64, 0.0);
+            (x, x + DVec3::new(3.0, 2.0, 0.5), DVec3::Z)
+        })
+        .fold((vec![], vec![], vec![]), |mut acc, (a, b, c)| {
+            acc.0.push(a);
+            acc.1.push(b);
+            acc.2.push(c);
+            acc
+        });
+    let w = vec![1.0; p1.len()];
+    let s = point_to_plane_solve(&p1, &q1, &n1, Some(&w), 1e-3).unwrap();
+    assert_eq!(s.weak, 3);
+    let t = s.delta.translation;
+    assert!(
+        (t.z - 0.5).abs() < 1e-9 && t.x.abs() < 1e-9 && t.y.abs() < 1e-9,
+        "{t}"
+    );
+    assert!(point_to_plane_solve(&p1, &q1[..3], &n1, None, 1e-3).is_err());
+}

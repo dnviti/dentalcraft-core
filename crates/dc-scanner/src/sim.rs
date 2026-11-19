@@ -437,6 +437,7 @@ impl SimDevice {
             timestamp_us: (frame as f64 * 1e6 / opt.fps as f64) as u64,
             color: None,
             imu_orientation: None,
+            imu_up: None,
         }
     }
 }

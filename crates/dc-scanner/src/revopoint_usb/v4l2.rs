@@ -1,7 +1,9 @@
 //! Minimal V4L2 memory-mapped capture (Linux), hand-written over
 //! `rustix::ioctl` from `linux/videodev2.h`. Only standard V4L2 calls:
 //! `QUERYCAP`, `S_FMT`, `S_PARM`, `REQBUFS`, `QUERYBUF`, `QBUF`, `DQBUF`,
-//! `STREAMON`, `STREAMOFF`. Nothing vendor-specific is sent.
+//! `STREAMON`, `STREAMOFF`; plus, through `UVCIOC_CTRL_QUERY` of
+//! `uvcvideo`, the user-authorised fill light lines of [`FillLight`] and
+//! nothing else (see [`super::light`]).
 
 #![allow(unsafe_code)]
 #![warn(clippy::undocumented_unsafe_blocks)]
@@ -18,6 +20,11 @@ use rustix::io::Errno;
 use rustix::ioctl::{Getter, Opcode, Setter, Updater, ioctl, opcode};
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 
+use super::exposure::ExposureProfile;
+use super::factory::{
+    CLOSE_PAYLOAD, FILE_PAYLOAD_LEN, FactoryFile, OPEN_SELECTOR, READ_SELECTOR, append_chunk,
+};
+use super::light::{FillLight, SHELL_PAYLOAD_LEN, SHELL_SELECTOR, SHELL_UNIT};
 use crate::{Result, ScanError};
 
 // ----- videodev2.h ---------------------------------------------------------
@@ -500,6 +507,117 @@ impl Capture {
     }
 }
 
+/// `struct uvc_xu_control_query` (`linux/uvcvideo.h`).
+#[repr(C)]
+struct XuQuery {
+    unit: u8,
+    selector: u8,
+    query: u8,
+    size: u16,
+    data: *mut u8,
+}
+
+const UVCIOC_CTRL_QUERY: Opcode = opcode::read_write::<XuQuery>(b'u', 0x21);
+const UVC_SET_CUR: u8 = 0x01;
+const UVC_GET_CUR: u8 = 0x81;
+const UVC_GET_LEN: u8 = 0x85;
+
+impl Capture {
+    /// One query of `selector` of the vendor extension unit.
+    fn xu_query(&self, selector: u8, query: u8, data: &mut [u8]) -> Result<()> {
+        let mut q = XuQuery {
+            unit: SHELL_UNIT,
+            selector,
+            query,
+            size: data.len() as u16,
+            data: data.as_mut_ptr(),
+        };
+        // SAFETY: `UVCIOC_CTRL_QUERY` reads one `uvc_xu_control_query` and
+        // reads or writes `size` bytes at `data`, a live buffer of that
+        // length for the duration of the call.
+        unsafe { ioctl(&self.fd, Updater::<UVCIOC_CTRL_QUERY, XuQuery>::new(&mut q)) }
+            .map_err(|e| errno_error("UVCIOC_CTRL_QUERY", e))
+    }
+
+    /// Checks that `selector` of the extension unit is `expected` bytes
+    /// long (`what` names the command for the error).
+    fn check_len(&self, selector: u8, expected: usize, what: &str) -> Result<()> {
+        let mut len = [0u8; 2];
+        self.xu_query(selector, UVC_GET_LEN, &mut len)?;
+        let len = u16::from_le_bytes(len) as usize;
+        if len != expected {
+            return Err(ScanError::Device(format!(
+                "extension unit {SHELL_UNIT} selector {selector} is {len} bytes, not \
+                 {expected}: no {what} sent"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Sends shell `payloads` after checking the selector length.
+    fn send_shell(&self, payloads: Vec<[u8; SHELL_PAYLOAD_LEN]>, what: &str) -> Result<()> {
+        self.check_len(SHELL_SELECTOR, SHELL_PAYLOAD_LEN, what)?;
+        for mut p in payloads {
+            self.xu_query(SHELL_SELECTOR, UVC_SET_CUR, &mut p)?;
+        }
+        Ok(())
+    }
+
+    /// Sets the fill light (the lines of [`FillLight`], nothing else),
+    /// after checking that the shell selector is
+    /// [`SHELL_PAYLOAD_LEN`] bytes long.
+    ///
+    /// # Errors
+    /// [`ScanError::Device`] when the selector has another length or a
+    /// query fails.
+    pub fn set_fill_light(&self, light: FillLight) -> Result<()> {
+        self.send_shell(light.payloads(), "light command")
+    }
+
+    /// Applies `profile` (its lines, nothing else), with the checks of
+    /// [`Capture::set_fill_light`].
+    ///
+    /// # Errors
+    /// As [`Capture::set_fill_light`].
+    pub fn set_exposure_profile(&self, profile: ExposureProfile) -> Result<()> {
+        self.send_shell(profile.payloads(), "exposure command")
+    }
+
+    /// Reads the factory file `file` over the read-only file channel (see
+    /// [`super::factory`]): open for reading, read until the end, close.
+    /// Call it with the stream idle.
+    ///
+    /// # Errors
+    /// [`ScanError::Device`] when a selector has another length, a query
+    /// fails or a reply is malformed.
+    pub fn read_factory_file(&self, file: FactoryFile) -> Result<Vec<u8>> {
+        self.check_len(OPEN_SELECTOR, FILE_PAYLOAD_LEN, "file read")?;
+        self.check_len(READ_SELECTOR, FILE_PAYLOAD_LEN, "file read")?;
+        self.xu_query(OPEN_SELECTOR, UVC_SET_CUR, &mut file.open_payload())?;
+        let mut data = Vec::new();
+        let read = (|| -> Result<()> {
+            loop {
+                let mut reply = [0u8; FILE_PAYLOAD_LEN];
+                self.xu_query(READ_SELECTOR, UVC_GET_CUR, &mut reply)?;
+                if !append_chunk(&reply, &mut data)? {
+                    return Ok(());
+                }
+            }
+        })();
+        // the session is closed whatever happened after it was opened
+        let mut close = CLOSE_PAYLOAD;
+        let closed = self.xu_query(OPEN_SELECTOR, UVC_SET_CUR, &mut close);
+        read.and(closed)?;
+        if data.is_empty() {
+            return Err(ScanError::Device(format!(
+                "{}: empty or missing on the device",
+                file.device_path()
+            )));
+        }
+        Ok(data)
+    }
+}
+
 impl Drop for Capture {
     fn drop(&mut self) {
         self.stop();
@@ -543,6 +661,8 @@ mod tests {
         assert_eq!(VIDIOC_G_PARM, 0xc0cc_5615);
         assert_eq!(VIDIOC_S_PARM, 0xc0cc_5616);
         assert_eq!(PIX_FMT_Y16, 0x2036_3159);
+        assert_eq!(size_of::<XuQuery>(), 16);
+        assert_eq!(UVCIOC_CTRL_QUERY, 0xc010_7521);
     }
 
     #[test]

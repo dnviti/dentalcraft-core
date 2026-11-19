@@ -12,13 +12,20 @@
 //! moves only with its frames. Otherwise the clock follows real time; in
 //! fast mode ([`SimTurntableBackend::new`] with `fast`)
 //! [`Turntable::wait_settled`] then completes the motion at once.
+//!
+//! Faults (tests): [`SimRig::inject_link_drop`] drops the link of the table
+//! like a Bluetooth disconnection, at a chosen move; the table keeps
+//! turning, every call fails with `ble-disconnected` until
+//! [`Turntable::reconnect`].
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use dc_ble::BleError;
+
 use crate::{
-    AngleProbe, Angles, AxisInfo, AxisKind, Feedback, Result, Turntable, TurntableBackend,
-    TurntableError, TurntableInfo,
+    AngleProbe, Angles, AxisInfo, AxisKind, Feedback, LinkProbe, Result, Turntable,
+    TurntableBackend, TurntableError, TurntableInfo,
 };
 
 /// Id of the simulated backend.
@@ -88,6 +95,12 @@ struct Inner {
     fast: bool,
     rotate: Motion,
     tilt: Motion,
+    /// The link of the opened table is up.
+    link_up: bool,
+    /// Fault: the link drops at this move command (counted down).
+    drop_at_move: Option<u32>,
+    /// Fault: a reconnection fails.
+    refuse_reconnect: bool,
 }
 
 impl Inner {
@@ -133,6 +146,32 @@ impl Inner {
             speed: m.speed,
         };
     }
+
+    /// A call of the opened table: fails while the link is down.
+    fn linked(&self) -> Result<()> {
+        if self.link_up {
+            Ok(())
+        } else {
+            Err(TurntableError::Ble(BleError::Disconnected))
+        }
+    }
+
+    /// A move command reached the table: the link drops now when the
+    /// fault says so (the move goes on).
+    fn count_move(&mut self) -> Result<()> {
+        match self.drop_at_move {
+            Some(n) if n <= 1 => {
+                self.drop_at_move = None;
+                self.link_up = false;
+                Err(TurntableError::Ble(BleError::Disconnected))
+            }
+            Some(n) => {
+                self.drop_at_move = Some(n - 1);
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 /// The shared state of a simulated table: its angles over the simulation
@@ -154,6 +193,9 @@ impl SimRig {
                 fast: false,
                 rotate: Motion::at_rest(0.0, DEFAULT_ROTATE_DEG_PER_S),
                 tilt: Motion::at_rest(0.0, DEFAULT_TILT_DEG_PER_S),
+                link_up: true,
+                drop_at_move: None,
+                refuse_reconnect: false,
             }),
         })
     }
@@ -198,6 +240,29 @@ impl SimRig {
         let mut g = self.lock();
         g.sync();
         g.clock
+    }
+
+    /// Fault hook (tests): the link of the opened table drops at its
+    /// `nth` move command from now (1: the next one; rotations and tilts
+    /// alike, 0: at once). That move still reaches the table and runs;
+    /// the command and every later call of the table then fail with
+    /// `ble-disconnected`, and [`Turntable::link`] says so, until
+    /// [`Turntable::reconnect`], which fails with `ble-not-found` unless
+    /// `reconnect`.
+    pub fn inject_link_drop(&self, nth_move: u32, reconnect: bool) {
+        let mut g = self.lock();
+        if nth_move == 0 {
+            g.link_up = false;
+            g.drop_at_move = None;
+        } else {
+            g.drop_at_move = Some(nth_move);
+        }
+        g.refuse_reconnect = !reconnect;
+    }
+
+    /// The link of the opened table is up.
+    pub fn link_up(&self) -> bool {
+        self.lock().link_up
     }
 }
 
@@ -255,6 +320,7 @@ impl TurntableBackend for SimTurntableBackend {
         g.sync();
         g.attached = true;
         g.fast = self.fast;
+        g.link_up = true;
         drop(g);
         Ok(Box::new(SimTurntable {
             rig: Arc::clone(&self.rig),
@@ -297,9 +363,15 @@ impl SimTurntable {
     fn target(&self, axis: AxisKind, to: f32) -> Result<()> {
         crate::axis_of(&axes(), axis)?.check(to)?;
         let mut g = self.rig.lock();
+        g.linked()?;
         g.sync();
         g.go(axis, to);
-        Ok(())
+        g.count_move()
+    }
+
+    /// Fails while the link is down.
+    fn linked(&self) -> Result<()> {
+        self.rig.lock().linked()
     }
 }
 
@@ -316,6 +388,7 @@ impl Turntable for SimTurntable {
         if !deg.is_finite() {
             return Err(TurntableError::InvalidParams(format!("move by {deg}")));
         }
+        self.linked()?;
         let now = {
             let mut g = self.rig.lock();
             g.sync();
@@ -336,6 +409,7 @@ impl Turntable for SimTurntable {
             )));
         }
         let mut g = self.rig.lock();
+        g.linked()?;
         g.sync();
         let clock = g.clock;
         let m = g.motion(axis);
@@ -351,6 +425,7 @@ impl Turntable for SimTurntable {
 
     fn stop(&mut self) -> Result<()> {
         let mut g = self.rig.lock();
+        g.linked()?;
         g.sync();
         let pose = g.pose();
         g.go(AxisKind::Rotate, pose.rotate_deg);
@@ -360,6 +435,7 @@ impl Turntable for SimTurntable {
 
     fn home(&mut self) -> Result<()> {
         let mut g = self.rig.lock();
+        g.linked()?;
         g.sync();
         g.go(AxisKind::Rotate, 0.0);
         g.go(AxisKind::Tilt, 0.0);
@@ -367,6 +443,7 @@ impl Turntable for SimTurntable {
     }
 
     fn position(&mut self, axis: AxisKind) -> Result<Option<f32>> {
+        self.linked()?;
         let p = self.rig.pose();
         Ok(Some(match axis {
             AxisKind::Rotate => p.rotate_deg,
@@ -384,6 +461,7 @@ impl Turntable for SimTurntable {
         loop {
             {
                 let mut g = self.rig.lock();
+                g.linked()?;
                 g.sync();
                 if g.fast && !g.streaming {
                     let end = g.motion(axis).end();
@@ -418,6 +496,23 @@ impl Turntable for SimTurntable {
                 moving: g.moving(AxisKind::Rotate) || g.moving(AxisKind::Tilt),
             }
         }))
+    }
+
+    fn link(&self) -> Option<LinkProbe> {
+        let rig = Arc::clone(&self.rig);
+        Some(Arc::new(move || rig.lock().link_up))
+    }
+
+    fn reconnect(&mut self, _timeout: Duration, cancel: &dyn Fn() -> bool) -> Result<()> {
+        if cancel() {
+            return Err(TurntableError::Cancelled);
+        }
+        let mut g = self.rig.lock();
+        if g.refuse_reconnect {
+            return Err(TurntableError::Ble(BleError::NotFound));
+        }
+        g.link_up = true;
+        Ok(())
     }
 }
 
@@ -516,5 +611,52 @@ mod tests {
         assert!((20.0..21.0).contains(&p), "{p}");
         t.wait_settled(AxisKind::Rotate, Duration::from_millis(100), &never)
             .unwrap();
+    }
+
+    #[test]
+    fn an_injected_link_drop_fails_every_call_until_a_reconnection() {
+        let backend = SimTurntableBackend::new(SimRig::new(), true);
+        let rig = Arc::clone(backend.rig());
+        let mut t = backend.open(DEVICE_ID).unwrap();
+        let link = t.link().unwrap();
+        assert!(link());
+        rig.inject_link_drop(2, true);
+        t.move_by(AxisKind::Rotate, 10.0).unwrap();
+        t.wait_settled(AxisKind::Rotate, Duration::from_secs(1), &never)
+            .unwrap();
+        // the second move reaches the table, then the link drops
+        let err = t.move_by(AxisKind::Rotate, 10.0).unwrap_err();
+        assert!(err.link_lost(), "{err}");
+        assert!(!link() && !rig.link_up());
+        for err in [
+            t.position(AxisKind::Rotate).unwrap_err(),
+            t.wait_settled(AxisKind::Rotate, Duration::from_secs(1), &never)
+                .unwrap_err(),
+            t.stop().unwrap_err(),
+        ] {
+            assert_eq!(err.code(), "ble-disconnected");
+        }
+        assert_eq!(
+            t.reconnect(Duration::from_secs(1), &|| true)
+                .unwrap_err()
+                .code(),
+            "cancelled"
+        );
+        t.reconnect(Duration::from_secs(1), &never).unwrap();
+        assert!(link());
+        // the move that dropped the link went on
+        t.wait_settled(AxisKind::Rotate, Duration::from_secs(1), &never)
+            .unwrap();
+        assert_eq!(t.position(AxisKind::Rotate).unwrap(), Some(20.0));
+        // a link that does not come back
+        rig.inject_link_drop(0, false);
+        assert!(!link());
+        assert_eq!(
+            t.reconnect(Duration::from_secs(1), &never)
+                .unwrap_err()
+                .code(),
+            "ble-not-found"
+        );
+        assert!(!link());
     }
 }
