@@ -357,6 +357,22 @@ impl ScanController {
         self.rig.calibration.clone()
     }
 
+    /// A rig job (`scan.auto`, `turntable.calibrate`) ended and is not
+    /// finalised yet: until then the acquisition still runs held, as the
+    /// job left it. Every command finalises it first; a host that only
+    /// reads the controller calls [`ScanController::finish_rig_job`].
+    pub fn rig_job_ended(&self) -> bool {
+        self.rig.job.as_ref().is_some_and(|(_, j)| j.finished())
+    }
+
+    /// Finalises a rig job that ended, as any command does first: after a
+    /// calibration the acquisition is reset and the new calibration
+    /// applied, after `scan.auto` the acquisition goes on paused. Nothing
+    /// happens while the job runs.
+    pub fn finish_rig_job(&mut self) {
+        self.reap_rig(false);
+    }
+
     /// Finalises a finished job: after a calibration the acquisition is
     /// reset and the new calibration applied; after `scan.auto` the
     /// acquisition goes on paused. With `cancel`, a running job is
