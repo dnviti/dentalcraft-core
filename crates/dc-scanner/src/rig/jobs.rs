@@ -200,6 +200,20 @@ impl Ctx {
         }
     }
 
+    /// Waits until the table stands still on every axis: a manual move or
+    /// a homing may still be under way when a job starts (starting the
+    /// controller's job stops only the watch of that motion), and a stop
+    /// taken while the table turns ruins the registration of its pair.
+    fn wait_still(&self) -> Result<()> {
+        let mut t = lock(&self.table);
+        for axis in t.axes() {
+            t.wait_settled(axis.kind, rotation_timeout(360.0, None), &|| {
+                self.cancelled()
+            })?;
+        }
+        Ok(())
+    }
+
     /// Starts the next step; `tilt` updates the tilt of the pass.
     fn step(&self, tilt: Option<f32>) {
         let mut s = self.job.lock();
@@ -309,8 +323,9 @@ fn rotation_timeout(deg: f32, deg_per_s: Option<f32>) -> Duration {
     Duration::from_secs_f32(deg.abs() / speed.max(0.1) + 30.0)
 }
 
-/// Starts `body` on a job thread. Whatever happens the frames end up held
-/// out of the model; on an error or a cancel the table is stopped.
+/// Starts `body` on a job thread, once the table stands still. Whatever
+/// happens the frames end up held out of the model; on an error or a
+/// cancel the table is stopped.
 fn spawn(
     kind: RigJobKind,
     steps: u32,
@@ -327,7 +342,7 @@ fn spawn(
     let handle = std::thread::Builder::new()
         .name(format!("dc-rig-{kind:?}").to_lowercase())
         .spawn(move || {
-            let r = body(&ctx);
+            let r = ctx.wait_still().and_then(|()| body(&ctx));
             ctx.link.set_hold(true);
             let mut s = ctx.job.lock();
             match r {
