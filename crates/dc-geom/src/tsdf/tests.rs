@@ -208,6 +208,112 @@ fn intrinsics_project_and_downscale() {
     assert!((half.cx - 159.5).abs() < 1e-4);
 }
 
+#[test]
+fn deintegration_takes_a_weighted_view_back_out() {
+    let cam = intr(96, 72, 110.0);
+    let c = Vec3::new(0.0, 0.0, 60.0);
+    let r = 12.0;
+    let params = TsdfParams {
+        voxel_mm: 0.4,
+        trunc_mm: 1.6,
+        max_weight: 1e6,
+    };
+    let poses: Vec<Affine3A> = [-25.0f32, 0.0, 25.0]
+        .iter()
+        .map(|&a| {
+            let a = a.to_radians();
+            look_at(c + Vec3::new(a.sin(), 0.0, -a.cos()) * 60.0, c, Vec3::NEG_Y)
+        })
+        .collect();
+    let views: Vec<(Vec<f32>, Vec<f32>)> = poses
+        .iter()
+        .map(|p| {
+            let d = sphere_depth(&cam, p, c, r);
+            let w = depth_weights(&d, &cam, &DepthWeightParams::default());
+            (d, w)
+        })
+        .collect();
+    let mut two = TsdfVolume::new(params);
+    let mut three = TsdfVolume::new(params);
+    for (k, ((d, w), pose)) in views.iter().zip(&poses).enumerate() {
+        if k != 1 {
+            two.integrate_weighted(d, w, &cam, pose);
+        }
+        three.integrate_weighted(d, w, &cam, pose);
+    }
+    three.deintegrate_weighted(&views[1].0, &views[1].1, &cam, &poses[1]);
+    // the same field wherever the two-view volume observed something
+    let mut compared = 0;
+    for (key, &i) in &two.map {
+        let a = &two.blocks[i];
+        let b = &three.blocks[three.map[key]];
+        for j in 0..VOXELS {
+            if a.weight[j] > 0.0 {
+                compared += 1;
+                assert!((a.weight[j] - b.weight[j]).abs() < 1e-3 * a.weight[j].max(1.0));
+                assert!(
+                    (a.tsdf[j] - b.tsdf[j]).abs() < 1e-3,
+                    "{} {}",
+                    a.tsdf[j],
+                    b.tsdf[j]
+                );
+            } else {
+                assert!(b.weight[j] < 1e-3, "{}", b.weight[j]);
+            }
+        }
+    }
+    assert!(compared > 1000);
+    // the weighted reconstruction is as exact as the plain one
+    let mesh = three.extract_mesh_with(0.5);
+    assert!(mesh.face_count() > 500);
+    for p in &mesh.positions {
+        assert!(((*p - c).length() - r).abs() < 0.4, "{p}");
+    }
+}
+
+#[test]
+fn depth_weights_erode_edges_and_grazing_views() {
+    let cam = intr(96, 72, 110.0);
+    let c = Vec3::new(0.0, 0.0, 60.0);
+    let pose = look_at(Vec3::ZERO, c, Vec3::NEG_Y);
+    let depth = sphere_depth(&cam, &pose, c, 12.0);
+    let w = depth_weights(&depth, &cam, &DepthWeightParams::default());
+    let (cu, cv) = (48usize, 36usize);
+    // facing the camera at the centre, at the 200 mm reference scaled
+    let centre = w[cv * 96 + cu];
+    let expected = (200.0f32 / depth[cv * 96 + cu]).powi(2);
+    assert!(
+        (centre - expected).abs() < 0.02 * expected,
+        "{centre} {expected}"
+    );
+    // the silhouette and its first two rings are dropped, the limb is
+    // weighted down
+    for v in 0..72usize {
+        for u in 0..96usize {
+            let i = v * 96 + u;
+            let near_edge = (0..=2i64).any(|k| {
+                [(k, 0i64), (-k, 0), (0, k), (0, -k)]
+                    .iter()
+                    .any(|&(du, dv)| {
+                        let (x, y) = (u as i64 + du, v as i64 + dv);
+                        x < 0 || y < 0 || x >= 96 || y >= 72 || depth[(y * 96 + x) as usize] <= 0.0
+                    })
+            });
+            if near_edge {
+                assert_eq!(w[i], 0.0, "pixel {u} {v}");
+            }
+            assert!(w[i] <= centre * 1.001);
+        }
+    }
+    assert!(w.iter().filter(|x| **x > 0.0).count() > 500);
+    // wrong size: all zero
+    assert!(
+        depth_weights(&depth[1..], &cam, &DepthWeightParams::default())
+            .iter()
+            .all(|x| *x == 0.0)
+    );
+}
+
 /// Release-mode performance check (run with `cargo test --release -p dc-geom
 /// -- --ignored tsdf_integrate_speed --nocapture`).
 #[test]

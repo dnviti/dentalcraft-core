@@ -9,12 +9,17 @@
 //! `g * voxel_mm`.
 //!
 //! * [`TsdfVolume::integrate`] fuses one depth image (millimetres, pinhole
-//!   camera looking along +Z) taken from a known pose.
+//!   camera looking along +Z) taken from a known pose;
+//!   [`TsdfVolume::integrate_weighted`] does the same with a confidence per
+//!   pixel ([`depth_weights`]: depth edges eroded, grazing views and far
+//!   samples weighted down), and [`TsdfVolume::deintegrate_weighted`] takes
+//!   such a frame back out (leave-one-out registration of multi-view scans).
 //! * [`TsdfVolume::raycast`] renders the fused surface from a pose (points
 //!   and normals per pixel), the model side of frame-to-model ICP tracking.
 //! * [`TsdfVolume::extract_cloud`] and [`TsdfVolume::extract_mesh`] export
 //!   the zero crossing as an oriented point cloud or an open triangle mesh
-//!   (marching cubes over observed voxels only, shared with the cloud mesher).
+//!   (marching cubes over observed voxels only, shared with the cloud mesher;
+//!   [`TsdfVolume::extract_mesh_with`] ignores voxels observed too little).
 
 use glam::{Affine3A, IVec3, Vec3};
 use rayon::prelude::*;
@@ -196,18 +201,66 @@ impl TsdfVolume {
     }
 
     /// Fuses one depth image (`depth_mm` row-major, `width * height`
-    /// entries, `0` or NaN = no measurement) seen from `cam_to_world`.
-    /// A frame whose size does not match `intr` is ignored.
+    /// entries, `0` or NaN = no measurement) seen from `cam_to_world`, every
+    /// pixel with weight 1. A frame whose size does not match `intr` is
+    /// ignored.
     pub fn integrate(
         &mut self,
         depth_mm: &[f32],
         intr: &CameraIntrinsics,
         cam_to_world: &Affine3A,
     ) {
+        self.update(depth_mm, None, intr, cam_to_world, false);
+    }
+
+    /// [`TsdfVolume::integrate`] with a confidence per pixel (`weights`,
+    /// one per pixel, e.g. from [`depth_weights`]): a pixel adds its weight
+    /// to the voxels it observes, a pixel of weight 0 is ignored. Weights of
+    /// the wrong length leave the volume unchanged.
+    pub fn integrate_weighted(
+        &mut self,
+        depth_mm: &[f32],
+        weights: &[f32],
+        intr: &CameraIntrinsics,
+        cam_to_world: &Affine3A,
+    ) {
+        if weights.len() == depth_mm.len() {
+            self.update(depth_mm, Some(weights), intr, cam_to_world, false);
+        }
+    }
+
+    /// Takes back a frame fused by [`TsdfVolume::integrate_weighted`] with
+    /// the same arguments. The volume returns to its state without that
+    /// frame (up to rounding) as long as no voxel the frame observes reached
+    /// [`TsdfParams::max_weight`]: volumes that frames are taken out of need
+    /// a cap above the total weight. Voxels left without weight become
+    /// unobserved; their blocks stay allocated.
+    pub fn deintegrate_weighted(
+        &mut self,
+        depth_mm: &[f32],
+        weights: &[f32],
+        intr: &CameraIntrinsics,
+        cam_to_world: &Affine3A,
+    ) {
+        if weights.len() == depth_mm.len() {
+            self.update(depth_mm, Some(weights), intr, cam_to_world, true);
+        }
+    }
+
+    /// Adds (or with `remove`, takes back) one frame: see
+    /// [`TsdfVolume::integrate_weighted`].
+    fn update(
+        &mut self,
+        depth_mm: &[f32],
+        weights: Option<&[f32]>,
+        intr: &CameraIntrinsics,
+        cam_to_world: &Affine3A,
+        remove: bool,
+    ) {
         if depth_mm.len() != intr.pixel_count() || depth_mm.is_empty() {
             return;
         }
-        let touched = self.allocate(depth_mm, intr, cam_to_world);
+        let touched = self.touch(depth_mm, weights, intr, cam_to_world, !remove);
         if touched.is_empty() {
             return;
         }
@@ -244,8 +297,14 @@ impl TsdfVolume {
                             if u < 0 || v < 0 || u >= w || v >= h {
                                 continue;
                             }
-                            let d = depth_mm[(v * w + u) as usize];
+                            let pix = (v * w + u) as usize;
+                            let d = depth_mm[pix];
                             if !valid(d) {
+                                continue;
+                            }
+                            let wp = weights.map_or(1.0, |ws| ws[pix]);
+                            // weight 0 or NaN: not used
+                            if wp.is_nan() || wp <= 0.0 {
                                 continue;
                             }
                             let sdf = d - cur.z;
@@ -255,28 +314,46 @@ impl TsdfVolume {
                             let t = (sdf * inv_trunc).min(1.0);
                             let i = row + x;
                             let wo = block.weight[i];
-                            block.tsdf[i] = (block.tsdf[i] * wo + t) / (wo + 1.0);
-                            block.weight[i] = (wo + 1.0).min(p.max_weight);
+                            if remove {
+                                let wn = wo - wp;
+                                if wn <= 1e-4 * wp {
+                                    block.tsdf[i] = 1.0;
+                                    block.weight[i] = 0.0;
+                                } else {
+                                    block.tsdf[i] =
+                                        ((block.tsdf[i] * wo - t * wp) / wn).clamp(-1.0, 1.0);
+                                    block.weight[i] = wn;
+                                }
+                            } else {
+                                let wn = wo + wp;
+                                block.tsdf[i] = (block.tsdf[i] * wo + t * wp) / wn;
+                                block.weight[i] = wn.min(p.max_weight);
+                            }
                         }
                     }
                 }
             });
     }
 
-    /// Allocates the blocks around the measured surface of a frame; returns
-    /// the indices of the blocks the frame touches.
-    fn allocate(
+    /// The blocks around the measured surface of a frame (pixels of weight
+    /// above 0 when `weights` are given), allocated when `create`; returns
+    /// the indices of the (existing) blocks the frame touches.
+    fn touch(
         &mut self,
         depth_mm: &[f32],
+        weights: Option<&[f32]>,
         intr: &CameraIntrinsics,
         cam_to_world: &Affine3A,
+        create: bool,
     ) -> Vec<usize> {
         let p = self.params;
         let block_mm = p.voxel_mm * SIDE as f32;
-        let zmin = depth_mm
-            .par_iter()
-            .copied()
-            .filter(|&d| valid(d))
+        let used = |i: usize| valid(depth_mm[i]) && weights.is_none_or(|ws| ws[i] > 0.0);
+        let zmin = (0..depth_mm.len())
+            .into_par_iter()
+            .with_min_len(4096)
+            .filter(|&i| used(i))
+            .map(|i| depth_mm[i])
             .reduce(|| f32::INFINITY, f32::min);
         if !zmin.is_finite() {
             return Vec::new();
@@ -295,10 +372,10 @@ impl TsdfVolume {
             .flat_map_iter(|v| {
                 let mut out = Vec::new();
                 for u in (0..w).step_by(stride) {
-                    let d = depth_mm[v * w + u];
-                    if !valid(d) {
+                    if !used(v * w + u) {
                         continue;
                     }
+                    let d = depth_mm[v * w + u];
                     let ray = intr.ray(u as f32, v as f32);
                     for s in 0..=samples {
                         let z = d - p.trunc_mm + 2.0 * p.trunc_mm * s as f32 / samples as f32;
@@ -322,6 +399,10 @@ impl TsdfVolume {
         let mut touched = Vec::with_capacity(keys.len());
         for k in keys {
             let key = mc::unpack(k);
+            if !create {
+                touched.extend(self.map.get(&key).copied());
+                continue;
+            }
             let next = self.blocks.len();
             let i = *self.map.entry(key).or_insert(next);
             if i == next {
@@ -569,17 +650,26 @@ impl TsdfVolume {
     /// observed voxels only), with vertex normals; faces are
     /// counter-clockwise seen from outside (from the cameras).
     pub fn extract_mesh(&self) -> TriMesh {
+        self.extract_mesh_with(0.0)
+    }
+
+    /// [`TsdfVolume::extract_mesh`] where only the voxels with an integration
+    /// weight of at least `min_weight` (and above 0) count as observed: the
+    /// surface stops where it was seen too little.
+    pub fn extract_mesh_with(&self, min_weight: f32) -> TriMesh {
         let keys = self.sorted_keys();
         let mut map = BlockMap::default();
         map.reserve(keys.len());
+        for (i, k) in keys.iter().enumerate() {
+            map.insert(*k, i);
+        }
         let values: Vec<[f32; VOXELS]> = keys
-            .iter()
-            .enumerate()
-            .map(|(i, k)| {
-                map.insert(*k, i);
+            .par_iter()
+            .map(|k| {
                 let b = &self.blocks[self.map[k]];
                 std::array::from_fn(|j| {
-                    if b.weight[j] > 0.0 {
+                    let w = b.weight[j];
+                    if w > 0.0 && w >= min_weight {
                         b.tsdf[j]
                     } else {
                         f32::NAN
@@ -639,6 +729,146 @@ pub fn backproject(
         }
     }
     (points, pixels)
+}
+
+/// How [`depth_weights`] rates the pixels of a depth image.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DepthWeightParams {
+    /// Pixels within this many pixels (city-block) of a depth edge get
+    /// weight 0: the mixed and flying pixels along silhouettes and holes.
+    pub erode_px: u32,
+    /// Past the eroded band the weight grows linearly to full over this
+    /// many pixels.
+    pub ramp_px: u32,
+    /// Largest depth step to a 4-neighbour, in pixel footprints
+    /// (`depth / fx`), that is not a depth edge.
+    pub max_slope: f32,
+    /// Pixels whose surface turns more than this from the viewing ray
+    /// (degrees) get weight 0; the others are weighted by the cosine.
+    pub max_incidence_deg: f32,
+    /// Depth of weight 1 (mm): the weight falls with the square of the
+    /// depth, like the precision of the depth.
+    pub reference_depth_mm: f32,
+}
+
+impl Default for DepthWeightParams {
+    fn default() -> Self {
+        Self {
+            erode_px: 2,
+            ramp_px: 3,
+            max_slope: 4.0,
+            max_incidence_deg: 75.0,
+            reference_depth_mm: 200.0,
+        }
+    }
+}
+
+/// Confidence of every pixel of a depth image (row-major, `0` or NaN
+/// invalid) for [`TsdfVolume::integrate_weighted`]: `0` within
+/// [`DepthWeightParams::erode_px`] of a depth edge (an invalid pixel, the
+/// image border, or a jump to a neighbour), then a ramp to full weight,
+/// times the cosine of the angle between the surface (normal from the
+/// pixels two away) and the viewing ray, times `(reference / depth)²`. A
+/// size mismatch gives all zeros.
+pub fn depth_weights(
+    depth_mm: &[f32],
+    intr: &CameraIntrinsics,
+    params: &DepthWeightParams,
+) -> Vec<f32> {
+    let (w, h) = (intr.width as usize, intr.height as usize);
+    let n = w * h;
+    if depth_mm.len() != n || w < 3 || h < 3 {
+        return vec![0.0; depth_mm.len()];
+    }
+    let edge: Vec<bool> = (0..n)
+        .into_par_iter()
+        .with_min_len(4096)
+        .map(|i| {
+            let d = depth_mm[i];
+            let (u, v) = (i % w, i / w);
+            if !valid(d) || u == 0 || v == 0 || u + 1 == w || v + 1 == h {
+                return true;
+            }
+            let tol = params.max_slope * d / intr.fx;
+            [i - 1, i + 1, i - w, i + w].iter().any(|&j| {
+                let dn = depth_mm[j];
+                !valid(dn) || (dn - d).abs() > tol
+            })
+        })
+        .collect();
+    // city-block distance to the nearest edge pixel (two passes)
+    let mut dist: Vec<u32> = edge
+        .iter()
+        .map(|&e| if e { 0 } else { u32::MAX / 2 })
+        .collect();
+    for v in 0..h {
+        for u in 0..w {
+            let i = v * w + u;
+            let mut d = dist[i];
+            if u > 0 {
+                d = d.min(dist[i - 1] + 1);
+            }
+            if v > 0 {
+                d = d.min(dist[i - w] + 1);
+            }
+            dist[i] = d;
+        }
+    }
+    for v in (0..h).rev() {
+        for u in (0..w).rev() {
+            let i = v * w + u;
+            let mut d = dist[i];
+            if u + 1 < w {
+                d = d.min(dist[i + 1] + 1);
+            }
+            if v + 1 < h {
+                d = d.min(dist[i + w] + 1);
+            }
+            dist[i] = d;
+        }
+    }
+    let cos_min = params.max_incidence_deg.to_radians().cos();
+    let r = 2usize;
+    (0..n)
+        .into_par_iter()
+        .with_min_len(4096)
+        .map(|i| {
+            let e = dist[i];
+            if e <= params.erode_px {
+                return 0.0;
+            }
+            let ramp = if params.ramp_px == 0 {
+                1.0
+            } else {
+                ((e - params.erode_px) as f32 / params.ramp_px as f32).min(1.0)
+            };
+            let (u, v) = (i % w, i / w);
+            if u < r || v < r || u + r >= w || v + r >= h {
+                return 0.0;
+            }
+            let at = |uu: usize, vv: usize| {
+                let dn = depth_mm[vv * w + uu];
+                valid(dn).then(|| intr.ray(uu as f32, vv as f32) * dn)
+            };
+            let (Some(left), Some(right), Some(up), Some(down)) =
+                (at(u - r, v), at(u + r, v), at(u, v - r), at(u, v + r))
+            else {
+                return 0.0;
+            };
+            let normal = (down - up).cross(right - left);
+            let ray = intr.ray(u as f32, v as f32);
+            let len = normal.length() * ray.length();
+            if len.is_nan() || len <= 0.0 {
+                return 0.0;
+            }
+            let cos = normal.dot(ray).abs() / len;
+            if cos < cos_min {
+                return 0.0;
+            }
+            let depth = (params.reference_depth_mm / depth_mm[i]).powi(2);
+            ramp * cos * depth
+        })
+        .collect()
 }
 
 #[cfg(test)]

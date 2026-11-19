@@ -17,6 +17,7 @@
 pub mod bvh;
 pub mod cloud;
 pub mod cotan;
+pub mod finish;
 pub mod holefill;
 pub mod icp;
 pub mod knn;
