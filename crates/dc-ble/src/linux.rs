@@ -27,7 +27,7 @@ use zbus::proxy;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{DBusError, MatchRule};
 
-use crate::{BleDeviceInfo, BleError, BleLink, SerialProfile, chunks};
+use crate::{BleDeviceInfo, BleError, BleLink, LinkState, SerialProfile, chunks};
 
 const BLUEZ: &str = "org.bluez";
 const ADAPTER_IFACE: &str = "org.bluez.Adapter1";
@@ -452,12 +452,15 @@ enum Event {
 /// Start the thread that converts BlueZ signals into [`Event`]s. The match
 /// rule covers the whole device subtree (characteristics and the device
 /// itself) and deliberately has no `sender`: only BlueZ publishes there.
+/// A lost link is also marked on `state` at once, so observers see it
+/// before the next read.
 fn spawn_reader(
     conn: &Connection,
     device: &OwnedObjectPath,
     notify_path: OwnedObjectPath,
     tx: mpsc::Sender<Event>,
     stop: Arc<AtomicBool>,
+    state: LinkState,
 ) -> Result<(), BleError> {
     let rule = MatchRule::builder()
         .msg_type(MessageType::Signal)
@@ -470,11 +473,16 @@ fn spawn_reader(
     let device = device.clone();
     thread::Builder::new()
         .name("dc-ble-notify".into())
-        .spawn(move || reader_loop(iter, &device, &notify_path, &tx, &stop))
+        .spawn(move || {
+            reader_loop(iter, &device, &notify_path, &tx, &stop);
+            state.mark_lost();
+            let _ = tx.send(Event::Lost);
+        })
         .map(|_| ())
         .map_err(|e| BleError::Platform(format!("cannot start the BLE reader thread: {e}")))
 }
 
+/// Forwards the notifications until the link is lost or stopped.
 fn reader_loop(
     iter: MessageIterator,
     device: &OwnedObjectPath,
@@ -487,7 +495,6 @@ fn reader_loop(
             return;
         }
         let Ok(msg) = msg else {
-            let _ = tx.send(Event::Lost);
             return;
         };
         let header = msg.header();
@@ -511,12 +518,10 @@ fn reader_loop(
             && path.as_str() == device.as_str()
             && prop_bool(&changed, "Connected") == Some(false)
         {
-            let _ = tx.send(Event::Lost);
             return;
         }
     }
     // The connection closed under us.
-    let _ = tx.send(Event::Lost);
 }
 
 struct BluezLink {
@@ -529,6 +534,7 @@ struct BluezLink {
     max_chunk: usize,
     rx: mpsc::Receiver<Event>,
     stop: Arc<AtomicBool>,
+    state: LinkState,
     lost: bool,
     closed: bool,
 }
@@ -544,6 +550,7 @@ impl BleLink for BluezLink {
                 let e = map_link_err(e);
                 if matches!(e, BleError::Disconnected) {
                     self.lost = true;
+                    self.state.mark_lost();
                 }
                 return Err(e);
             }
@@ -559,6 +566,7 @@ impl BleLink for BluezLink {
             Ok(Event::Data(bytes)) => Ok(Some(bytes)),
             Ok(Event::Lost) | Err(RecvTimeoutError::Disconnected) => {
                 self.lost = true;
+                self.state.mark_lost();
                 Err(BleError::Disconnected)
             }
             Err(RecvTimeoutError::Timeout) => Ok(None),
@@ -570,11 +578,16 @@ impl BleLink for BluezLink {
             return;
         }
         self.closed = true;
+        self.state.mark_lost();
         self.stop.store(true, Ordering::Release);
         let _ = self.notify_char.stop_notify();
         // Disconnecting also emits a `Connected=false` signal that wakes the
         // reader thread so that it sees the stop flag and exits.
         let _ = self.device.disconnect();
+    }
+
+    fn state(&self) -> LinkState {
+        self.state.clone()
     }
 }
 
@@ -617,7 +630,15 @@ fn open_link(
     // notification is lost.
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
-    spawn_reader(conn, device_path, target.notify_path, tx, stop.clone())?;
+    let state = LinkState::new();
+    spawn_reader(
+        conn,
+        device_path,
+        target.notify_path,
+        tx,
+        stop.clone(),
+        state.clone(),
+    )?;
     match notify_char.start_notify() {
         Ok(()) => {}
         // Already notifying (stale session): usable as is.
@@ -636,6 +657,7 @@ fn open_link(
         max_chunk: profile.max_chunk,
         rx,
         stop,
+        state,
         lost: false,
         closed: false,
     })

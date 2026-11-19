@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use dc_ble::{BleError, BleLink};
+use dc_ble::{BleError, BleLink, LinkState};
 
 use super::*;
 
@@ -91,12 +91,24 @@ impl Table {
     }
 }
 
-struct FakeLink(Arc<Mutex<Table>>);
+struct FakeLink {
+    table: Arc<Mutex<Table>>,
+    state: LinkState,
+}
+
+impl FakeLink {
+    fn boxed(table: &Arc<Mutex<Table>>) -> Box<Self> {
+        Box::new(Self {
+            table: Arc::clone(table),
+            state: LinkState::new(),
+        })
+    }
+}
 
 impl BleLink for FakeLink {
     fn write(&mut self, data: &[u8]) -> std::result::Result<(), BleError> {
-        let mut t = self.0.lock().unwrap();
-        if t.closed {
+        let mut t = self.table.lock().unwrap();
+        if t.closed || !self.state.is_connected() {
             return Err(BleError::Disconnected);
         }
         t.inbox.extend_from_slice(data);
@@ -109,15 +121,23 @@ impl BleLink for FakeLink {
     }
 
     fn recv(&mut self, timeout: Duration) -> std::result::Result<Option<Vec<u8>>, BleError> {
-        if let Some(m) = self.0.lock().unwrap().outbox.pop_front() {
+        if !self.state.is_connected() {
+            return Err(BleError::Disconnected);
+        }
+        if let Some(m) = self.table.lock().unwrap().outbox.pop_front() {
             return Ok(Some(m));
         }
         std::thread::sleep(timeout.min(Duration::from_millis(1)));
-        Ok(self.0.lock().unwrap().outbox.pop_front())
+        Ok(self.table.lock().unwrap().outbox.pop_front())
     }
 
     fn close(&mut self) {
-        self.0.lock().unwrap().closed = true;
+        self.state.mark_lost();
+        self.table.lock().unwrap().closed = true;
+    }
+
+    fn state(&self) -> LinkState {
+        self.state.clone()
     }
 }
 
@@ -141,7 +161,7 @@ fn info() -> TurntableInfo {
 
 fn open(table: Table) -> (RevopointTurntable, Arc<Mutex<Table>>) {
     let shared = Arc::new(Mutex::new(table));
-    let link = Box::new(FakeLink(Arc::clone(&shared)));
+    let link = FakeLink::boxed(&shared);
     (
         RevopointTurntable::new(link, info(), timing()).unwrap(),
         shared,
@@ -275,7 +295,7 @@ fn connect_reads_limits_and_angle_and_refuses_a_silent_device() {
         silent: true,
         ..Table::default()
     }));
-    let err = RevopointTurntable::new(Box::new(FakeLink(silent)), info(), timing()).unwrap_err();
+    let err = RevopointTurntable::new(FakeLink::boxed(&silent), info(), timing()).unwrap_err();
     assert_eq!(err.code(), "turntable-protocol");
 }
 
@@ -499,4 +519,93 @@ fn home_follows_the_table_whichever_way_it_turns() {
         .unwrap();
     assert_eq!(table.lock().unwrap().angle, 0.0);
     assert_eq!(t.position(AxisKind::Rotate).unwrap(), Some(0.0));
+}
+
+/// A connector that opens a new fake link to `table`, after `failures`
+/// failed attempts; counts the attempts.
+fn connector(table: &Arc<Mutex<Table>>, failures: u32) -> (Connector, Arc<Mutex<u32>>) {
+    let attempts = Arc::new(Mutex::new(0));
+    let (table, counted) = (Arc::clone(table), Arc::clone(&attempts));
+    let connect: Connector = Box::new(move |_timeout| {
+        let mut n = counted.lock().unwrap();
+        *n += 1;
+        if *n <= failures {
+            return Err(BleError::NotFound);
+        }
+        table.lock().unwrap().closed = false;
+        Ok(FakeLink::boxed(&table) as Box<dyn BleLink>)
+    });
+    (connect, attempts)
+}
+
+#[test]
+fn a_reconnection_keeps_the_angle_continuous_and_the_speeds() {
+    let table = Arc::new(Mutex::new(Table {
+        step: 30.0,
+        notify_completion: true,
+        ..Table::default()
+    }));
+    let first = FakeLink::boxed(&table);
+    let radio = first.state();
+    let (connect, attempts) = connector(&table, 1);
+    let mut t = RevopointTurntable::new(first, info(), timing())
+        .unwrap()
+        .with_connector(connect);
+    let link = t.link().unwrap();
+    t.set_speed(AxisKind::Rotate, 20.0).unwrap();
+    t.set_speed(AxisKind::Tilt, 6.7).unwrap();
+    // almost two turns: the table reads -20
+    assert_eq!(turn(&mut t, 700.0), 700.0);
+    // the radio drops during a move: the state shows it before any read
+    t.move_by(AxisKind::Rotate, 20.0).unwrap();
+    assert!(link());
+    radio.mark_lost();
+    assert!(!link());
+    assert_eq!(
+        t.position(AxisKind::Rotate).unwrap_err().code(),
+        "ble-disconnected"
+    );
+    let before = sent(&table).len();
+    t.reconnect(Duration::from_secs(10), &never).unwrap();
+    assert!(link());
+    assert_eq!(*attempts.lock().unwrap(), 2, "one failed attempt, then up");
+    let resent = sent(&table)[before..].to_vec();
+    for speed in ["+CT,TURNSPEED=18;", "+CR,TILTSPEED=60;"] {
+        assert!(resent.iter().any(|s| s == speed), "{resent:?}");
+    }
+    // the move finished meanwhile: 720, the reading 0.0 on the same turn,
+    // not mapped back to 0
+    t.wait_settled(AxisKind::Rotate, Duration::from_secs(5), &never)
+        .unwrap();
+    assert_eq!(t.position(AxisKind::Rotate).unwrap(), Some(720.0));
+    assert_eq!(t.probe().unwrap()().rotate_deg, Some(720.0));
+    assert_eq!(turn(&mut t, 10.0), 730.0);
+    assert_eq!(table.lock().unwrap().angle, 730.0);
+}
+
+#[test]
+fn a_reconnection_gives_up_at_its_deadline_or_on_cancel() {
+    let table = Arc::new(Mutex::new(Table::default()));
+    let (connect, attempts) = connector(&table, u32::MAX);
+    let mut t = RevopointTurntable::new(FakeLink::boxed(&table), info(), timing())
+        .unwrap()
+        .with_connector(connect);
+    let link = t.link().unwrap();
+    let start = Instant::now();
+    let err = t.reconnect(Duration::from_secs(4), &never).unwrap_err();
+    assert_eq!(err.code(), "ble-not-found");
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(*attempts.lock().unwrap() >= 2);
+    assert!(!link(), "the old link was closed");
+    let err = t.reconnect(Duration::from_secs(30), &|| true).unwrap_err();
+    assert_eq!(err.code(), "cancelled");
+    // a table opened without a connector cannot reconnect
+    let (mut plain, _) = open(Table::default());
+    assert_eq!(
+        plain
+            .reconnect(Duration::from_secs(1), &never)
+            .unwrap_err()
+            .code(),
+        "turntable-not-connected"
+    );
 }

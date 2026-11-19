@@ -52,16 +52,24 @@
 //! ([`tilt_speed_value`], [`tilt_speed_deg_per_s`]). Both only feed the
 //! motion estimate and the timeouts; rotation completion never relies on
 //! them.
+//!
+//! Reconnection: the table runs on mains and keeps its zero while the
+//! Bluetooth link is down, so [`Turntable::reconnect`] opens a new link
+//! (the backend rediscovers the device, see [`dc_ble::connect_serial`])
+//! and reads the angle again around the motion estimate, which went on
+//! meanwhile: the angle stays continuous (the mapping into (−180, 180] is
+//! only done at the first connection). The speeds set before are sent
+//! again.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use dc_ble::{BleLink, SerialProfile};
+use dc_ble::{BleError, BleLink, LinkState, SerialProfile};
 
 use crate::{
-    AngleProbe, Angles, AxisInfo, AxisKind, Feedback, Result, Turntable, TurntableBackend,
-    TurntableError, TurntableInfo,
+    AngleProbe, Angles, AxisInfo, AxisKind, Feedback, LinkProbe, Result, Turntable,
+    TurntableBackend, TurntableError, TurntableInfo,
 };
 
 /// Id of the backend.
@@ -85,6 +93,16 @@ const ARRIVED_DEG: f32 = 0.5;
 /// After the expected end of a rotation, two equal readings end the wait
 /// even far from the target (a stall, a different firmware).
 const OVERDUE: Duration = Duration::from_secs(2);
+/// Pause between two reconnection attempts.
+const RECONNECT_PAUSE: Duration = Duration::from_secs(1);
+/// A reconnection attempt gets at least this long.
+const MIN_CONNECT_ATTEMPT: Duration = Duration::from_secs(2);
+
+/// Opens a new link to the table within a timeout, for
+/// [`Turntable::reconnect`] (the backend's: [`dc_ble::connect_serial`] to
+/// the address of the table).
+pub type Connector =
+    Box<dyn FnMut(Duration) -> std::result::Result<Box<dyn BleLink>, BleError> + Send>;
 
 /// The GATT layout of the table: HM-10 serial service `FFE0`, one
 /// characteristic `FFE1` for write and notify, 20-byte writes.
@@ -394,6 +412,13 @@ pub struct RevopointTurntable {
     completed: Option<(Instant, f32)>,
     /// When the latest rotation was acknowledged.
     rotate_sent: Option<Instant>,
+    /// Opens the link again; `None`: [`Turntable::reconnect`] cannot.
+    connector: Option<Connector>,
+    /// State of the current link, shared with [`Turntable::link`].
+    link_state: Arc<Mutex<LinkState>>,
+    /// The speed values set, sent again after a reconnection.
+    turn_speed: Option<u32>,
+    tilt_speed: Option<u32>,
 }
 
 impl std::fmt::Debug for RevopointTurntable {
@@ -418,6 +443,7 @@ impl RevopointTurntable {
             rotate: AxisModel::at_rest(0.0, DEFAULT_TURN_DEG_PER_S),
             tilt: AxisModel::at_rest(0.0, DEFAULT_TILT_DEG_PER_S),
         };
+        let state = link.state();
         let mut t = Self {
             link,
             info,
@@ -431,6 +457,10 @@ impl RevopointTurntable {
             unsolicited: VecDeque::new(),
             completed: None,
             rotate_sent: None,
+            connector: None,
+            link_state: Arc::new(Mutex::new(state)),
+            turn_speed: None,
+            tilt_speed: None,
         };
         match t.query(cmd::Q_TILT_ANGLE) {
             Ok(v) if v.len() >= 2 && v[0] < v[1] => t.tilt_limits = (v[0], v[1]),
@@ -440,6 +470,13 @@ impl RevopointTurntable {
         let angle = t.read_angle()?;
         t.model().rotate = AxisModel::at_rest(angle, DEFAULT_TURN_DEG_PER_S);
         Ok(t)
+    }
+
+    /// Lets [`Turntable::reconnect`] open the link again with `connect`.
+    #[must_use]
+    pub fn with_connector(mut self, connect: Connector) -> Self {
+        self.connector = Some(connect);
+        self
     }
 
     fn model(&self) -> MutexGuard<'_, Model> {
@@ -735,11 +772,13 @@ impl Turntable for RevopointTurntable {
             AxisKind::Rotate => {
                 let v = turn_speed_value(deg_per_s);
                 self.command(&cmd::turn_speed(v))?;
+                self.turn_speed = Some(v);
                 self.model().rotate.set_speed(360.0 / v as f32);
             }
             AxisKind::Tilt => {
                 let v = tilt_speed_value(deg_per_s);
                 self.command(&cmd::tilt_speed(v))?;
+                self.tilt_speed = Some(v);
                 self.model().tilt.set_speed(tilt_speed_deg_per_s(v));
             }
         }
@@ -864,6 +903,68 @@ impl Turntable for RevopointTurntable {
             }
         }))
     }
+
+    fn link(&self) -> Option<LinkProbe> {
+        let state = Arc::clone(&self.link_state);
+        Some(Arc::new(move || {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_connected()
+        }))
+    }
+
+    fn reconnect(&mut self, timeout: Duration, cancel: &dyn Fn() -> bool) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        if self.connector.is_none() {
+            return Err(TurntableError::NotConnected);
+        }
+        // the old link first: the table takes one central at a time
+        self.link.close();
+        let mut last = TurntableError::Ble(BleError::Disconnected);
+        let link = loop {
+            if cancel() {
+                return Err(TurntableError::Cancelled);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left < MIN_CONNECT_ATTEMPT {
+                return Err(last);
+            }
+            let Some(connect) = self.connector.as_mut() else {
+                return Err(TurntableError::NotConnected);
+            };
+            match connect(left.min(CONNECT_TIMEOUT)) {
+                Ok(link) => break link,
+                Err(e) => last = e.into(),
+            }
+            if Self::sleep_cancellable(RECONNECT_PAUSE, cancel) {
+                return Err(TurntableError::Cancelled);
+            }
+        };
+        *self.link_state.lock().unwrap_or_else(|e| e.into_inner()) = link.state();
+        self.link = link;
+        self.rx = ReplyBuffer::default();
+        self.pending.clear();
+        self.last_write = None;
+        self.completed = None;
+        self.rotate_target = None;
+        self.rotate_sent = None;
+        // the table kept its zero: the reading is unwrapped around where the
+        // estimate, which went on during the drop, expects the table
+        let angle = self.read_angle()?;
+        {
+            let mut m = self.model();
+            let settled = m.rotate.end() <= Instant::now();
+            m.rotate.anchor(angle, settled);
+        }
+        if let Some(v) = self.turn_speed {
+            self.command(&cmd::turn_speed(v))?;
+        }
+        if let Some(v) = self.tilt_speed {
+            self.command(&cmd::tilt_speed(v))?;
+        }
+        Ok(())
+    }
 }
 
 /// The backend: Revopoint Dual-axis Turntables seen over Bluetooth LE.
@@ -900,11 +1001,12 @@ impl TurntableBackend for RevopointBackend {
             id: id.to_owned(),
             name: DEVICE_NAME.to_owned(),
         };
-        Ok(Box::new(RevopointTurntable::new(
-            link,
-            info,
-            Timing::default(),
-        )?))
+        let address = id.to_owned();
+        let connect: Connector =
+            Box::new(move |timeout| dc_ble::connect_serial(&address, &profile(), timeout));
+        Ok(Box::new(
+            RevopointTurntable::new(link, info, Timing::default())?.with_connector(connect),
+        ))
     }
 }
 

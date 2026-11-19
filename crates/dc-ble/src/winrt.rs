@@ -33,7 +33,7 @@ use windows::Foundation::TypedEventHandler;
 use windows::Storage::Streams::{DataReader, DataWriter};
 use windows::core::{GUID, IInspectable, Ref};
 
-use crate::{BleDeviceInfo, BleError, BleLink, SerialProfile, chunks};
+use crate::{BleDeviceInfo, BleError, BleLink, LinkState, SerialProfile, chunks};
 
 /// HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_AVAILABLE): the radio is off.
 const E_RADIO_UNAVAILABLE: i32 = 0x8007_10DFu32 as i32;
@@ -255,6 +255,7 @@ struct WinLink {
     write_option: GattWriteOption,
     max_chunk: usize,
     rx: mpsc::Receiver<Event>,
+    state: LinkState,
     lost: bool,
     closed: bool,
 }
@@ -276,6 +277,7 @@ impl BleLink for WinLink {
             if let Err(e) = map_status(status, "write") {
                 if matches!(e, BleError::Disconnected) {
                     self.lost = true;
+                    self.state.mark_lost();
                 }
                 return Err(e);
             }
@@ -291,6 +293,7 @@ impl BleLink for WinLink {
             Ok(Event::Data(bytes)) => Ok(Some(bytes)),
             Ok(Event::Lost) | Err(RecvTimeoutError::Disconnected) => {
                 self.lost = true;
+                self.state.mark_lost();
                 Err(BleError::Disconnected)
             }
             Err(RecvTimeoutError::Timeout) => Ok(None),
@@ -302,6 +305,7 @@ impl BleLink for WinLink {
             return;
         }
         self.closed = true;
+        self.state.mark_lost();
         let _ = self.notify_char.RemoveValueChanged(self.value_token);
         let _ = self.device.RemoveConnectionStatusChanged(self.status_token);
         let _ = self
@@ -316,6 +320,10 @@ impl BleLink for WinLink {
         // Releasing every reference to the device disconnects it.
         let _ = self.service.Close();
         let _ = self.device.Close();
+    }
+
+    fn state(&self) -> LinkState {
+        self.state.clone()
     }
 }
 
@@ -406,6 +414,8 @@ fn connect_blocking(
 
     let (tx, rx) = mpsc::channel();
     let value_tx = tx.clone();
+    let state = LinkState::new();
+    let status_state = state.clone();
     let value_token = notify_char
         .ValueChanged(&TypedEventHandler::<
             GattCharacteristic,
@@ -429,6 +439,7 @@ fn connect_blocking(
                 if let Some(device) = sender.as_ref()
                     && device.ConnectionStatus()? == BluetoothConnectionStatus::Disconnected
                 {
+                    status_state.mark_lost();
                     let _ = tx.send(Event::Lost);
                 }
                 Ok(())
@@ -448,6 +459,7 @@ fn connect_blocking(
         write_option,
         max_chunk: profile.max_chunk,
         rx,
+        state,
         lost: false,
         closed: false,
     };
