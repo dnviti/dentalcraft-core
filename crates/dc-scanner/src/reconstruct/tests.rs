@@ -307,3 +307,148 @@ fn bad_parameters_and_cancel() {
         "cancelled"
     );
 }
+
+/// Height of the simulated tilt axis under the platter (mm).
+const PIVOT_MM: f32 = 40.0;
+
+/// Stops every `step` degrees of one revolution at each tilt of `tilts`
+/// (the first stop, at rotation 0 and the first tilt, is the world: give
+/// tilt 0 first), with the poses of a calibrated dual-axis turntable.
+/// `slip(tilt, k)` places the object on the platter at stop `k` of the pass
+/// at `tilt` (identity: where it was at the first stop); the poses do not
+/// know about it, like the turntable poses of an object that moved.
+fn passes_scan(tilts: &[f32], step: f32, slip: &dyn Fn(f32, usize) -> Affine3A) -> KeptStops {
+    let k = intr();
+    let elev = 30f32.to_radians();
+    let cam0 = look_at(
+        Vec3::new(70.0 * elev.cos(), 0.0, 70.0 * elev.sin()),
+        Vec3::new(0.0, 0.0, 5.0),
+    );
+    let to_cam = cam0.inverse();
+    let pivot = Vec3::new(0.0, 0.0, -PIVOT_MM);
+    let calibration = RigCalibration {
+        axis_point: to_cam.transform_point3(Vec3::ZERO).into(),
+        axis_dir: to_cam.transform_vector3(Vec3::Z).into(),
+        platter_up: to_cam.transform_vector3(Vec3::Z).into(),
+        tilt_axis_point: Some(to_cam.transform_point3(pivot).into()),
+        tilt_axis_dir: Some(to_cam.transform_vector3(Vec3::X).into()),
+        scanner_serial: None,
+        turntable_id: "test".into(),
+        created: "2026-11-19T00:00:00Z".into(),
+        fit_rms_deg: 0.0,
+        fit_rms_mm: 0.0,
+        angle_gain: 1.0,
+        fit_pairs: 0,
+        imu_up: None,
+    };
+    // the platter at the angles, in the scene
+    let platter = |r: f32, t: f32| {
+        Affine3A::from_translation(pivot)
+            * Affine3A::from_rotation_x(t.to_radians())
+            * Affine3A::from_translation(-pivot)
+            * Affine3A::from_rotation_z(r.to_radians())
+    };
+    let n = (360.0 / step).round() as usize;
+    let mut stops = Vec::new();
+    for &t in tilts {
+        for i in 0..n {
+            let r = i as f32 * step;
+            // the camera seen from the object, as the turntable says ...
+            let told = platter(r, t).inverse() * cam0;
+            // ... and as it was, the object moved on the platter
+            let depth = render(&k, &(slip(t, i).inverse() * told));
+            stops.push(KeptStop {
+                pixels: Arc::new(
+                    depth
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| d.is_finite())
+                        .map(|(j, d)| (j as u32, *d))
+                        .collect(),
+                ),
+                intrinsics: k,
+                angles: (r, t),
+                pose: to_cam * told,
+                flagged: false,
+            });
+        }
+    }
+    KeptStops {
+        stops,
+        world: cam0,
+        world_angles: Some((0.0, 0.0)),
+        calibration: Some(calibration),
+        roi: Some((40.0, 30.0)),
+    }
+}
+
+fn reconstruct_at(stops: &KeptStops, refine: bool) -> Reconstruction {
+    let params = ReconstructParams {
+        resolution_mm: 0.25,
+        refine,
+        ..ReconstructParams::default()
+    };
+    reconstruct(stops, &params, &|_| {}, &|| false).unwrap()
+}
+
+#[test]
+fn a_pass_that_slipped_as_one_body_is_aligned() {
+    // the object slipped 1.2 mm and turned 1.5 degrees while the table
+    // tilted to +15: beyond the live stop limits, within a pass alignment
+    let slip = Affine3A::from_translation(Vec3::new(1.0, -0.6, 0.3))
+        * Affine3A::from_rotation_z(1.5f32.to_radians());
+    let stops = passes_scan(&[0.0, 15.0, -15.0], 30.0, &|t, _| {
+        if t > 0.0 { slip } else { Affine3A::IDENTITY }
+    });
+    let r = reconstruct_at(&stops, true);
+    let rep = &r.report;
+    let tilted = rep.pass_details.iter().find(|p| p.tilt_deg > 0.0).unwrap();
+    assert!(tilted.corrected_mm > 0.5, "{rep:?}");
+    assert_eq!(rep.passes, 3);
+    assert_eq!(rep.rejected_stops, 0, "{rep:?}");
+    assert_eq!(rep.stops, 36);
+    assert!(rep.warning.is_none());
+    let (mean, _) = error(&r.mesh);
+    assert!(mean < 0.06, "mean {mean} {rep:?}");
+}
+
+#[test]
+fn views_of_an_object_that_moved_are_left_out() {
+    // the object turned 15 degrees on the platter before the -15 pass, and
+    // 12 more degrees during the last three stops of the +15 pass
+    let big = Affine3A::from_translation(Vec3::new(2.0, 0.0, 0.0))
+        * Affine3A::from_rotation_z(15f32.to_radians());
+    let late = Affine3A::from_rotation_z((-12f32).to_radians());
+    let slip = |t: f32, k: usize| {
+        if t < 0.0 {
+            big
+        } else if t > 0.0 && k >= 9 {
+            late
+        } else {
+            Affine3A::IDENTITY
+        }
+    };
+    let stops = passes_scan(&[0.0, 15.0, -15.0], 30.0, &slip);
+    let r = reconstruct_at(&stops, true);
+    let rep = &r.report;
+    assert_eq!(rep.rejected_passes, 1, "{rep:?}");
+    assert_eq!(rep.rejected_stops, 12 + 3, "{rep:?}");
+    assert_eq!(rep.stops, 36 - 15);
+    assert_eq!(rep.warning.as_deref(), Some(WARN_VIEWS_REJECTED));
+    let moved: Vec<bool> = stops
+        .stops
+        .iter()
+        .enumerate()
+        .map(|(i, s)| slip(s.angles.1, i % 12) != Affine3A::IDENTITY)
+        .collect();
+    assert_eq!(r.rejected, moved);
+    for p in &rep.pass_details {
+        assert_eq!(p.rejected, p.tilt_deg < 0.0, "{p:?}");
+    }
+    // no double walls: the mesh lies on the scene; fused as they are, the
+    // moved views would make them
+    let (mean, _) = error(&r.mesh);
+    assert!(mean < 0.06, "mean {mean} {rep:?}");
+    let (raw_mean, _) = error(&reconstruct_at(&stops, false).mesh);
+    assert!(raw_mean > 2.0 * mean, "raw {raw_mean} gated {mean}");
+}

@@ -683,12 +683,51 @@ fn describe(mesh: &TriMesh) -> String {
     )
 }
 
+/// The stops of the passes at the tilts `DC_SCAN_TILTS` (comma separated,
+/// default all), every `DC_SCAN_KEEP_EVERY`-th stop of each pass (default
+/// 1): the subsets of an exported scan that a scan with fewer tilts or a
+/// coarser step would have taken.
+fn select_stops(mut stops: KeptStops) -> KeptStops {
+    let tilts: Option<Vec<f32>> = std::env::var("DC_SCAN_TILTS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect());
+    let every = std::env::var("DC_SCAN_KEEP_EVERY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let same = |a: f32, b: f32| (a - b).abs() < 0.05;
+    let mut seen: Vec<(f32, usize)> = Vec::new();
+    stops.stops.retain(|s| {
+        let t = s.angles.1;
+        if tilts
+            .as_ref()
+            .is_some_and(|l| !l.iter().any(|x| same(*x, t)))
+        {
+            return false;
+        }
+        let k = match seen.iter_mut().find(|(x, _)| same(*x, t)) {
+            Some((_, k)) => {
+                *k += 1;
+                *k - 1
+            }
+            None => {
+                seen.push((t, 1));
+                0
+            }
+        };
+        k % every == 0
+    });
+    stops
+}
+
 /// The fine reconstruction and the finish of `scan.auto` on real stops,
 /// against the old path (the live 0.3 mm model as a cloud, meshed at 0.3
 /// mm, islands removed, holes filled, three Taubin passes). The stops come
 /// from `DC_SCAN_STOPS` (a directory written by `scan.export` with `what:
-/// "stops"`) or from the dataset `DC_SCAN_SET` in `DC_SCAN_DATA` (default
-/// `g_calib_m125`), calibrated and fused like `scan.auto` (see
+/// "stops"`, subsets by `DC_SCAN_TILTS` and `DC_SCAN_KEEP_EVERY`, see
+/// `select_stops`) or from the dataset `DC_SCAN_SET` in `DC_SCAN_DATA`
+/// (default `g_calib_m125`), calibrated and fused like `scan.auto` (see
 /// `dataset_scan`, `DC_SCAN_EVERY`, `DC_SCAN_FRAMES`, `DC_SCAN_INTR`).
 /// `DC_SCAN_RES` (0.1), `DC_SCAN_REFINE` (1), `DC_SCAN_MINW` (1) set the
 /// reconstruction; `DC_SCAN_OUT` gets `old.ply`, `raw.ply`,
@@ -699,7 +738,7 @@ fn recorded_stops_reconstruct() {
     let (label, stops) = match std::env::var_os("DC_SCAN_STOPS") {
         Some(dir) => (
             PathBuf::from(&dir).display().to_string(),
-            read_stops(Path::new(&dir)).expect("a stops directory"),
+            select_stops(read_stops(Path::new(&dir)).expect("a stops directory")),
         ),
         None => {
             let set = std::env::var("DC_SCAN_SET").unwrap_or_else(|_| "g_calib_m125".into());
@@ -707,6 +746,7 @@ fn recorded_stops_reconstruct() {
             (set, stops)
         }
     };
+    println!("{label}: {} stops", stops.stops.len());
     let out = std::env::var_os("DC_SCAN_OUT").map(PathBuf::from);
     if let Some(out) = &out {
         std::fs::create_dir_all(out).unwrap();
@@ -752,6 +792,20 @@ fn recorded_stops_reconstruct() {
         finish_mesh(&rec.mesh, &FinishParams::default(), &|_| {}, &|| false).unwrap();
     let t_fin = t.elapsed().as_secs_f32();
     println!("RECONSTRUCTION {label}: {t_rec:.1} s {:?}", rec.report);
+    for p in &rec.report.pass_details {
+        println!("  pass {p:?}");
+    }
+    let rejected: Vec<String> = rec
+        .rejected
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| **r)
+        .map(|(i, _)| {
+            let s = &stops.stops[i];
+            format!("{i}@{:+.0}/{:.0}", s.angles.1, s.angles.0)
+        })
+        .collect();
+    println!("rejected stops: {}", rejected.join(" "));
     println!("RAW: {}", describe(&rec.mesh));
     println!("FINISH {t_fin:.1} s {report:?}");
     println!("FINISHED: {}", describe(&finished));

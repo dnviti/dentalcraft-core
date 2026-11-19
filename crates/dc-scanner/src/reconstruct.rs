@@ -8,20 +8,33 @@
 //! preview; [`reconstruct`] rebuilds the surface from the stops at the
 //! resolution of the scanner:
 //!
-//! 1. **Refinement** (optional): every stop is fused into a registration
-//!    volume ([`REG_VOXEL_MM`]) with its pixel weights, then for
-//!    [`REFINE_ROUNDS`] rounds:
-//!    * each tilt pass (the stops taken at one tilt) except the reference
-//!      one (the tilt nearest 0) is taken out of the volume and registered
-//!      as one rigid body onto the others (multi-view point-to-plane ICP):
-//!      this absorbs the open-loop tilt of the table and errors of the
-//!      calibrated tilt axis, at most [`PASS_MAX_DEG`] / [`PASS_MAX_MM`];
-//!    * each stop is taken out and registered onto the model of all the
-//!      others from its pose; the result must stay within the limits of the
-//!      live stop registration around its turntable pose (corrected by its
-//!      pass) and must fit the others better than the current pose (a
-//!      robust residual, [`crate::tracking`]): otherwise the current pose
-//!      stays, so a stop never ends worse than at its turntable pose.
+//! 1. **Refinement and consistency gate** (optional, on by default): the
+//!    stops are fused into a registration volume ([`REG_VOXEL_MM`]) with
+//!    their pixel weights, tilt pass by tilt pass, starting from the
+//!    reference pass (the tilt nearest 0) and going away from it:
+//!    * each pass is registered as one rigid body onto the passes already
+//!      in (multi-view point-to-plane ICP from a few millimetres away,
+//!      [`PASS_GATES_MM`], at most [`PASS_MAX_DEG`] / [`PASS_MAX_MM`]):
+//!      the object slipped once on the platter while it tilted;
+//!    * then every stop of the pass is checked against those passes (the
+//!      model ray cast from the stop's camera, the distance of its samples
+//!      to the model surface: [`AGREE_TOL_MM`], [`AGREE_MAX_MEDIAN_MM`]).
+//!      A stop that disagrees is registered once more on its own
+//!      ([`RESCUE_MAX_DEG`] / [`RESCUE_MAX_MM`]: a small slip within the
+//!      pass) and left out when it still disagrees; a pass of which most
+//!      stops disagree ([`PASS_MIN_AGREE`]) is left out whole. Views of an
+//!      object that moved during the scan are never fused, so they can
+//!      never make double walls; the report counts them and warns
+//!      ([`WARN_VIEWS_REJECTED`]);
+//!    * for [`REFINE_ROUNDS`] rounds, each kept stop is taken out and
+//!      registered onto the model of all the others from its pose; the
+//!      result must stay within the limits of the live stop registration
+//!      around its turntable pose (corrected by its pass) and must fit the
+//!      others better than the current pose (a robust residual,
+//!      [`crate::tracking`]): otherwise the current pose stays, so a stop
+//!      never ends worse than at its turntable pose. In the last round
+//!      every stop is checked once more against all the others and left
+//!      out when it disagrees.
 //! 2. **Fusion**: every stop is fused into a fine TSDF
 //!    ([`ReconstructParams::resolution_mm`], 0.1 mm by default) in the scan
 //!    world frame, each pixel weighted ([`depth_weights`]: depth edges
@@ -64,10 +77,55 @@ pub const REG_VOXEL_MM: f32 = 0.25;
 const REG_TRUNC_MM: f32 = 1.0;
 /// Rounds of the refinement.
 pub const REFINE_ROUNDS: usize = 2;
+/// Association gates of the stages of the alignment of a tilt pass onto
+/// the passes nearer to tilt 0 (mm): it starts from a few millimetres away.
+pub const PASS_GATES_MM: [f64; 5] = [3.0, 1.5, 0.8, 0.4, 0.25];
+/// Iterations per stage of the pass alignment, at most.
+const PASS_ITERATIONS: usize = 6;
+/// Samples per stop of the pass alignment, about.
+const PASS_SAMPLES: usize = 3000;
 /// Largest rotation of the correction of a tilt pass (degrees).
-pub const PASS_MAX_DEG: f64 = 3.0;
+pub const PASS_MAX_DEG: f64 = 5.0;
 /// Largest shift of the samples of a tilt pass by its correction (mm).
-pub const PASS_MAX_MM: f64 = 3.0;
+pub const PASS_MAX_MM: f64 = 5.0;
+/// Association gates of the two calls of the registration that brings back
+/// a stop that moved a little within its pass (mm).
+const RESCUE_GATES_MM: [[f32; 3]; 2] = [[2.0, 1.2, 0.8], [0.5, 0.35, 0.25]];
+/// Largest rotation of that registration (degrees).
+pub const RESCUE_MAX_DEG: f64 = 3.0;
+/// Largest shift of the samples by that registration (mm).
+pub const RESCUE_MAX_MM: f64 = 3.0;
+/// Agreement of a stop with the model of the others: a sample is close to
+/// the model surface within this (mm).
+pub const AGREE_TOL_MM: f64 = 0.25;
+/// A sample farther than this behind the model surface sees through it, a
+/// conflict (mm); one this far in front sees what the model lacks (the
+/// stop's own coverage) and is not judged.
+pub const AGREE_FAR_MM: f64 = 0.5;
+/// A stop agrees when at least this fraction of its judged samples is
+/// close...
+pub const AGREE_MIN_CLOSE: f64 = 0.5;
+/// ... at most this fraction sees through the model surface...
+pub const AGREE_MAX_BEHIND: f64 = 0.1;
+/// ... and their median distance to the model surface is at most this
+/// (mm). Registered views of the MINI 2 show 0.03-0.1 mm, views of an
+/// object that moved 0.3 mm and more.
+pub const AGREE_MAX_MEDIAN_MM: f64 = 0.2;
+/// A sample and the model surface at its pixel face alike within this
+/// (degrees): otherwise it is another surface, not compared.
+const AGREE_NORMAL_DEG: f32 = 45.0;
+/// The model of an agreement check is ray cast at most this many pixels
+/// wide.
+const AGREE_VIEW_WIDTH: u32 = 200;
+/// Fewest overlapping samples to judge a stop...
+const AGREE_MIN_OVERLAP: usize = 200;
+/// ... and as a fraction of its samples.
+const AGREE_MIN_OVERLAP_FRACTION: f64 = 0.1;
+/// Samples per stop of the agreement checks, about.
+const AGREE_SAMPLES: usize = 4000;
+/// A pass of which fewer than this fraction of the stops that can be
+/// judged agree with the passes nearer to tilt 0 is left out whole.
+pub const PASS_MIN_AGREE: f64 = 0.5;
 /// Without a turntable pose to refer to, the largest correction of a stop
 /// from its pose (degrees, mm).
 const FREE_MAX_STEP: (f64, f64) = (1.0, 1.0);
@@ -199,8 +257,21 @@ impl Default for ReconstructParams {
 pub struct ReconstructionReport {
     /// Voxel of the fine volume (mm).
     pub resolution_mm: f32,
-    /// Stops fused.
+    /// Stops fused (the stops with measurements but the rejected ones).
     pub stops: usize,
+    /// Stops left out of the fusion: they disagree with the consensus of
+    /// the others (the object moved on the platter, or a pose is wrong),
+    /// so they can never make double walls.
+    #[serde(default)]
+    pub rejected_stops: usize,
+    /// Whole tilt passes left out: most of their stops disagree with the
+    /// passes nearer to tilt 0.
+    #[serde(default)]
+    pub rejected_passes: usize,
+    /// Stops that disagreed after their pass was aligned and were
+    /// registered again on their own (a small slip within the pass).
+    #[serde(default)]
+    pub rescued_stops: usize,
     /// Stops whose pose the refinement changed.
     pub refined: usize,
     /// Mean RMS residual of the stops against the model of all the others
@@ -212,6 +283,13 @@ pub struct ReconstructionReport {
     pub passes: usize,
     /// Tilt passes whose rigid correction was applied.
     pub passes_corrected: usize,
+    /// Per tilt pass (refinement only), by tilt.
+    #[serde(default)]
+    pub pass_details: Vec<PassReport>,
+    /// [`WARN_VIEWS_REJECTED`] when views were left out: the mesh lacks
+    /// what only they saw (fix the object on the platter and scan again).
+    #[serde(default)]
+    pub warning: Option<String>,
     /// Vertices of the mesh.
     pub vertices: usize,
     /// Faces of the mesh.
@@ -252,6 +330,8 @@ pub struct Reconstruction {
     /// Per stop, its RMS residual against the model of the others after
     /// the refinement (mm; `NaN` when not measured).
     pub stop_rms_mm: Vec<f32>,
+    /// Per stop: left out of the fusion (it disagrees with the others).
+    pub rejected: Vec<bool>,
     /// What was done.
     pub report: ReconstructionReport,
 }
@@ -317,6 +397,7 @@ pub fn reconstruct(
     }
     let mut poses: Vec<Affine3A> = stops.stops.iter().map(|s| s.pose).collect();
     let mut stop_rms = vec![f32::NAN; poses.len()];
+    let mut rejected = vec![false; poses.len()];
 
     stage(ReconstructStage::Refine);
     check()?;
@@ -330,11 +411,33 @@ pub fn reconstruct(
             cancel,
         )?;
         report.refined = out.refined;
-        report.passes = out.passes;
+        report.passes = out.passes.len();
         report.passes_corrected = out.passes_corrected;
-        report.mean_rms_before_mm = mean(&out.rms_first);
-        report.mean_rms_mm = mean(&out.rms_last);
-        stop_rms = out.rms_last;
+        report.rejected_passes = out.passes.iter().filter(|p| p.rejected).count();
+        report.rescued_stops = out.passes.iter().map(|p| p.rescued_stops).sum();
+        report.pass_details = out.passes;
+        let kept = |v: &[f32]| -> Vec<f32> {
+            v.iter()
+                .zip(&out.rejected)
+                .map(|(r, rej)| if *rej { f32::NAN } else { *r })
+                .collect()
+        };
+        report.mean_rms_before_mm = mean(&kept(&out.rms_first));
+        stop_rms = kept(&out.rms_last);
+        report.mean_rms_mm = mean(&stop_rms);
+        rejected = out.rejected;
+    }
+    report.rejected_stops = prepared
+        .iter()
+        .zip(&rejected)
+        .filter(|(p, r)| p.is_some() && **r)
+        .count();
+    report.stops -= report.rejected_stops;
+    if report.rejected_stops > 0 {
+        report.warning = Some(WARN_VIEWS_REJECTED.to_owned());
+    }
+    if report.stops == 0 {
+        return Err(ScanError::Empty("stops that agree with each other"));
     }
     report.refine_s = t.elapsed().as_secs_f32();
 
@@ -346,9 +449,9 @@ pub fn reconstruct(
         trunc_mm: (TRUNC_VOXELS * voxel).max(MIN_TRUNC_MM),
         max_weight: NO_CAP,
     });
-    for (p, pose) in prepared.iter().zip(&poses) {
+    for ((p, pose), rej) in prepared.iter().zip(&poses).zip(&rejected) {
         check()?;
-        if let Some(p) = p {
+        if let (Some(p), false) = (p, *rej) {
             fine.integrate_weighted(&p.depth, &p.weights, &p.intr, &(stops.world * *pose));
         }
     }
@@ -372,6 +475,7 @@ pub fn reconstruct(
         mesh,
         poses,
         stop_rms_mm: stop_rms,
+        rejected,
         report,
     })
 }
@@ -433,13 +537,42 @@ fn refine_params(target_points: usize) -> TrackParams {
 /// Gate of the robust residual that compares two poses (mm).
 const FIT_GATE_MM: f64 = 0.25;
 
+/// One tilt pass of a [`ReconstructionReport`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PassReport {
+    /// Tilt of the pass (degrees).
+    pub tilt_deg: f32,
+    /// Its stops.
+    pub stops: usize,
+    /// Rotation of the rigid correction applied to the whole pass
+    /// (degrees; 0 when none was applied).
+    pub corrected_deg: f32,
+    /// Shift of the scanned surface by that correction (mm).
+    pub corrected_mm: f32,
+    /// Stops that disagreed after the pass correction and were registered
+    /// again on their own (a small slip within the pass).
+    pub rescued_stops: usize,
+    /// Stops left out of the fusion.
+    pub rejected_stops: usize,
+    /// The whole pass was left out: most of its stops disagree with the
+    /// passes nearer to tilt 0.
+    pub rejected: bool,
+}
+
+/// Warning of a reconstruction that left views out
+/// ([`ReconstructionReport::warning`]).
+pub const WARN_VIEWS_REJECTED: &str = "scan-views-rejected";
+
 /// What [`refine`] did.
 struct RefineOutcome {
     refined: usize,
-    passes: usize,
     passes_corrected: usize,
     rms_first: Vec<f32>,
     rms_last: Vec<f32>,
+    /// Per stop: left out of the fusion.
+    rejected: Vec<bool>,
+    /// Per pass, in tilt order.
+    passes: Vec<PassReport>,
 }
 
 /// Camera pose of the turntable angles `angles` in the fusion frame whose
@@ -464,7 +597,7 @@ fn passes(prepared: &[Option<Prepared>]) -> Vec<Vec<usize>> {
     out.into_iter().map(|(_, l)| l).collect()
 }
 
-/// The refinement (see the module doc).
+/// The refinement and the consistency gate (see the module doc).
 fn refine(
     prepared: &[Option<Prepared>],
     poses: &mut [Affine3A],
@@ -488,35 +621,6 @@ fn refine(
             volume.deintegrate_weighted(&p.depth, &p.weights, &p.intr, pose);
         }
     };
-    for (i, pose) in poses.iter().enumerate() {
-        add(&mut volume, i, pose);
-    }
-    // turntable poses: the references of the limits (corrected per pass)
-    let mut reference: Vec<Option<Affine3A>> = (0..n)
-        .map(|i| match (geometry, world_angles, &prepared[i]) {
-            (Some(g), Some(w), Some(p)) => Some(table_pose(g, w, p.angles)),
-            _ => None,
-        })
-        .collect();
-    let groups = passes(prepared);
-    let reference_pass = (0..groups.len()).min_by(|&a, &b| {
-        let tilt = |k: usize| {
-            prepared[groups[k][0]]
-                .as_ref()
-                .map_or(f32::INFINITY, |p| p.angles.1.abs())
-        };
-        tilt(a)
-            .total_cmp(&tilt(b))
-            .then(groups[b].len().cmp(&groups[a].len()))
-    });
-    let initial: Vec<Affine3A> = poses.to_vec();
-    let mut out = RefineOutcome {
-        refined: 0,
-        passes: groups.len(),
-        passes_corrected: 0,
-        rms_first: vec![f32::NAN; n],
-        rms_last: vec![f32::NAN; n],
-    };
     let check = || {
         if cancel() {
             Err(ScanError::Cancelled)
@@ -524,32 +628,109 @@ fn refine(
             Ok(())
         }
     };
-    let mut corrected = vec![false; groups.len()];
-    for round in 0..REFINE_ROUNDS {
-        if groups.len() > 1 {
-            for (k, group) in groups.iter().enumerate() {
-                if Some(k) == reference_pass {
-                    continue;
-                }
-                check()?;
+    // turntable poses: the references of the limits (corrected per pass)
+    let mut reference: Vec<Option<Affine3A>> = (0..n)
+        .map(|i| match (geometry, world_angles, &prepared[i]) {
+            (Some(g), Some(w), Some(p)) => Some(table_pose(g, w, p.angles)),
+            _ => None,
+        })
+        .collect();
+    // samples of the agreement checks
+    let checks: Vec<Option<FrameSample>> = prepared
+        .par_iter()
+        .map(|p| p.as_ref().map(|p| samples(p, AGREE_SAMPLES)))
+        .collect();
+    let initial: Vec<Affine3A> = poses.to_vec();
+    let mut groups = passes(prepared);
+    let tilt = |g: &[usize]| prepared[g[0]].as_ref().map_or(0.0, |p| p.angles.1);
+    // the reference pass (the tilt nearest 0, the larger on a tie) first,
+    // then the others away from it
+    groups.sort_by(|a, b| {
+        tilt(a)
+            .abs()
+            .total_cmp(&tilt(b).abs())
+            .then(b.len().cmp(&a.len()))
+    });
+    let mut out = RefineOutcome {
+        refined: 0,
+        passes_corrected: 0,
+        rms_first: vec![f32::NAN; n],
+        rms_last: vec![f32::NAN; n],
+        rejected: vec![false; n],
+        passes: Vec::with_capacity(groups.len()),
+    };
+    let mut rescued = vec![false; n];
+    for (rank, group) in groups.iter().enumerate() {
+        check()?;
+        let mut pass = PassReport {
+            tilt_deg: tilt(group),
+            stops: group.len(),
+            ..PassReport::default()
+        };
+        if rank > 0 {
+            // the pass as one body onto the passes accepted so far, from a
+            // few millimetres away (the object slipped while tilting)
+            if let Some((c, deg, mm)) = align_pass(&volume, prepared, poses, group) {
                 for &i in group {
-                    take(&mut volume, i, &poses[i]);
+                    poses[i] = to_f(&(c * to_d(&poses[i])));
+                    reference[i] = reference[i].map(|r| to_f(&(c * to_d(&r))));
                 }
-                if let Some(c) = register_pass(&volume, prepared, poses, group) {
-                    for &i in group {
-                        poses[i] = c * poses[i];
-                        reference[i] = reference[i].map(|r| c * r);
+                (pass.corrected_deg, pass.corrected_mm) = (deg as f32, mm as f32);
+                out.passes_corrected += 1;
+            }
+            let verdicts: Vec<Verdict> = group
+                .iter()
+                .map(|&i| match (&prepared[i], &checks[i]) {
+                    (Some(p), Some(f)) => agreement(&volume, p, f, &poses[i]).verdict(),
+                    _ => Verdict::Unknown,
+                })
+                .collect();
+            let agree = verdicts.iter().filter(|v| **v == Verdict::Agrees).count();
+            let known = verdicts.iter().filter(|v| **v != Verdict::Unknown).count();
+            if known > 0 && (agree as f64) < PASS_MIN_AGREE * known as f64 {
+                pass.rejected = true;
+                for &i in group {
+                    out.rejected[i] = true;
+                }
+            } else {
+                for (v, &i) in verdicts.iter().zip(group) {
+                    check()?;
+                    let rescue = match (v, &prepared[i], &checks[i]) {
+                        // it moved within the pass: once more on its own,
+                        // from a little farther away
+                        (Verdict::Disagrees, Some(p), Some(f)) => {
+                            rescue_stop(&volume, p, f, &poses[i])
+                        }
+                        _ => None,
+                    };
+                    if let Some(pose) = rescue {
+                        poses[i] = pose;
+                        // the turntable no longer tells where this view was
+                        reference[i] = None;
+                        rescued[i] = true;
+                        pass.rescued_stops += 1;
+                    } else if *v == Verdict::Disagrees {
+                        out.rejected[i] = true;
+                        continue;
                     }
-                    corrected[k] = true;
-                }
-                for &i in group {
                     add(&mut volume, i, &poses[i]);
                 }
             }
+        } else {
+            for &i in group {
+                add(&mut volume, i, &poses[i]);
+            }
         }
+        out.passes.push(pass);
+    }
+    for round in 0..REFINE_ROUNDS {
+        let last = round + 1 == REFINE_ROUNDS;
         for i in 0..n {
-            check()?;
             let Some(p) = &prepared[i] else { continue };
+            if out.rejected[i] {
+                continue;
+            }
+            check()?;
             take(&mut volume, i, &poses[i]);
             let r = register_stop(&volume, p, &poses[i], reference[i], geometry);
             if round == 0 {
@@ -559,13 +740,35 @@ fn refine(
             if let Some(pose) = r.pose {
                 poses[i] = pose;
             }
+            // the gate: every view against the consensus of all the others
+            if last
+                && let Some(f) = &checks[i]
+                && agreement(&volume, p, f, &poses[i]).verdict() == Verdict::Disagrees
+            {
+                out.rejected[i] = true;
+                continue;
+            }
             add(&mut volume, i, &poses[i]);
         }
     }
-    out.passes_corrected = corrected.iter().filter(|c| **c).count();
-    out.refined = poses.iter().zip(&initial).filter(|(a, b)| a != b).count();
+    for (pass, group) in out.passes.iter_mut().zip(&groups) {
+        pass.rejected_stops = group.iter().filter(|&&i| out.rejected[i]).count();
+    }
+    out.passes.sort_by(|a, b| a.tilt_deg.total_cmp(&b.tilt_deg));
+    out.refined = poses
+        .iter()
+        .zip(&initial)
+        .zip(&out.rejected)
+        .filter(|((a, b), r)| !**r && a != b)
+        .count();
     if let (Some(g), Some(w)) = (geometry, world_angles) {
-        regauge(poses, &reference, g.axis_at(w.1).0);
+        let gauge: Vec<Option<Affine3A>> = reference
+            .iter()
+            .zip(&out.rejected)
+            .zip(&rescued)
+            .map(|((r, rej), res)| r.filter(|_| !*rej && !*res))
+            .collect();
+        regauge(poses, &gauge, g.axis_at(w.1).0);
     }
     Ok(out)
 }
@@ -574,6 +777,7 @@ fn refine(
 /// them back onto their references on average: the registrations measure
 /// only how the stops sit relative to each other, so the whole model may
 /// slide while it is refined; the turntable keeps it where it belongs.
+/// Stops without a reference do not count.
 fn regauge(poses: &mut [Affine3A], reference: &[Option<Affine3A>], centre: glam::Vec3) {
     let c0 = centre.as_dvec3();
     let (mut rot, mut shift, mut k) = (DVec3::ZERO, DVec3::ZERO, 0usize);
@@ -694,34 +898,57 @@ pub(crate) fn stop_correction(
     (delta, off, shift)
 }
 
-/// Registers the stops `group` (taken out of `volume`) as one rigid body
-/// onto `volume`: the world-side correction, when it stays within
+/// Centroid of the samples of `frames` placed by their poses.
+fn samples_centroid<'a>(frames: impl Iterator<Item = (&'a FrameSample, DAffine3)>) -> DVec3 {
+    let (sum, count) = frames.fold((DVec3::ZERO, 0usize), |(s, k), (f, pose)| {
+        (
+            s + f
+                .points
+                .iter()
+                .map(|x| pose.transform_point3(x.as_dvec3()))
+                .sum::<DVec3>(),
+            k + f.points.len(),
+        )
+    });
+    sum / count.max(1) as f64
+}
+
+/// Registers the stops `group` (not in `volume`) as one rigid body onto
+/// `volume`, from a few millimetres away: stages of shrinking association
+/// gates ([`PASS_GATES_MM`]), the model ray cast again at the start of
+/// every stage. The world-side correction (and its rotation in degrees and
+/// the shift of the samples in millimetres) when it stays within
 /// [`PASS_MAX_DEG`] / [`PASS_MAX_MM`] and fits better.
-fn register_pass(
+fn align_pass(
     volume: &TsdfVolume,
     prepared: &[Option<Prepared>],
     poses: &[Affine3A],
     group: &[usize],
-) -> Option<Affine3A> {
-    let params = refine_params(3000);
-    let views: Vec<(FrameSample, ModelView, DAffine3)> = group
+) -> Option<(DAffine3, f64, f64)> {
+    let params = TrackParams {
+        max_model_width: AGREE_VIEW_WIDTH,
+        ..refine_params(PASS_SAMPLES)
+    };
+    let frames: Vec<(&Prepared, FrameSample, DAffine3)> = group
         .iter()
         .filter_map(|&i| {
             let p = prepared[i].as_ref()?;
-            let frame = samples(p, params.target_points);
-            let view = ModelView::new(volume, &p.intr, &poses[i], &params);
-            Some((frame, view, to_d(&poses[i])))
+            Some((p, samples(p, params.target_points), to_d(&poses[i])))
         })
         .collect();
-    if views.is_empty() {
+    if frames.is_empty() {
         return None;
     }
     let mut c = DAffine3::IDENTITY;
-    for &gate in &params.gates_mm {
-        let gate = f64::from(gate);
-        for _ in 0..params.iterations_per_stage {
+    let mut views: Vec<ModelView> = Vec::new();
+    for &gate in &PASS_GATES_MM {
+        views = frames
+            .iter()
+            .map(|(p, _, pose)| ModelView::new(volume, &p.intr, &to_f(&(c * *pose)), &params))
+            .collect();
+        for _ in 0..PASS_ITERATIONS {
             let (mut p, mut q, mut nrm, mut w) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-            for (frame, view, pose) in &views {
+            for ((_, frame, pose), view) in frames.iter().zip(&views) {
                 for (a, b, n, _) in view.pairs(frame, &(c * *pose), gate) {
                     w.push(tukey((b - a).dot(n), gate));
                     p.push(a);
@@ -741,31 +968,166 @@ fn register_pass(
         }
     }
     // the motion of the scanned surface, not of the far camera origins
-    let (sum, count) = views
-        .iter()
-        .fold((DVec3::ZERO, 0usize), |(s, k), (f, _, pose)| {
-            (
-                s + f
-                    .points
-                    .iter()
-                    .map(|x| pose.transform_point3(x.as_dvec3()))
-                    .sum::<DVec3>(),
-                k + f.points.len(),
-            )
-        });
-    let centroid = sum / count.max(1) as f64;
+    let centroid = samples_centroid(frames.iter().map(|(_, f, pose)| (f, *pose)));
     let shift = c.transform_point3(centroid).distance(centroid);
-    if rotation_angle(&c).to_degrees() > PASS_MAX_DEG || shift > PASS_MAX_MM {
+    let deg = rotation_angle(&c).to_degrees();
+    if deg > PASS_MAX_DEG || shift > PASS_MAX_MM {
         return None;
     }
     let cost = |c: &DAffine3| {
-        views
+        frames
             .iter()
-            .map(|(f, v, pose)| v.fit(f, &(*c * *pose), FIT_GATE_MM).cost)
+            .zip(&views)
+            .map(|((_, f, pose), v)| v.fit(f, &(*c * *pose), FIT_GATE_MM).cost)
             .sum::<f64>()
     };
     let (before, after) = (cost(&DAffine3::IDENTITY), cost(&c));
-    (after < before * (1.0 - MIN_GAIN)).then(|| to_f(&c))
+    (after < before * (1.0 - MIN_GAIN)).then_some((c, deg, shift))
+}
+
+/// Registers a stop that disagrees with `volume` once more on its own,
+/// from a little farther away than the refinement ([`RESCUE_GATES_MM`]):
+/// the object slipped a little within the pass. The new pose when it stays
+/// within [`RESCUE_MAX_DEG`] / [`RESCUE_MAX_MM`] of `pose` and then agrees
+/// with `volume` (`check`: the samples of the agreement).
+fn rescue_stop(
+    volume: &TsdfVolume,
+    p: &Prepared,
+    check: &FrameSample,
+    pose: &Affine3A,
+) -> Option<Affine3A> {
+    let base = TrackParams {
+        max_step_deg: RESCUE_MAX_DEG as f32,
+        max_step_mm: RESCUE_MAX_MM as f32,
+        ..refine_params(10_000)
+    };
+    let frame = samples(p, base.target_points);
+    let mut current = *pose;
+    for (k, gates) in RESCUE_GATES_MM.iter().enumerate() {
+        let params = TrackParams {
+            gates_mm: *gates,
+            ..base
+        };
+        let view = ModelView::new(volume, &p.intr, &current, &params);
+        let r = track_in_view(&view, &frame, &current, &params);
+        // the coarse stage only brings the pose near: its residual is
+        // measured at a wide gate
+        let usable = r.pose.is_finite() && (r.ok || k + 1 < RESCUE_GATES_MM.len());
+        if !usable {
+            return None;
+        }
+        current = r.pose;
+    }
+    let c = to_d(pose).inverse() * to_d(&current);
+    let centroid = samples_centroid(std::iter::once((&frame, to_d(pose))));
+    let moved = to_d(&current)
+        .transform_point3(to_d(pose).inverse().transform_point3(centroid))
+        .distance(centroid);
+    if rotation_angle(&c).to_degrees() > RESCUE_MAX_DEG || moved > RESCUE_MAX_MM {
+        return None;
+    }
+    (agreement(volume, p, check, &current).verdict() == Verdict::Agrees).then_some(current)
+}
+
+/// How a stop agrees with a model ([`agreement`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Agreement {
+    /// Samples considered.
+    samples: usize,
+    /// Samples judged: the model has a surface facing like the stop's at
+    /// their pixel, and they are not [`AGREE_FAR_MM`] in front of it.
+    judged: usize,
+    /// Of those, the samples within [`AGREE_TOL_MM`] of that surface...
+    close: usize,
+    /// ... and the samples more than [`AGREE_FAR_MM`] behind it.
+    behind: usize,
+    /// Median distance of the judged samples to the surface (mm).
+    median_mm: f64,
+}
+
+/// What an [`Agreement`] says about a stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// It lies on the model.
+    Agrees,
+    /// It sees the same surfaces elsewhere: the object moved, or its pose
+    /// is wrong.
+    Disagrees,
+    /// Too little in common with the model to tell.
+    Unknown,
+}
+
+impl Agreement {
+    fn verdict(&self) -> Verdict {
+        let enough = self.judged >= AGREE_MIN_OVERLAP
+            && self.judged as f64 >= AGREE_MIN_OVERLAP_FRACTION * self.samples as f64;
+        if !enough {
+            return Verdict::Unknown;
+        }
+        let n = self.judged as f64;
+        let agrees = self.close as f64 >= AGREE_MIN_CLOSE * n
+            && self.behind as f64 <= AGREE_MAX_BEHIND * n
+            && self.median_mm <= AGREE_MAX_MEDIAN_MM;
+        if agrees {
+            Verdict::Agrees
+        } else {
+            Verdict::Disagrees
+        }
+    }
+}
+
+/// How the stop `p` placed by `pose` agrees with `volume`: the model is ray
+/// cast from the stop's own camera (at most [`AGREE_VIEW_WIDTH`] pixels
+/// wide) and every sample of `frame` is compared with the model surface at
+/// its pixel, where that surface faces like the sample (normals within
+/// [`AGREE_NORMAL_DEG`]): its signed distance to that plane, positive
+/// toward the camera. Samples in front see what the model lacks; samples
+/// behind see through a surface the model has. A view of an object that
+/// moved shows both, whatever part of it still fits (a part symmetric about
+/// the turntable axis).
+fn agreement(volume: &TsdfVolume, p: &Prepared, frame: &FrameSample, pose: &Affine3A) -> Agreement {
+    let k = p.intr.downscaled(p.intr.width.div_ceil(AGREE_VIEW_WIDTH));
+    let (points, normals) = volume.raycast(&k, pose);
+    let cos = AGREE_NORMAL_DEG.to_radians().cos();
+    let mut dist: Vec<f64> = frame
+        .points
+        .par_iter()
+        .zip(frame.normals.par_iter())
+        .with_min_len(512)
+        .filter_map(|(x, nx)| {
+            let (u, v) = k.project(*x)?;
+            let (u, v) = (u.round(), v.round());
+            if u < 0.0 || v < 0.0 || u >= k.width as f32 || v >= k.height as f32 {
+                return None;
+            }
+            let i = v as usize * k.width as usize + u as usize;
+            let (q, n) = (points[i], normals[i]);
+            if !q.is_finite() || !n.is_finite() {
+                return None;
+            }
+            let (pw, nw) = (pose.transform_point3(*x), pose.transform_vector3(*nx));
+            let d = f64::from((pw - q).dot(n));
+            (nw.dot(n) >= cos && d <= AGREE_FAR_MM).then_some(d)
+        })
+        .collect();
+    let close = dist.iter().filter(|d| d.abs() <= AGREE_TOL_MM).count();
+    let behind = dist.iter().filter(|d| **d < -AGREE_FAR_MM).count();
+    for d in &mut dist {
+        *d = d.abs();
+    }
+    let median_mm = if dist.is_empty() {
+        f64::NAN
+    } else {
+        let m = dist.len() / 2;
+        *dist.select_nth_unstable_by(m, f64::total_cmp).1
+    };
+    Agreement {
+        samples: frame.points.len(),
+        judged: dist.len(),
+        close,
+        behind,
+        median_mm,
+    }
 }
 
 /// Name of the index file of a stops directory.

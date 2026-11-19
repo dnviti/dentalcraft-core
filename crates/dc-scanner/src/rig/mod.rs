@@ -248,12 +248,18 @@ pub struct RigJobStatus {
     pub kept_stops: Option<u32>,
 }
 
-/// Default tilts of `scan.auto` (degrees): five passes over the table's
-/// range, so the occlusal surfaces and the steep walls are seen from above
-/// and from both sides.
-pub const AUTO_TILTS_DEG: [f32; 5] = [-30.0, -15.0, 0.0, 15.0, 30.0];
-/// Default degrees between the stops of `scan.auto` (stop-and-capture).
-pub const AUTO_STEP_DEG: f32 = 6.0;
+/// Default tilts of `scan.auto` (degrees): five passes, so the occlusal
+/// surfaces and the steep walls are seen from above and from both sides,
+/// within ±20 degrees, safe for an object that only rests on the platter.
+/// On the rig (2026-11-19, a test arch resting on the platter) the passes
+/// at ±15 stayed put (per-view corrections 0.2-0.5 degrees, at most 1.7)
+/// while at ±30 the object slid and turned on the platter by 6 to 21
+/// degrees within the pass; a scan at ±20 kept it in place.
+pub const AUTO_TILTS_DEG: [f32; 5] = [-20.0, -10.0, 0.0, 10.0, 20.0];
+/// Default degrees between the stops of `scan.auto` (stop-and-capture):
+/// 5 × 49 stops, about 2 s each on the rig, keep the whole automatic scan
+/// near 10 minutes.
+pub const AUTO_STEP_DEG: f32 = 7.5;
 /// Default frames averaged (per-pixel median) at each stop of `scan.auto`.
 pub const AUTO_FRAMES_PER_STOP: u32 = 3;
 /// Default mesh resolution of the finish of `scan.auto` (mm).
