@@ -109,6 +109,19 @@ pub struct FrameHeader {
     pub magnetometer: Vec3,
 }
 
+/// An accelerometer reading this close to 1 g (relative) is taken as
+/// gravity alone: the device is at rest or moving slowly.
+const REST_G_TOLERANCE: f32 = 0.1;
+
+impl FrameHeader {
+    /// The up direction in the frame of the IMU (unit): the accelerometer
+    /// reading, when it is about 1 g.
+    pub fn up(&self) -> Option<Vec3> {
+        let g = self.accel_g.length();
+        ((g - 1.0).abs() <= REST_G_TOLERANCE).then(|| self.accel_g / g)
+    }
+}
+
 /// Parses the header in the bytes of row 0. `None` when the row is too
 /// short or does not start with the known header words.
 pub fn parse_header(row0: &[u8]) -> Option<FrameHeader> {
@@ -243,6 +256,14 @@ mod tests {
         assert!(q.mul_vec3(Vec3::Z).z > 0.99);
         assert!(h.gyro.length() < 0.05);
         assert!(h.magnetometer.length() > 10.0);
+        let up = h.up().unwrap();
+        assert!(up.is_normalized() && up.z > 0.99, "{up}");
+        // a shaken device measures more than gravity: no up
+        let shaken = FrameHeader {
+            accel_g: 1.5 * h.accel_g,
+            ..h
+        };
+        assert_eq!(shaken.up(), None);
 
         // word 4 varies between sessions (0x148 on 2026-11-18): still a header
         let mut varying = ROW0.to_vec();

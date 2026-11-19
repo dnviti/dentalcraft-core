@@ -49,12 +49,14 @@ use dc_geom::icp::rotation_angle;
 use dc_geom::tsdf::{CameraIntrinsics, TsdfParams, TsdfVolume};
 use dc_mesh::PointCloud;
 use dc_turntable::AngleProbe;
-use glam::{Affine3A, Vec3};
+use glam::{Affine3A, Quat, Vec3};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::rig::fit::{angle_about, to_d};
-use crate::rig::{Background, RigCalibration, RigGeometry, RigInput, about, camera_world};
+use crate::rig::{
+    Background, RigCalibration, RigGeometry, RigInput, about, camera_world, gravity_world,
+};
 use crate::tracking::{FrameSample, TrackParams, sample_frame, track_frame};
 use crate::{DepthFrame, DeviceInfo, Result, ScanError, ScannerBackend, ScannerDevice, backend};
 
@@ -62,6 +64,9 @@ use crate::{DepthFrame, DeviceInfo, Result, ScanError, ScannerBackend, ScannerDe
 pub const PREVIEW_INTERVAL: Duration = Duration::from_millis(200);
 /// How long the acquisition thread waits for a frame before checking for stop.
 const FRAME_WAIT: Duration = Duration::from_millis(50);
+/// Weight of the newest frame in the smoothed IMU up: one accelerometer
+/// reading is noisy, and a hand-held scanner adds its own accelerations.
+const IMU_UP_SMOOTHING: f32 = 0.2;
 
 /// Acquisition state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,8 +201,13 @@ pub struct ScanStatus {
     pub world_from_camera: Option<[f32; 12]>,
     /// The world frame is the calibrated rig frame: +Z the turntable axis
     /// pointing up from the platter, origin on the axis at the platter,
-    /// +X toward the scanner. Otherwise it is [`crate::rig::camera_world`].
+    /// +X toward the scanner. Otherwise it is [`crate::rig::gravity_world`]
+    /// when `imu_world`, else [`crate::rig::camera_world`].
     pub rig_world: bool,
+    /// Without a rig calibration in use, the world's +Z is the true up
+    /// measured by the scanner's IMU (oriented in the camera by a stored
+    /// calibration of this scanner, [`RigCalibration::camera_from_imu`]).
+    pub imu_world: bool,
     /// Pose of the scanner at the first fused frame in the world frame:
     /// `[tilt, yaw]` in degrees, tilt > 0 looking down, yaw 0 looking at
     /// the axis (along −X).
@@ -322,7 +332,11 @@ struct Live {
     /// World frame from the first camera frame, once set.
     world: Option<Affine3A>,
     rig_world: bool,
+    imu_world: bool,
     latency: Duration,
+    /// The up direction measured by the device IMU, smoothed over the
+    /// recent frames (frame of the IMU).
+    imu_up: Option<Vec3>,
 }
 
 impl Live {
@@ -375,6 +389,11 @@ struct Fusion {
     world: Affine3A,
     /// `world` is the calibrated rig frame.
     rig_world: bool,
+    /// `world` stands on the up measured by the IMU.
+    imu_world: bool,
+    /// The true up in the camera frame of the latest frame, from the IMU,
+    /// when known.
+    up: Option<Vec3>,
     /// The fused stops of `scan.auto`.
     stops: Vec<StopRecord>,
     /// Frames fused one by one (not as stops).
@@ -392,18 +411,26 @@ impl Fusion {
             world_angles: None,
             world: camera_world(),
             rig_world: false,
+            imu_world: false,
+            up: None,
             stops: Vec::new(),
             loose_frames: 0,
         }
     }
 
     /// Sets the world frame at the first fused frame (taken at `angles`):
-    /// the rig frame with a calibration, else [`camera_world`].
+    /// the rig frame with a calibration, else [`gravity_world`] on the up
+    /// measured by the IMU, else [`camera_world`].
     fn set_world(&mut self, geometry: Option<&RigGeometry>, angles: Option<(f32, f32)>) {
         self.world_angles = angles;
-        (self.world, self.rig_world) = match geometry {
-            Some(g) => (g.world_from_camera(angles.map_or(0.0, |a| a.1)), true),
-            None => (camera_world(), false),
+        (self.world, self.rig_world, self.imu_world) = match (geometry, self.up) {
+            (Some(g), _) => (
+                g.world_from_camera(angles.map_or(0.0, |a| a.1)),
+                true,
+                false,
+            ),
+            (None, Some(up)) => (gravity_world(up), false, true),
+            (None, None) => (camera_world(), false, false),
         };
     }
 }
@@ -458,6 +485,12 @@ impl RigLink {
     /// Frames processed per second (smoothed; 0 before two frames).
     pub fn fps(&self) -> f32 {
         self.0.live().fps
+    }
+
+    /// The up direction measured by the device IMU, smoothed over the
+    /// recent frames (frame of the IMU), when the device reports it.
+    pub fn imu_up(&self) -> Option<Vec3> {
+        self.0.live().imu_up
     }
 
     /// The latency of the device ([`ScannerDevice::latency`]) when the
@@ -780,6 +813,14 @@ impl ScanSession {
         self.shared.rig().calibration.clone()
     }
 
+    /// Sets the rotation from the scanner's IMU frame to its camera frame
+    /// ([`RigCalibration::camera_from_imu`]): without a rig calibration in
+    /// use, the world of the next scan then stands on the true up the IMU
+    /// measures ([`gravity_world`]). Takes effect from the next frame.
+    pub fn set_imu_alignment(&mut self, camera_from_imu: Option<Quat>) {
+        self.shared.rig().camera_from_imu = camera_from_imu;
+    }
+
     /// Current state and counters.
     pub fn status(&self) -> ScanStatus {
         let live = self.shared.live();
@@ -797,6 +838,7 @@ impl ScanSession {
             world_angles_deg: live.world_angles,
             world_from_camera: live.world.map(|w| w.to_cols_array()),
             rig_world: live.rig_world,
+            imu_world: live.imu_world,
             scanner_deg: live.world.as_ref().map(scanner_angles),
         }
     }
@@ -1282,9 +1324,9 @@ fn acquire(
             .and_then(|a| Some((a.rotate_deg?, a.tilt_deg.unwrap_or(0.0))))
     };
     while !shared.stop.load(Ordering::SeqCst) {
-        let (geometry, probe) = {
+        let (geometry, probe, camera_from_imu) = {
             let rig = shared.rig();
-            (rig.geometry, rig.probe.clone())
+            (rig.geometry, rig.probe.clone(), rig.camera_from_imu)
         };
         // a loop closure needs no frame (the request is copied out: the
         // lock must not be held while serving it)
@@ -1322,6 +1364,16 @@ fn acquire(
             shared.live().error = Some((e.code(), e.to_string()));
             break;
         }
+        // the true up of this frame in the camera, from the IMU
+        if let Some(u) = frame.imu_up {
+            let mut live = shared.live();
+            live.imu_up = Some(live.imu_up.map_or(u, |a| {
+                a.lerp(u, IMU_UP_SMOOTHING).try_normalize().unwrap_or(u)
+            }));
+        }
+        fusion.up = camera_from_imu
+            .zip(shared.live().imu_up)
+            .map(|(r, u)| r * u);
         let paused = shared.paused.load(Ordering::SeqCst) || shared.hold.load(Ordering::SeqCst);
         // the turntable angles when the frame was taken (the latency of a
         // device may follow its frame rate)
@@ -1420,6 +1472,7 @@ fn acquire(
                 live.world_angles = fusion.world_angles.map(|(r, t)| [r, t]);
                 live.world = Some(fusion.world);
                 live.rig_world = fusion.rig_world;
+                live.imu_world = fusion.imu_world;
             }
         }
         if let Some(prev) = last_frame {
@@ -1663,5 +1716,44 @@ mod tests {
         assert_eq!(h.at(t0 + Duration::from_secs(5)).unwrap().0, 10.0);
         h.push(t0 + Duration::from_secs(2), None);
         assert_eq!(h.at(t0), None);
+    }
+
+    #[test]
+    fn the_world_stands_on_the_rig_then_the_imu_then_the_camera() {
+        let mut f = Fusion::new(&ScanSettings::default());
+        f.set_world(None, None);
+        assert_eq!(f.world, camera_world());
+        assert!(!f.rig_world && !f.imu_world);
+        // the IMU measures a scanner looking 20 degrees down
+        let a = 20_f32.to_radians();
+        f.up = Some(Vec3::new(0.0, -a.cos(), -a.sin()));
+        f.set_world(None, None);
+        assert_eq!(f.world, gravity_world(f.up.unwrap()));
+        assert!(!f.rig_world && f.imu_world);
+        let [tilt, yaw] = scanner_angles(&f.world);
+        assert!(
+            (tilt - 20.0).abs() < 1e-3 && yaw.abs() < 1e-3,
+            "{tilt} {yaw}"
+        );
+        // a rig calibration wins
+        let c = RigCalibration {
+            axis_point: [0.0, 0.0, 150.0],
+            axis_dir: [0.0, 0.0, -1.0],
+            platter_up: [0.0, 0.0, -1.0],
+            tilt_axis_point: None,
+            tilt_axis_dir: None,
+            scanner_serial: None,
+            turntable_id: "T".into(),
+            created: String::new(),
+            fit_rms_deg: 0.0,
+            fit_rms_mm: 0.0,
+            angle_gain: 1.0,
+            fit_pairs: 0,
+            imu_up: None,
+        };
+        let g = RigGeometry::new(&c);
+        f.set_world(Some(&g), Some((0.0, 0.0)));
+        assert_eq!(f.world, g.world_from_camera(0.0));
+        assert!(f.rig_world && !f.imu_world);
     }
 }

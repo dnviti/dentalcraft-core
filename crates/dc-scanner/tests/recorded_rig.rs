@@ -173,6 +173,7 @@ fn recorded_revolution_calibrates_and_fuses() {
         fit_rms_mm: outcome.axis.rms_mm,
         angle_gain: outcome.axis.angle_gain,
         fit_pairs: outcome.axis.pairs as u32,
+        imu_up: None,
     };
 
     let t = Instant::now();
@@ -353,6 +354,7 @@ fn recorded_revolution_under_other_camera_models() {
                 fit_rms_mm: o.axis.rms_mm,
                 angle_gain: o.angle_gain,
                 fit_pairs: o.axis.pairs as u32,
+                imu_up: None,
             };
             let stops: Vec<RecordedStop> = model
                 .iter()

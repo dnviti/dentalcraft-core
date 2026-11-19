@@ -664,6 +664,9 @@ fn calibrate(ctx: &Ctx, plan: &CalibrationPlan) -> Result<RigCalibration> {
         });
         ctx.step(None);
     }
+    // the up of the IMU with the platter level (the scanner never moves:
+    // smoothed over every frame of the turn)
+    let imu_up = ctx.link.imu_up();
     // tilt stops at the last angle
     let mut tilt = Vec::new();
     if let Some(t) = plan.tilt_deg {
@@ -707,6 +710,7 @@ fn calibrate(ctx: &Ctx, plan: &CalibrationPlan) -> Result<RigCalibration> {
         fit_rms_mm: axis.rms_mm,
         angle_gain: outcome.angle_gain,
         fit_pairs: axis.pairs as u32,
+        imu_up: imu_up.map(Into::into),
     })
 }
 

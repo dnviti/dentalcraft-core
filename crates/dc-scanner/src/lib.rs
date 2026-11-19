@@ -147,7 +147,8 @@ pub enum ScanError {
     RigUncalibrated,
     /// `turntable.calibrate` measured an axis that fails its checks; `code`
     /// says which (`calibration-no-object`, `calibration-tracking`,
-    /// `calibration-inaccurate`, `calibration-implausible`).
+    /// `calibration-tilt`, `calibration-inaccurate`,
+    /// `calibration-implausible`).
     #[error("turntable calibration refused ({code}): {detail}")]
     CalibrationRefused {
         /// Stable code of the failed check.
@@ -225,6 +226,10 @@ pub struct DepthFrame {
     /// Orientation of the device IMU when the frame was taken, when the
     /// device reports it (frame of the IMU, not of the camera).
     pub imu_orientation: Option<glam::Quat>,
+    /// The up direction measured by the device IMU when the frame was
+    /// taken (the accelerometer reading of a device at rest, unit, frame
+    /// of the IMU), when the device reports it.
+    pub imu_up: Option<glam::Vec3>,
 }
 
 /// Identity of a device as listed by its backend.

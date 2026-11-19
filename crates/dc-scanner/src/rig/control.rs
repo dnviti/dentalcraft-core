@@ -421,11 +421,16 @@ impl ScanController {
     }
 
     /// Gives the session the calibration matching the connected scanner
-    /// and table, and the table's angle estimate.
+    /// and table, and the table's angle estimate; and, with or without a
+    /// table, the orientation of the scanner's IMU from the stored
+    /// calibration of this scanner.
     pub(crate) fn apply_rig(&mut self) {
+        // an unreadable calibration file must not prevent a connection:
+        // turntable.calibration reports it
+        let _ = self.rig.ensure_loaded();
+        let serial = self.session.status().device.and_then(|d| d.serial);
         let (calibration, probe) = match &self.rig.table {
             Some(c) => {
-                let serial = self.session.status().device.and_then(|d| d.serial);
                 let calibration = self
                     .rig
                     .calibration
@@ -436,7 +441,14 @@ impl ScanController {
             }
             None => (None, None),
         };
+        let imu = self
+            .rig
+            .calibration
+            .as_ref()
+            .filter(|cal| serial.is_some() && cal.scanner_serial == serial)
+            .and_then(RigCalibration::camera_from_imu);
         self.session.set_rig(calibration, probe);
+        self.session.set_imu_alignment(imu);
     }
 
     /// Runs a `turntable.*` command or `scan.auto`.
@@ -631,9 +643,6 @@ impl ScanController {
             axes: axes.clone(),
             probe,
         });
-        // an unreadable calibration file must not prevent the connection:
-        // turntable.calibration reports it
-        let _ = self.rig.ensure_loaded();
         self.apply_rig();
         Ok(json!({
             "turntable": info,

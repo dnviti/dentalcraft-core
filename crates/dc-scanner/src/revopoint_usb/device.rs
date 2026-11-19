@@ -411,6 +411,7 @@ impl RevopointUsbDevice {
                 .map_or(driver_timestamp_us, |h| u64::from(h.timestamp_ms) * 1000),
             color: None,
             imu_orientation: planes.header.and_then(|h| h.orientation),
+            imu_up: planes.header.and_then(|h| h.up()),
         })
     }
 }

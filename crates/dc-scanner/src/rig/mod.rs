@@ -90,6 +90,13 @@ pub struct RigCalibration {
     /// Registered stop pairs the axis was fitted to.
     #[serde(default)]
     pub fit_pairs: u32,
+    /// The up direction measured by the scanner's IMU while the
+    /// calibration was measured (unit, frame of the IMU), the platter level
+    /// at tilt 0: with `platter_up`, the true up in the camera frame, it
+    /// orients the IMU in the camera ([`RigCalibration::camera_from_imu`]).
+    /// `None` for a scanner without an IMU or an older calibration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imu_up: Option<[f32; 3]>,
 }
 
 fn one() -> f32 {
@@ -106,6 +113,41 @@ impl RigCalibration {
                 _ => true,
             }
     }
+
+    /// The rotation from the frame of the scanner's IMU to its camera
+    /// frame, estimated from `imu_up` and `platter_up`, the same direction
+    /// (up) seen by the two. One direction cannot fix the turn about
+    /// itself, so the IMU axes are taken along the camera axes: the
+    /// rotation between the axes that brings `imu_up` closest to
+    /// `platter_up`, then the shortest turn that makes them agree. `None`
+    /// without `imu_up`.
+    pub fn camera_from_imu(&self) -> Option<Quat> {
+        let imu = Vec3::from(self.imu_up?).try_normalize()?;
+        let up = Vec3::from(self.platter_up).try_normalize()?;
+        let axes = axis_rotations()
+            .into_iter()
+            .max_by(|a, b| (*a * imu).dot(up).total_cmp(&(*b * imu).dot(up)))?;
+        Some((Quat::from_rotation_arc(axes * imu, up) * axes).normalize())
+    }
+}
+
+/// The 24 rotations that take the coordinate axes onto the coordinate axes.
+fn axis_rotations() -> Vec<Quat> {
+    let axes = [
+        Vec3::X,
+        Vec3::Y,
+        Vec3::Z,
+        Vec3::NEG_X,
+        Vec3::NEG_Y,
+        Vec3::NEG_Z,
+    ];
+    let mut out = Vec::with_capacity(24);
+    for x in axes {
+        for y in axes.into_iter().filter(|y| x.dot(*y) == 0.0) {
+            out.push(Quat::from_mat3(&Mat3::from_cols(x, y, x.cross(y))));
+        }
+    }
+    out
 }
 
 /// Kind of a rig job.
@@ -232,6 +274,22 @@ fn frame_from_camera(x: Vec3, y: Vec3, z: Vec3, origin: Vec3) -> Affine3A {
 /// sees a horizontal surface as the XY plane.
 pub fn camera_world() -> Affine3A {
     frame_from_camera(Vec3::NEG_Z, Vec3::X, Vec3::NEG_Y, Vec3::ZERO)
+}
+
+/// The scan world frame without a rig calibration of a scanner that knows
+/// its up direction `up` (camera frame, from its IMU), as a map from the
+/// camera frame: +Z the true up, +X back toward the scanner along the
+/// horizontal (the camera's −z, or −y when it looks straight down),
+/// Y = Z × X, origin at the camera. Equals [`camera_world`] for a scanner
+/// held level (`up` the camera's −y).
+pub fn gravity_world(up: Vec3) -> Affine3A {
+    let z = up.try_normalize().unwrap_or(Vec3::NEG_Y);
+    let x = Vec3::NEG_Z
+        .reject_from_normalized(z)
+        .try_normalize()
+        .or_else(|| Vec3::NEG_Y.reject_from_normalized(z).try_normalize())
+        .unwrap_or_else(|| z.any_orthonormal_vector());
+    frame_from_camera(x, z.cross(x), z, Vec3::ZERO)
 }
 
 impl RigGeometry {
@@ -411,6 +469,9 @@ pub(crate) struct RigInput {
     pub calibration: Option<RigCalibration>,
     pub geometry: Option<RigGeometry>,
     pub probe: Option<AngleProbe>,
+    /// The rotation from the scanner's IMU frame to its camera frame
+    /// ([`RigCalibration::camera_from_imu`]), when known.
+    pub camera_from_imu: Option<Quat>,
 }
 
 /// Default directory of the rig files: `<data dir>/dentalcraft/rig`
@@ -511,7 +572,61 @@ mod tests {
             fit_rms_mm: 0.05,
             angle_gain: 1.0,
             fit_pairs: 24,
+            imu_up: None,
         }
+    }
+
+    #[test]
+    fn the_imu_is_oriented_by_the_up_of_the_calibration() {
+        // IMU axes along the camera's: x to -x, y to -z, z to -y (the up of
+        // a scanner held level), scanner looking 19 degrees down
+        let truth = Quat::from_mat3(&Mat3::from_cols(Vec3::NEG_X, Vec3::NEG_Z, Vec3::NEG_Y));
+        let looking_down = |deg: f32| {
+            let a = deg.to_radians();
+            Vec3::new(0.0, -a.cos(), -a.sin())
+        };
+        let up = looking_down(19.0);
+        let c = RigCalibration {
+            platter_up: up.into(),
+            imu_up: Some((truth.inverse() * up).into()),
+            ..calibration()
+        };
+        let r = c.camera_from_imu().unwrap();
+        assert!(r.angle_between(truth).to_degrees() < 0.01, "{r:?}");
+        // the scanner moved to 40 degrees down: its IMU tells the new up
+        let now = looking_down(40.0);
+        assert!((r * (truth.inverse() * now)).angle_between(now) < 1e-4);
+        // an IMU slightly off the axes still maps the calibration up exactly
+        let off = Quat::from_rotation_x(3_f32.to_radians()) * truth;
+        let c = RigCalibration {
+            imu_up: Some((off.inverse() * up).into()),
+            ..c
+        };
+        let r = c.camera_from_imu().unwrap();
+        assert!((r * Vec3::from(c.imu_up.unwrap())).angle_between(up) < 1e-4);
+        assert!(r.angle_between(off).to_degrees() < 0.01, "{r:?}");
+        // no IMU: unknown
+        assert_eq!(calibration().camera_from_imu(), None);
+    }
+
+    #[test]
+    fn the_gravity_world_stands_on_the_true_up() {
+        let level = gravity_world(Vec3::NEG_Y);
+        assert!(level.abs_diff_eq(camera_world(), 1e-6), "{level:?}");
+        // looking 19 degrees down: up is +Z, the view points down along -X
+        let a = 19_f32.to_radians();
+        let up = Vec3::new(0.0, -a.cos(), -a.sin());
+        let w = gravity_world(up);
+        assert!(w.transform_vector3(up).abs_diff_eq(Vec3::Z, 1e-6));
+        let view = w.transform_vector3(Vec3::Z);
+        assert!((view.z + a.sin()).abs() < 1e-6 && view.y.abs() < 1e-6 && view.x < 0.0);
+        assert_eq!(w.transform_point3(Vec3::ZERO), Vec3::ZERO);
+        // looking straight down: +X toward the camera's top edge
+        let down = gravity_world(Vec3::NEG_Z);
+        assert!(
+            down.transform_vector3(Vec3::NEG_Y)
+                .abs_diff_eq(Vec3::X, 1e-6)
+        );
     }
 
     #[test]
