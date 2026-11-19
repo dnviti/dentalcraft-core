@@ -28,6 +28,7 @@
 //! | `scan.undo`, `scan.redo` | none | `{done, editor}` |
 //! | `scan.export` | `path`, `what` (`cloud` / `mesh` / `stops`: a directory, see [`crate::reconstruct::write_stops`]) | `{path, what}` (+ `stops`) |
 //! | `scan.import` | `role?` | run by the host |
+//! | `scan.close` | none | `{}`; ends the session (discards the scan, disconnects the scanner and the turntable); refused with `invalid-state` while a scan or a job runs; a host with a scan window closes it |
 //! | `scan.auto` | `tilts_deg?`, `rotation_deg?`, `mode?`, `step_deg?`, `frames_per_stop?`, `deg_per_s?`, `settle_s?`, `finish?`, `resolution_mm?`, `refine?` | `{started, steps}`; runs in the background |
 //! | `turntable.devices` | `timeout_s?` | `{devices, backends}` |
 //! | `turntable.connect` | `backend?`, `device?`, `options?` (sim only) | `{turntable, axes, calibrated}` |
@@ -97,6 +98,10 @@ pub const SCAN_EXPORT: &str = "scan.export";
 /// `scan.import`: executed by the host (it needs the case), not by the
 /// controller.
 pub const SCAN_IMPORT: &str = "scan.import";
+/// `scan.close`: ends the scan session (the scan is discarded, the scanner
+/// and the turntable are disconnected); a host with a scan window closes it
+/// too. Refused while a scan or a job runs.
+pub const SCAN_CLOSE: &str = "scan.close";
 /// `scan.auto`: automatic turntable scan, in the background.
 pub const SCAN_AUTO: &str = "scan.auto";
 /// `turntable.devices`.
@@ -173,6 +178,7 @@ pub fn command_infos() -> Vec<ScanCommandInfo> {
         info!(SCAN_REDO, "redo", NoParams),
         info!(SCAN_EXPORT, "export", ExportParams),
         info!(SCAN_IMPORT, "import", ImportParams),
+        info!(SCAN_CLOSE, "close", NoParams),
         info!(SCAN_AUTO, "auto", rig::AutoParams),
         info!(
             TURNTABLE_DEVICES,
@@ -658,6 +664,11 @@ impl ScanController {
                 let p: ExportParams = parse(params)?;
                 self.export(&p)
             }
+            SCAN_CLOSE => {
+                let NoParams {} = parse(params)?;
+                self.close_scan()?;
+                Ok(json!({}))
+            }
             SCAN_IMPORT => Err(ScanError::InvalidParams(format!(
                 "{SCAN_IMPORT} is run by the host (it needs the case)"
             ))),
@@ -927,7 +938,7 @@ mod tests {
             assert_eq!(i.doc_key, format!("{prefix}{name}-doc"));
             assert_eq!((i.params_schema)()["type"], "object", "{}", i.id);
         }
-        assert_eq!(infos.len(), 29);
+        assert_eq!(infos.len(), 30);
         assert!(is_scan_command(TURNTABLE_MOVE) && is_turntable_command(TURNTABLE_MOVE));
         assert!(!is_turntable_command(SCAN_AUTO));
         assert!(!is_scan_command("case.import"));
@@ -953,6 +964,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn close_ends_the_session_unless_a_scan_runs() {
+        let mut c = ScanController::new();
+        // nothing connected: closing is fine and does nothing
+        run(&mut c, SCAN_CLOSE, json!({})).unwrap();
+        assert_eq!(
+            run(&mut c, SCAN_CLOSE, json!({"x": 1})).unwrap_err().code(),
+            "invalid-params"
+        );
+        let sim = json!({"backend": "sim", "options": {"realtime": false, "frames": 5,
+                         "width": 80, "height": 50}});
+        run(&mut c, SCAN_CONNECT, sim).unwrap();
+        run(&mut c, SCAN_START, json!({})).unwrap();
+        // scanning: refused, the scan goes on
+        let refused = run(&mut c, SCAN_CLOSE, json!({})).unwrap_err();
+        assert_eq!(refused.code(), "invalid-state");
+        assert_eq!(c.session().status().state, ScanState::Scanning);
+        run(&mut c, SCAN_STOP, json!({})).unwrap();
+        // stopped: closing discards the scan and disconnects the scanner
+        run(&mut c, SCAN_CLOSE, json!({})).unwrap();
+        assert_eq!(c.session().status().state, ScanState::Idle);
+        assert!(c.editor().is_none());
+    }
     #[test]
     fn bad_parameters_and_states_are_refused() {
         let mut c = ScanController::new();

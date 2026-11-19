@@ -405,6 +405,29 @@ impl ScanController {
         self.reap_rig(false);
     }
 
+    /// Ends the scan session (`scan.close`): the scan and its edits are
+    /// discarded, the scanner and the turntable disconnected.
+    ///
+    /// # Errors
+    /// [`ScanError::InvalidState`] while a rig job runs or the acquisition
+    /// is scanning or paused (stop or reset it first).
+    pub(crate) fn close_scan(&mut self) -> Result<()> {
+        let state = self.session.status().state;
+        if self.rig.job_running() || matches!(state, ScanState::Scanning | ScanState::Paused) {
+            return Err(ScanError::InvalidState {
+                action: "close",
+                state,
+            });
+        }
+        self.reap_rig(true);
+        self.session.reset();
+        self.editor = None;
+        self.rig.table = None;
+        self.session.disconnect();
+        self.apply_rig();
+        Ok(())
+    }
+
     /// Finalises a finished job: after a calibration the acquisition is
     /// reset and the new calibration applied; after `scan.auto` the
     /// acquisition goes on paused. With `cancel`, a running job is
