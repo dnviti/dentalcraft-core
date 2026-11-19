@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use dc_turntable::sim::{self as table_sim, SimRig, SimTurntableBackend};
 use dc_turntable::{
-    AngleProbe, AxisInfo, AxisKind, Turntable, TurntableBackend, TurntableError, TurntableInfo,
-    axis_of,
+    AngleProbe, AxisInfo, AxisKind, LinkProbe, Turntable, TurntableBackend, TurntableError,
+    TurntableInfo, axis_of,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -26,8 +26,8 @@ use super::jobs::{
 };
 use super::{
     AUTO_FRAMES_PER_STOP, AUTO_RESOLUTION_MM, AUTO_STEP_DEG, AUTO_TILTS_DEG,
-    RECONSTRUCT_RESOLUTION_MM, RigCalibration, RigJobKind, RigJobStatus, TurntableStatus,
-    calibration_json,
+    RECONSTRUCT_RESOLUTION_MM, RigCalibration, RigJobKind, RigJobState, RigJobStatus,
+    TurntableStatus, calibration_json,
 };
 use crate::control::{
     NoParams, SCAN_AUTO, TURNTABLE_CALIBRATE, TURNTABLE_CALIBRATION, TURNTABLE_CONNECT,
@@ -171,6 +171,8 @@ struct Connected {
     info: TurntableInfo,
     axes: Vec<AxisInfo>,
     probe: Option<AngleProbe>,
+    /// Whether its link is up, when it can drop.
+    link: Option<LinkProbe>,
 }
 
 /// Waits for the end of a manual move without holding the controller.
@@ -347,7 +349,7 @@ impl ScanController {
             .as_ref()
             .is_some_and(|w| !w.handle.is_finished());
         TurntableStatus {
-            connected: true,
+            connected: c.link.as_ref().is_none_or(|up| up()),
             info: Some(c.info.clone()),
             axes: c.axes.clone(),
             rotate_deg: angles.rotate_deg,
@@ -449,9 +451,26 @@ impl ScanController {
                         Ok(editor) => self.editor = Some(editor),
                         Err(e) => shared.fail(&e),
                     }
+                } else if Self::kept_partial(&shared.status()) {
+                    // a stop-and-capture scan that failed or was cancelled
+                    // keeps its stops: the acquisition stops, so they can be
+                    // rebuilt (`scan.reconstruct`) and exported; the job's
+                    // own error stays the one reported
+                    if let Ok(cloud) = self.session.stop() {
+                        self.editor = Some(ScanEditor::new(cloud));
+                    }
                 }
+                let kept = self.session.kept_stops().map(|k| k.stops.len() as u32);
+                shared.set_kept_stops(kept);
             }
         }
+    }
+
+    /// A `scan.auto` that ended without a finish (failed or cancelled)
+    /// after capturing stops.
+    fn kept_partial(s: &RigJobStatus) -> bool {
+        matches!(s.state, RigJobState::Failed | RigJobState::Cancelled)
+            && s.quality.as_ref().is_some_and(|q| q.stops > 0)
     }
 
     /// Gives the session the calibration matching the connected scanner
@@ -671,11 +690,13 @@ impl ScanController {
         let info = table.info();
         let axes = table.axes();
         let probe = table.probe();
+        let link = table.link();
         self.rig.table = Some(Connected {
             table: Arc::new(Mutex::new(table)),
             info: info.clone(),
             axes: axes.clone(),
             probe,
+            link,
         });
         self.apply_rig();
         Ok(json!({
@@ -911,6 +932,30 @@ mod tests {
     fn run(c: &mut ScanController, id: &str, params: Value) -> Value {
         c.execute(id, &params, &|| false)
             .unwrap_or_else(|e| panic!("{id} {params}: {e}"))
+    }
+
+    #[test]
+    fn the_status_shows_a_dropped_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = ScanController::new();
+        c.set_rig_dir(dir.path());
+        run(&mut c, TURNTABLE_CONNECT, json!({"backend": "sim"}));
+        assert!(c.turntable_status().connected);
+        c.sim_rig().inject_link_drop(0, true);
+        let s = run(&mut c, TURNTABLE_STATUS, json!({}));
+        assert_eq!(s["connected"], false, "{s}");
+        assert_eq!(s["info"]["id"], "sim-turntable", "{s}");
+        let err = c
+            .execute(
+                TURNTABLE_MOVE,
+                &json!({"axis": "rotate", "by_deg": 10.0}),
+                &|| false,
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), "ble-disconnected");
+        // connecting again gives a working table
+        run(&mut c, TURNTABLE_CONNECT, json!({"backend": "sim"}));
+        assert!(c.turntable_status().connected);
     }
 
     #[test]

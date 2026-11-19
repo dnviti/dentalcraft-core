@@ -38,6 +38,17 @@
 //! stops every `step_deg` (and at `+t` / `-t` on a dual-axis table), then
 //! [`calib::measure`] (see there). A refused calibration fails the job with
 //! its code and leaves the residuals in the status.
+//!
+//! **Link drops**: when the link to the table drops (a Bluetooth
+//! disconnection, or a protocol error or a timeout followed by the drop
+//! within [`LINK_LOSS_GRACE`]) the job reconnects the table
+//! ([`Turntable::reconnect`], at most [`RECONNECT_TIMEOUT`]), waits for it
+//! to stand still and does again what failed: a move is sent again from
+//! where the table is (the targets are absolute angles of the pass), a
+//! reading is taken again, so the pass goes on at the stop where it was.
+//! The status counts the reconnections (`reconnects`); a link that does
+//! not come back, or more than [`MAX_RECONNECTS`] drops, fails the job
+//! (`ble-disconnected`), and the controller keeps the stops fused so far.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -46,7 +57,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use dc_geom::finish::{FinishParams, FinishStage, finish_mesh};
 use dc_mesh::TriMesh;
-use dc_turntable::{AxisKind, Turntable, TurntableError};
+use dc_turntable::{AxisKind, LinkProbe, Turntable, TurntableError};
 
 use super::calib::{self, CalibrationStop};
 use super::{
@@ -110,6 +121,14 @@ pub const WARN_SCAN_QUALITY_WEAK: &str = "scan-quality-weak";
 /// Steps of the finish of `scan.auto`: refine, fuse, extract, clean, fill
 /// holes, optimise.
 pub(crate) const FINISH_STEPS: u32 = 6;
+/// Longest wait for a dropped link to the table to come back, per drop.
+pub(crate) const RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Link drops a job recovers from; one more fails it.
+pub(crate) const MAX_RECONNECTS: u32 = 10;
+/// After a protocol error or a timeout with the link still reported up,
+/// how long the job waits for the system to report a drop: a radio drop
+/// is known only after the supervision timeout of the link (seconds).
+const LINK_LOSS_GRACE: Duration = Duration::from_secs(6);
 
 /// The raw and the finished mesh of a `scan.auto` finish.
 pub(crate) type FinishedMeshes = (TriMesh, TriMesh);
@@ -140,6 +159,9 @@ impl JobShared {
                 quality: None,
                 reconstruction: None,
                 finish: None,
+                reconnects: 0,
+                reconnecting: false,
+                kept_stops: None,
             }),
             result: Mutex::new(None),
             meshes: Mutex::new(None),
@@ -182,6 +204,12 @@ impl JobShared {
         s.error = Some(e.code().to_owned());
         s.error_detail = Some(e.to_string());
     }
+
+    /// The controller finalised a stop-and-capture `scan.auto`: `n` stops
+    /// are kept for the reconstruction and the export.
+    pub fn set_kept_stops(&self, n: Option<u32>) {
+        self.lock().kept_stops = n;
+    }
 }
 
 /// A running job.
@@ -215,6 +243,8 @@ impl Job {
 /// What a job works with.
 struct Ctx {
     table: TableHandle,
+    /// Whether the link to the table is up, when it can drop.
+    table_link: Option<LinkProbe>,
     link: RigLink,
     job: Arc<JobShared>,
 }
@@ -244,13 +274,100 @@ impl Ctx {
     /// controller's job stops only the watch of that motion), and a stop
     /// taken while the table turns ruins the registration of its pair.
     fn wait_still(&self) -> Result<()> {
-        let mut t = lock(&self.table);
+        self.on_table(|t| self.settle_axes(t))
+    }
+
+    /// Waits for every axis of `t` to stand still.
+    fn settle_axes(&self, t: &mut dyn Turntable) -> dc_turntable::Result<()> {
         for axis in t.axes() {
             t.wait_settled(axis.kind, rotation_timeout(360.0, None), &|| {
                 self.cancelled()
             })?;
         }
         Ok(())
+    }
+
+    /// Runs `f` on the table; when the link to the table dropped,
+    /// reconnects it and runs `f` again, so `f` must re-read where the
+    /// table is rather than assume it.
+    fn on_table<T>(
+        &self,
+        mut f: impl FnMut(&mut dyn Turntable) -> dc_turntable::Result<T>,
+    ) -> Result<T> {
+        loop {
+            let r = f(lock(&self.table).as_mut());
+            match r {
+                Err(e) if !self.cancelled() && self.lost_link(&e) => self.reconnect(e)?,
+                r => return Ok(r?),
+            }
+        }
+    }
+
+    /// `e` comes from a dropped link: a disconnection, or a protocol error
+    /// or a timeout while the link drops (it shows only after the
+    /// supervision timeout of the radio, [`LINK_LOSS_GRACE`]).
+    fn lost_link(&self, e: &TurntableError) -> bool {
+        if e.link_lost() {
+            return true;
+        }
+        let Some(up) = &self.table_link else {
+            return false;
+        };
+        if !up() {
+            return true;
+        }
+        if !matches!(e, TurntableError::Protocol(_) | TurntableError::Timeout(_)) {
+            return false;
+        }
+        let end = Instant::now() + LINK_LOSS_GRACE;
+        while Instant::now() < end && !self.cancelled() {
+            std::thread::sleep(Duration::from_millis(50));
+            if !up() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The link dropped (`cause`): reconnects the table and waits for it to
+    /// stand still (the move under way at the drop goes on), again after
+    /// every new drop meanwhile.
+    ///
+    /// # Errors
+    /// [`ScanError::Cancelled`]; `ble-disconnected`
+    /// ([`TurntableError::Reconnect`]) when the link does not come back
+    /// within [`RECONNECT_TIMEOUT`] or dropped more than
+    /// [`MAX_RECONNECTS`] times.
+    fn reconnect(&self, mut cause: TurntableError) -> Result<()> {
+        loop {
+            if self.job.lock().reconnects >= MAX_RECONNECTS {
+                return Err(TurntableError::Reconnect(format!(
+                    "the link dropped more than {MAX_RECONNECTS} times ({cause})"
+                ))
+                .into());
+            }
+            self.job.lock().reconnecting = true;
+            let mut t = lock(&self.table);
+            let back = t.reconnect(RECONNECT_TIMEOUT, &|| self.cancelled());
+            self.job.lock().reconnecting = false;
+            match back {
+                Ok(()) => self.job.lock().reconnects += 1,
+                Err(TurntableError::Cancelled) => return Err(ScanError::Cancelled),
+                Err(e) => {
+                    return Err(TurntableError::Reconnect(format!("{e} (dropped: {cause})")).into());
+                }
+            }
+            match self.settle_axes(t.as_mut()) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    drop(t);
+                    if self.cancelled() || !self.lost_link(&e) {
+                        return Err(e.into());
+                    }
+                    cause = e;
+                }
+            }
+        }
     }
 
     /// Starts the next step; `tilt` updates the tilt of the pass.
@@ -298,42 +415,55 @@ impl Ctx {
     }
 
     fn rotation(&self) -> Result<f32> {
-        lock(&self.table)
-            .position(AxisKind::Rotate)?
+        self.on_table(|t| t.position(AxisKind::Rotate))?
             .ok_or_else(|| ScanError::Calibration("the turntable reports no rotation".into()))
     }
 
-    /// Moves to `target` and waits for the end of the motion. When
-    /// `pausable`, a user pause stops the table and the rest of the motion
-    /// is sent again on resume.
+    /// Sets the rotation speed, and the tilt speed of the jobs when `tilt`.
+    fn set_speeds(&self, rotate_deg_per_s: f32, tilt: bool) -> Result<()> {
+        self.on_table(|t| {
+            t.set_speed(AxisKind::Rotate, rotate_deg_per_s)?;
+            if tilt {
+                t.set_speed(AxisKind::Tilt, TILT_DEG_PER_S)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Moves to `target` and waits for the end of the motion, each attempt
+    /// within `timeout`. When `pausable`, a user pause stops the table and
+    /// the rest of the motion is sent again on resume; after a dropped
+    /// link it is sent again from where the table stands.
     fn run_move(&self, target: Target, timeout: Duration, pausable: bool) -> Result<()> {
-        let deadline = Instant::now() + timeout;
         loop {
             if pausable {
                 self.wait_unpaused()?;
             }
             self.check()?;
-            let mut t = lock(&self.table);
-            let axis = match target {
-                Target::Rotate(to) => {
-                    let now = t.position(AxisKind::Rotate)?.unwrap_or(to);
-                    if (to - now).abs() > 0.05 {
-                        t.move_by(AxisKind::Rotate, to - now)?;
-                    }
-                    AxisKind::Rotate
-                }
-                Target::Tilt(to) => {
-                    t.move_to(AxisKind::Tilt, to)?;
-                    AxisKind::Tilt
-                }
-            };
             let interrupted = || self.cancelled() || (pausable && self.link.paused());
-            let left = deadline.saturating_duration_since(Instant::now());
-            match t.wait_settled(axis, left, &interrupted) {
-                Ok(()) => return Ok(()),
-                // paused: stop now, send the rest after the resume
-                Err(TurntableError::Cancelled) if !self.cancelled() => t.stop()?,
-                Err(e) => return Err(e.into()),
+            let arrived = self.on_table(|t| {
+                let axis = match target {
+                    Target::Rotate(to) => {
+                        let now = t.position(AxisKind::Rotate)?.unwrap_or(to);
+                        if (to - now).abs() > 0.05 {
+                            t.move_by(AxisKind::Rotate, to - now)?;
+                        }
+                        AxisKind::Rotate
+                    }
+                    Target::Tilt(to) => {
+                        t.move_to(AxisKind::Tilt, to)?;
+                        AxisKind::Tilt
+                    }
+                };
+                match t.wait_settled(axis, timeout, &interrupted) {
+                    Ok(()) => Ok(true),
+                    // paused: stop now, send the rest after the resume
+                    Err(TurntableError::Cancelled) if !self.cancelled() => t.stop().map(|()| false),
+                    Err(e) => Err(e),
+                }
+            })?;
+            if arrived {
+                return Ok(());
             }
         }
     }
@@ -380,8 +510,10 @@ fn spawn(
     body: impl FnOnce(&Ctx) -> Result<()> + Send + 'static,
 ) -> Result<Job> {
     let shared = JobShared::new(kind, steps);
+    let table_link = lock(&table).link();
     let ctx = Ctx {
         table,
+        table_link,
         link,
         job: Arc::clone(&shared),
     };
@@ -584,16 +716,7 @@ fn tilt_to(ctx: &Ctx, plan: &AutoPlan, tilt: f32) -> Result<()> {
 }
 
 fn auto_stops(ctx: &Ctx, plan: &AutoPlan, step_deg: f32, frames: usize) -> Result<ScanQuality> {
-    {
-        let mut t = lock(&ctx.table);
-        t.set_speed(
-            AxisKind::Rotate,
-            plan.deg_per_s.unwrap_or(STOP_MOVE_DEG_PER_S),
-        )?;
-        if plan.has_tilt {
-            t.set_speed(AxisKind::Tilt, TILT_DEG_PER_S)?;
-        }
-    }
+    ctx.set_speeds(plan.deg_per_s.unwrap_or(STOP_MOVE_DEG_PER_S), plan.has_tilt)?;
     let wait = settle(plan.settle, ctx.link.latency());
     let speed = plan.deg_per_s.unwrap_or(STOP_MOVE_DEG_PER_S);
     let timeout = rotation_timeout(step_deg, Some(speed));
@@ -656,13 +779,7 @@ fn auto_continuous(ctx: &Ctx, plan: &AutoPlan) -> Result<ScanQuality> {
             (CONTINUOUS_DEG_PER_FRAME * fps).clamp(CONTINUOUS_DEG_PER_S.0, CONTINUOUS_DEG_PER_S.1)
         }
     };
-    {
-        let mut t = lock(&ctx.table);
-        t.set_speed(AxisKind::Rotate, speed)?;
-        if plan.has_tilt {
-            t.set_speed(AxisKind::Tilt, TILT_DEG_PER_S)?;
-        }
-    }
+    ctx.set_speeds(speed, plan.has_tilt)?;
     let wait = settle(plan.settle, ctx.link.latency());
     let timeout = rotation_timeout(plan.rotation_deg, Some(speed));
     let mut quality = ScanQuality::default();
@@ -736,13 +853,7 @@ pub(crate) fn start_calibration(
 }
 
 fn calibrate(ctx: &Ctx, plan: &CalibrationPlan) -> Result<RigCalibration> {
-    {
-        let mut t = lock(&ctx.table);
-        t.set_speed(AxisKind::Rotate, STOP_MOVE_DEG_PER_S)?;
-        if plan.tilt_deg.is_some() {
-            t.set_speed(AxisKind::Tilt, TILT_DEG_PER_S)?;
-        }
-    }
+    ctx.set_speeds(STOP_MOVE_DEG_PER_S, plan.tilt_deg.is_some())?;
     ctx.link.set_hold(true);
     if plan.tilt_deg.is_some() {
         ctx.step(Some(0.0));

@@ -233,6 +233,19 @@ pub struct RigJobStatus {
     /// done).
     #[serde(default)]
     pub finish: Option<dc_geom::finish::FinishReport>,
+    /// Times the link to the table dropped during the job and came back:
+    /// the job resumed at the stop where it was. A warning when not zero.
+    #[serde(default)]
+    pub reconnects: u32,
+    /// The link to the table dropped and the job is reconnecting it now
+    /// (at most 30 s; the job fails when it does not come back).
+    #[serde(default)]
+    pub reconnecting: bool,
+    /// `scan.auto` stop-and-capture, once ended: the stops kept for
+    /// `scan.reconstruct` and `scan.export` `stops`, also when the job
+    /// failed or was cancelled (`null` without any).
+    #[serde(default)]
+    pub kept_stops: Option<u32>,
 }
 
 /// Default tilts of `scan.auto` (degrees): five passes over the table's
@@ -273,7 +286,9 @@ pub struct ScanQuality {
 /// What `turntable.status` returns.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct TurntableStatus {
-    /// A turntable is connected.
+    /// A turntable is connected and its link is up. `false` with `info`
+    /// set: the link dropped; a running job reconnects it by itself,
+    /// otherwise `turntable.connect` again.
     pub connected: bool,
     /// Its identity.
     pub info: Option<TurntableInfo>,
