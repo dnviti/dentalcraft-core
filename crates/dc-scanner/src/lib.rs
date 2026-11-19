@@ -266,7 +266,8 @@ pub trait ScannerDevice: Send {
         Ok(())
     }
     /// How long before its arrival a frame shows the scene, about: the
-    /// turntable angle of a frame is read that long before it arrived.
+    /// turntable angle of a frame is read that long before it arrived. It
+    /// may follow the frame rate: the acquisition asks at every frame.
     fn latency(&self) -> Duration {
         Duration::ZERO
     }

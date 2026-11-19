@@ -144,8 +144,10 @@ pub struct UsbOptions {
     /// Keep the infrared pair of the latest frame
     /// ([`RevopointUsbDevice::latest_ir`]).
     pub keep_ir: bool,
-    /// How long before its arrival a frame shows the scene: 0.7 to 1.1 s
-    /// measured on a MINI 2 (2026-11-18), see [`crate::ScannerDevice::latency`].
+    /// How long before its arrival a frame shows the scene until the frame
+    /// period of the stream is known (then it follows the period): 0.7 to
+    /// 1.1 s measured on a MINI 2 at 2.74 frames per second (2026-11-18),
+    /// see [`crate::ScannerDevice::latency`].
     pub latency: Duration,
 }
 

@@ -460,7 +460,10 @@ impl RigLink {
         self.0.live().fps
     }
 
-    /// The latency of the device ([`ScannerDevice::latency`]).
+    /// The latency of the device ([`ScannerDevice::latency`]) when the
+    /// acquisition started, before its frame rate is known: the
+    /// conservative one the rig jobs settle on (the angle of each frame is
+    /// read with the latency of the moment).
     pub fn latency(&self) -> Duration {
         self.0.live().latency
     }
@@ -1270,8 +1273,7 @@ fn acquire(
     let mut extracted_at = shared.live().fused_frames;
     let mut last_publish: Option<Instant> = None;
     let mut last_frame: Option<Instant> = None;
-    let latency = device.latency();
-    shared.live().latency = latency;
+    shared.live().latency = device.latency();
     let mut history = AngleHistory::default();
     let probe_angles = |probe: &Option<dc_turntable::AngleProbe>| {
         probe
@@ -1321,8 +1323,9 @@ fn acquire(
             break;
         }
         let paused = shared.paused.load(Ordering::SeqCst) || shared.hold.load(Ordering::SeqCst);
-        // the turntable angles when the frame was taken
-        let angles = history.at(arrived.checked_sub(latency).unwrap_or(arrived));
+        // the turntable angles when the frame was taken (the latency of a
+        // device may follow its frame rate)
+        let angles = history.at(arrived.checked_sub(device.latency()).unwrap_or(arrived));
         let request = shared.io().request;
         let capture = match request {
             Some(RigRequest::Capture(c)) => Some(c),

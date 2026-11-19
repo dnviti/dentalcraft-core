@@ -109,6 +109,8 @@ impl ScannerBackend for RevopointUsbBackend {
             light_note: None,
             fast_exposure: false,
             exposure_note: None,
+            last_frame_us: None,
+            period: None,
         }))
     }
 }
@@ -157,6 +159,38 @@ pub struct RevopointUsbDevice {
     fast_exposure: bool,
     /// Why the exposure profile was not applied, once.
     exposure_note: Option<String>,
+    /// Driver timestamp of the latest complete frame dequeued (µs).
+    last_frame_us: Option<u64>,
+    /// Smoothed frame period of the stream, once two frames came.
+    period: Option<Duration>,
+}
+
+/// Latency of a frame beyond its period, and in frame periods: a MINI 2
+/// frame shows the scene `LATENCY_BASE + LATENCY_PERIODS × period` before
+/// it arrives (against the turntable's own angle estimate). Fitted on the
+/// rig: 0.7 to 1.1 s at 2.74 frames per second (2026-11-18), 0.35 to 0.40 s
+/// at 11.2 (fast exposure, 2026-11-19).
+const LATENCY_BASE: Duration = Duration::from_millis(200);
+const LATENCY_PERIODS: f32 = 1.9;
+
+/// The latency of a frame of a stream with frame period `period` (see
+/// [`LATENCY_BASE`]); `fallback` before the period is known.
+fn latency_of(period: Option<Duration>, fallback: Duration) -> Duration {
+    period.map_or(fallback, |p| LATENCY_BASE + p.mul_f32(LATENCY_PERIODS))
+}
+
+/// Updates the smoothed frame `period` with a frame dequeued at
+/// `timestamp_us` (driver clock), `last_us` being the previous one; gaps
+/// outside 5 ms to 1 s (a restart, a stall) do not count.
+fn note_frame(last_us: &mut Option<u64>, period: &mut Option<Duration>, timestamp_us: u64) {
+    if let Some(dt) = last_us
+        .and_then(|last| timestamp_us.checked_sub(last))
+        .filter(|dt| (5_000..=1_000_000).contains(dt))
+    {
+        let dt = Duration::from_micros(dt);
+        *period = Some(period.map_or(dt, |p| p.mul_f32(0.9) + dt.mul_f32(0.1)));
+    }
+    *last_us = Some(timestamp_us);
 }
 
 impl std::fmt::Debug for RevopointUsbDevice {
@@ -335,6 +369,9 @@ impl RevopointUsbDevice {
             });
         }
         self.reconnect_deadline = None;
+        // the next stream may run at another rate
+        self.last_frame_us = None;
+        self.period = None;
     }
 
     /// One reconnection step: waits at most `timeout`.
@@ -441,11 +478,13 @@ impl ScannerDevice for RevopointUsbDevice {
                 // frames queued behind it are newer: keep the newest, so
                 // the frame and the turntable angle read now stay close
                 let mut timestamp_us = dq.timestamp_us;
+                note_frame(&mut self.last_frame_us, &mut self.period, timestamp_us);
                 for _ in 0..self.options.buffers {
                     match capture.next(Duration::ZERO, &mut self.spare) {
                         Ok(Some(next)) if next.bytes >= full => {
                             std::mem::swap(&mut self.buf, &mut self.spare);
                             timestamp_us = next.timestamp_us;
+                            note_frame(&mut self.last_frame_us, &mut self.period, timestamp_us);
                         }
                         Ok(Some(_)) => {}
                         // a failure surfaces at the next call
@@ -465,7 +504,7 @@ impl ScannerDevice for RevopointUsbDevice {
     }
 
     fn latency(&self) -> Duration {
-        self.options.latency
+        latency_of(self.period, self.options.latency)
     }
 }
 
@@ -492,5 +531,32 @@ mod tests {
                 .code(),
             "device-not-found"
         );
+    }
+
+    #[test]
+    fn latency_follows_the_frame_period_measured_on_the_rig() {
+        let fallback = UsbOptions::default().latency;
+        assert_eq!(latency_of(None, fallback), fallback);
+        let at = |fps: f64| latency_of(Some(Duration::from_secs_f64(1.0 / fps)), fallback);
+        // 0.7 to 1.1 s at 2.74 fps, 0.35 to 0.40 s at 11.2 fps (fast exposure)
+        assert!(
+            (0.7..=1.1).contains(&at(2.74).as_secs_f64()),
+            "{:?}",
+            at(2.74)
+        );
+        assert!(
+            (0.35..=0.40).contains(&at(11.2).as_secs_f64()),
+            "{:?}",
+            at(11.2)
+        );
+
+        // the period comes from consecutive frames; a stall does not count
+        let (mut last, mut period) = (None, None);
+        for k in 0..20u64 {
+            note_frame(&mut last, &mut period, 1_000_000 + k * 89_000);
+        }
+        note_frame(&mut last, &mut period, 1_000_000 + 19 * 89_000 + 3_000_000);
+        let p = period.unwrap().as_secs_f64();
+        assert!((p - 0.089).abs() < 1e-4, "{p}");
     }
 }
