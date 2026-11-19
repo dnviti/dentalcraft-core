@@ -361,6 +361,57 @@ fn parallel_cells_keep_tolerance_and_topology() {
     );
 }
 
+/// The surface bound keeps the edge midpoints and face centroids within
+/// the tolerance, the edge cap every edge, and the normal cap keeps more
+/// faces; `decimate_against` holds the bound against the reference.
+#[test]
+fn surface_bound_normal_and_edge_caps() {
+    let mesh = noisy_surface(90, 0.01);
+    let tol = 0.05;
+    let p = DecimateParams {
+        surface_tolerance: true,
+        max_normal_angle_deg: 10.0,
+        max_edge: 1.5,
+        ..DecimateParams::to_tolerance(tol)
+    };
+    let d = decimate(&mesh, &p).unwrap();
+    assert_clean(&mesh, &d.mesh);
+    assert!(hausdorff(&mesh, &d.mesh) <= tol + 1e-5);
+    let bvh = Bvh::build(&mesh).unwrap();
+    let out = &d.mesh;
+    for t in &out.tris {
+        let [a, b, c] = t.map(|v| out.positions[v as usize]);
+        for q in [
+            (a + b) * 0.5,
+            (b + c) * 0.5,
+            (c + a) * 0.5,
+            (a + b + c) / 3.0,
+        ] {
+            let h = bvh.closest_point(q, f32::INFINITY).unwrap();
+            assert!(f64::from(h.distance) <= tol + 1e-5, "{}", h.distance);
+        }
+        for (x, y) in [(a, b), (b, c), (c, a)] {
+            assert!(x.distance(y) <= 1.5 + 1e-4, "{}", x.distance(y));
+        }
+    }
+    let fewer = decimate(&mesh, &DecimateParams::to_tolerance(tol)).unwrap();
+    assert!(d.mesh.face_count() > fewer.mesh.face_count());
+    assert!(d.mesh.face_count() < mesh.face_count() / 2);
+
+    // against a reference: the mesh moved within the tolerance
+    let mut moved = mesh.clone();
+    for q in &mut moved.positions {
+        q.z += 0.02;
+    }
+    let d = decimate_against(&moved, &mesh, &p).unwrap();
+    assert!(directed(&mesh, &d.mesh) <= tol + 1e-5);
+    assert!(directed(&d.mesh, &mesh) <= tol + 1e-5);
+    for q in &mut moved.positions {
+        q.z += 0.04;
+    }
+    assert!(decimate_against(&moved, &mesh, &p).is_err());
+}
+
 #[test]
 fn vertex_labels_are_preserved() {
     let mut mesh = sphere(5);

@@ -15,10 +15,18 @@
 //!    longest, the open base of the scan, is triangulated, refined to the
 //!    surrounding edge length and faired to the curvature of the
 //!    surrounding surface.
-//! 3. **Optimise** ([`crate::qem`]): quadric error decimation within
-//!    [`FinishParams::max_error_mm`] (every vertex of the input stays within
-//!    that distance of the output and back), the border kept in place. The
-//!    quadrics keep sharp features; nothing is smoothed.
+//! 3. **Optimise**: the surface is first denoised ([`crate::denoise`],
+//!    bilateral normal filtering; every vertex moves at most
+//!    [`FinishParams::denoise_mm`]) so the ~0.1 mm grain of the scan is not
+//!    baked into the result, then decimated ([`crate::qem`]) against the
+//!    surface before denoising, within [`FinishParams::max_error_mm`]:
+//!    every vertex of that surface stays within that distance of the
+//!    output, and every vertex, edge midpoint and face centroid of the
+//!    output within it of that surface. No face turns more than
+//!    [`FinishParams::max_normal_deg`] from the surface and no edge grows
+//!    beyond [`FinishParams::max_edge_mm`], so curved crowns keep enough
+//!    faces to look smooth when shaded flat. The border stays in place;
+//!    the quadrics keep sharp features.
 //!
 //! [`FinishReport`] counts what every stage did.
 
@@ -29,12 +37,19 @@ use glam::Vec3;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::denoise::{DenoiseParams, denoise};
 use crate::holefill::{Edges, HoleFillParams, fill_holes};
-use crate::qem::{DecimateParams, decimate};
+use crate::qem::{DecimateParams, decimate_against};
 use crate::{GeomError, Result};
 
 /// Default largest distance the optimisation may move the surface (mm).
 pub const DEFAULT_MAX_ERROR_MM: f32 = 0.015;
+/// Default largest distance the denoising may move a vertex (mm).
+pub const DEFAULT_DENOISE_MM: f32 = 0.01;
+/// Default largest angle between an optimised face and the surface (°).
+pub const DEFAULT_MAX_NORMAL_DEG: f32 = 8.0;
+/// Default longest edge of the optimised mesh (mm).
+pub const DEFAULT_MAX_EDGE_MM: f32 = 0.3;
 /// A spike: a vertex farther off the centroid of its neighbours, along
 /// the normal of its faces, than this many times the size of their ring
 /// (a vertex on a smooth surface or a rounded cusp at the scan resolution
@@ -59,6 +74,16 @@ pub struct FinishParams {
     pub optimise: bool,
     /// Largest distance the optimisation may move the surface (mm).
     pub max_error_mm: f32,
+    /// Largest distance the denoising before the optimisation may move a
+    /// vertex (mm; 0: no denoising). At most two thirds of
+    /// [`FinishParams::max_error_mm`] is used: the result stays within
+    /// that error of the surface before denoising.
+    pub denoise_mm: f32,
+    /// Largest angle between an optimised face and the surface (degrees,
+    /// 0: no limit).
+    pub max_normal_deg: f32,
+    /// Longest edge of the optimised mesh (mm, 0: no limit).
+    pub max_edge_mm: f32,
 }
 
 impl Default for FinishParams {
@@ -69,6 +94,9 @@ impl Default for FinishParams {
             max_hole_edges: 0,
             optimise: true,
             max_error_mm: DEFAULT_MAX_ERROR_MM,
+            denoise_mm: DEFAULT_DENOISE_MM,
+            max_normal_deg: DEFAULT_MAX_NORMAL_DEG,
+            max_edge_mm: DEFAULT_MAX_EDGE_MM,
         }
     }
 }
@@ -111,8 +139,14 @@ pub struct FinishReport {
     pub clean_s: f32,
     /// Time of the hole filling (s).
     pub holes_s: f32,
-    /// Time of the optimisation (s).
+    /// Time of the optimisation, denoising included (s).
     pub optimise_s: f32,
+    /// Largest distance the denoising moved a vertex (mm).
+    #[serde(default)]
+    pub denoise_max_mm: f32,
+    /// Time of the denoising (s).
+    #[serde(default)]
+    pub denoise_s: f32,
 }
 
 /// A stage of [`finish_mesh`], for progress reports.
@@ -148,6 +182,17 @@ pub fn finish_mesh(
         return Err(GeomError::InvalidInput(format!(
             "max_error_mm {} not in (0, 1]",
             params.max_error_mm
+        )));
+    }
+    if !(params.denoise_mm >= 0.0
+        && params.denoise_mm.is_finite()
+        && (0.0..90.0).contains(&params.max_normal_deg)
+        && params.max_edge_mm >= 0.0
+        && params.max_edge_mm.is_finite())
+    {
+        return Err(GeomError::InvalidInput(format!(
+            "denoise_mm {} (>= 0), max_normal_deg {} ([0, 90)) or max_edge_mm {} (>= 0) out of range",
+            params.denoise_mm, params.max_normal_deg, params.max_edge_mm
         )));
     }
     mesh.check()?;
@@ -196,11 +241,30 @@ pub fn finish_mesh(
     check()?;
     let t = Instant::now();
     if params.optimise {
-        let decimation = decimate(
+        // the surface before denoising is the reference of the bound
+        let reference = out.clone();
+        let t = Instant::now();
+        let bound = params.denoise_mm.min(params.max_error_mm * 2.0 / 3.0);
+        if bound > 0.0 {
+            report.denoise_max_mm = denoise(
+                &mut out,
+                &DenoiseParams {
+                    max_displacement: bound,
+                    ..DenoiseParams::default()
+                },
+            )?;
+        }
+        report.denoise_s = t.elapsed().as_secs_f32();
+        check()?;
+        let decimation = decimate_against(
             &out,
+            &reference,
             &DecimateParams {
                 max_valence: 12,
                 preserve_labels: false,
+                surface_tolerance: true,
+                max_normal_angle_deg: f64::from(params.max_normal_deg),
+                max_edge: f64::from(params.max_edge_mm),
                 ..DecimateParams::to_tolerance(f64::from(params.max_error_mm))
             },
         )?;
@@ -344,7 +408,7 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 }
 
 /// Faces of every vertex (CSR: offsets, faces).
-fn vertex_faces(mesh: &TriMesh) -> (Vec<u32>, Vec<u32>) {
+pub(crate) fn vertex_faces(mesh: &TriMesh) -> (Vec<u32>, Vec<u32>) {
     let n = mesh.positions.len();
     let mut offsets = vec![0u32; n + 1];
     for t in &mesh.tris {
@@ -461,11 +525,8 @@ fn remove_islands(mesh: &mut TriMesh, fraction: f32) -> usize {
     removed
 }
 
-/// Puts the spike vertices (see [`SPIKE_RATIO`]) on
-/// the centroid of their neighbours; returns how many moved. Border
-/// vertices stay.
-fn fix_spikes(mesh: &mut TriMesh) -> usize {
-    let (offsets, faces) = vertex_faces(mesh);
+/// Vertices on a border edge (an edge of one face).
+pub(crate) fn border_vertices(mesh: &TriMesh) -> Vec<bool> {
     let (edges, of_face) = edge_counts(&mesh.tris);
     let mut border = vec![false; mesh.positions.len()];
     for (f, t) in mesh.tris.iter().enumerate() {
@@ -476,6 +537,15 @@ fn fix_spikes(mesh: &mut TriMesh) -> usize {
             }
         }
     }
+    border
+}
+
+/// Puts the spike vertices (see [`SPIKE_RATIO`]) on
+/// the centroid of their neighbours; returns how many moved. Border
+/// vertices stay.
+fn fix_spikes(mesh: &mut TriMesh) -> usize {
+    let (offsets, faces) = vertex_faces(mesh);
+    let border = border_vertices(mesh);
     let pos = &mesh.positions;
     let tris = &mesh.tris;
     let moves: Vec<(usize, Vec3)> = (0..pos.len())

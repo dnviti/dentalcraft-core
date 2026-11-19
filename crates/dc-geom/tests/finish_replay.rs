@@ -56,18 +56,40 @@ fn samples(mesh: &TriMesh) -> (Vec<Vec3>, Vec<usize>) {
 fn finish_replay() {
     let path = std::env::var_os("DC_FINISH_IN").expect("set DC_FINISH_IN to a raw mesh");
     let raw = dc_mesh::io::read(&path).unwrap();
+    // DC_FINISH_ERR, _DENOISE, _NORMAL, _EDGE override the defaults
+    let env = |key: &str, default: f32| {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let d = FinishParams::default();
+    let params = FinishParams {
+        max_error_mm: env("DC_FINISH_ERR", d.max_error_mm),
+        denoise_mm: env("DC_FINISH_DENOISE", d.denoise_mm),
+        max_normal_deg: env("DC_FINISH_NORMAL", d.max_normal_deg),
+        max_edge_mm: env("DC_FINISH_EDGE", d.max_edge_mm),
+        ..d
+    };
     let t = Instant::now();
-    let (finished, report) =
-        finish_mesh(&raw, &FinishParams::default(), &|_| {}, &|| false).unwrap();
+    let (finished, report) = finish_mesh(&raw, &params, &|_| {}, &|| false).unwrap();
     let total = t.elapsed().as_secs_f32();
-    println!("FINISH {total:.2} s {report:?}");
+    println!("FINISH {total:.2} s {params:?} {report:?}");
     let adj = finished.edge_adjacency();
+    let mut lengths: Vec<f32> = adj
+        .iter()
+        .map(|(e, _)| finished.positions[e.0 as usize].distance(finished.positions[e.1 as usize]))
+        .collect();
+    lengths.sort_unstable_by(f32::total_cmp);
     println!(
-        "result: {} faces, {} border loops, {} non-manifold edges, {} components",
+        "result: {} faces, {} border loops, {} non-manifold edges, {} components; edge median {:.3} mm, 95 % {:.3} mm, max {:.3} mm",
         finished.face_count(),
         adj.boundary_loops().len(),
         adj.non_manifold_edge_count(),
-        finished.connected_components().len()
+        finished.connected_components().len(),
+        lengths[lengths.len() / 2],
+        lengths[lengths.len() * 95 / 100],
+        lengths[lengths.len() - 1]
     );
     // the optimisation input: the same finish without the optimisation
     let (input, _) = finish_mesh(

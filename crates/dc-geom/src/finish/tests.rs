@@ -133,7 +133,12 @@ fn finish_closes_holes_to_the_curvature_and_keeps_the_base_open() {
     mesh.positions[spike] *= 1.1;
     assert_eq!(mesh.boundary_loops().len(), 5);
 
-    let params = FinishParams::default();
+    // the test mesh is coarser than a scan: no edge or normal cap
+    let params = FinishParams {
+        max_edge_mm: 0.0,
+        max_normal_deg: 0.0,
+        ..FinishParams::default()
+    };
     let (out, report) = finish_mesh(&mesh, &params, &|_| {}, &|| false).unwrap();
     assert_eq!(report.islands_removed, 1, "{report:?}");
     assert!(report.spikes_fixed >= 1, "{report:?}");

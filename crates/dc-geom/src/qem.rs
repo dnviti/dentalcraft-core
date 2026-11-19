@@ -117,6 +117,18 @@ pub struct DecimateParams {
     /// limit). Large flat regions otherwise end in fans of dozens of thin
     /// triangles, whose tolerance check dominates the run.
     pub max_valence: usize,
+    /// With a tolerance, the midpoints of the new edges and the centroid of
+    /// every new face must also lie within it of the input surface: a
+    /// bound on the surface, not only on its vertices (a face can no longer
+    /// bridge a concave notch).
+    pub surface_tolerance: bool,
+    /// With a tolerance, no new face may turn more than this from the input
+    /// surface (degrees; the input's vertex normals interpolated at the
+    /// closest point to the face centroid; 0: no limit). Keeps curved
+    /// surfaces in enough faces to look smooth when shaded flat.
+    pub max_normal_angle_deg: f64,
+    /// No collapse may leave an edge longer than this (mm, 0: no limit).
+    pub max_edge: f64,
 }
 
 impl Default for DecimateParams {
@@ -130,6 +142,9 @@ impl Default for DecimateParams {
             boundary_weight: 100.0,
             preserve_labels: true,
             max_valence: 0,
+            surface_tolerance: false,
+            max_normal_angle_deg: 0.0,
+            max_edge: 0.0,
         }
     }
 }
@@ -183,6 +198,25 @@ pub struct Decimation {
 /// non-finite positions or invalid parameters; [`GeomError::Mesh`] for
 /// indices out of range or attributes of the wrong length.
 pub fn decimate(mesh: &TriMesh, params: &DecimateParams) -> Result<Decimation> {
+    decimate_against(mesh, mesh, params)
+}
+
+/// [`decimate`] with the tolerance measured against `reference`: the same
+/// triangles as `mesh`, every vertex at most the tolerance away from its
+/// place in `mesh` (e.g. `mesh` is `reference` denoised). Every vertex of
+/// `reference` stays within the tolerance of the result and every vertex
+/// of the result (and with [`DecimateParams::surface_tolerance`] every
+/// edge midpoint and face centroid of the new faces) within it of
+/// `reference`.
+///
+/// # Errors
+/// As [`decimate`]; [`GeomError::InvalidInput`] when `reference` has other
+/// triangles or a vertex farther than the tolerance.
+pub fn decimate_against(
+    mesh: &TriMesh,
+    reference: &TriMesh,
+    params: &DecimateParams,
+) -> Result<Decimation> {
     mesh.check()?;
     if mesh.tris.is_empty() {
         return Err(GeomError::InvalidInput("mesh has no triangles".into()));
@@ -200,17 +234,42 @@ pub fn decimate(mesh: &TriMesh, params: &DecimateParams) -> Result<Decimation> {
     {
         return Err(GeomError::InvalidInput(format!("tolerance {t} invalid")));
     }
-    if params.max_error.is_nan() || params.boundary_weight.is_nan() || params.boundary_weight < 0.0
+    if params.max_error.is_nan()
+        || params.boundary_weight.is_nan()
+        || params.boundary_weight < 0.0
+        || !(params.max_normal_angle_deg >= 0.0 && params.max_edge >= 0.0)
     {
         return Err(GeomError::InvalidInput(
-            "max_error and boundary_weight must be numbers (weight >= 0)".into(),
+            "max_error, boundary_weight, max_normal_angle_deg and max_edge must be numbers (>= 0)"
+                .into(),
         ));
+    }
+    if !std::ptr::eq(mesh, reference) {
+        if reference.tris != mesh.tris || reference.positions.len() != mesh.positions.len() {
+            return Err(GeomError::InvalidInput(
+                "the reference must have the triangles of the mesh".into(),
+            ));
+        }
+        let t = params.tolerance.unwrap_or(0.0) as f32;
+        if mesh
+            .positions
+            .iter()
+            .zip(&reference.positions)
+            .any(|(p, q)| {
+                let d = p.distance(*q);
+                d.is_nan() || d > t
+            })
+        {
+            return Err(GeomError::InvalidInput(
+                "a vertex lies farther than the tolerance from the reference".into(),
+            ));
+        }
     }
     let target = match params.ratio {
         Some(r) => (r * mesh.tris.len() as f64).ceil() as usize,
         None => params.target_faces,
     };
-    let mut d = Decimator::new(mesh, params)?;
+    let mut d = Decimator::new(mesh, reference, params)?;
     if target == 0 && d.live_faces >= PARALLEL_MIN_FACES {
         d.run_partitioned(params.max_error);
     } else {
@@ -414,6 +473,19 @@ struct Tolerance {
     bvh: Arc<Bvh>,
     /// Assignment computed by the last successful check.
     scratch: Vec<(u32, u32)>,
+    /// Check the edge midpoints and centroids of the new faces too.
+    surface: bool,
+    /// Smallest cosine between a new face and the input surface, with the
+    /// input's triangles and unit vertex normals (`None`: no limit).
+    normals: Option<NormalCap>,
+}
+
+/// The normal deviation limit of the tolerance check.
+#[derive(Clone)]
+struct NormalCap {
+    min_cos: f64,
+    tris: Arc<[[u32; 3]]>,
+    normals: Arc<[DVec3]>,
 }
 
 /// The working mesh of a run: the whole mesh, or one cell of a parallel
@@ -446,6 +518,8 @@ struct Decimator {
     ng: Vec<u32>,
     nw: Vec<u32>,
     max_valence: usize,
+    /// Squared longest edge a collapse may leave (0: no limit).
+    max_edge2: f64,
 }
 
 /// One cell of a parallel pass, decimated: its vertices (global indices,
@@ -485,7 +559,7 @@ fn degenerate(n: DVec3, a: DVec3, b: DVec3, c: DVec3) -> bool {
 }
 
 impl Decimator {
-    fn new(mesh: &TriMesh, params: &DecimateParams) -> Result<Self> {
+    fn new(mesh: &TriMesh, reference: &TriMesh, params: &DecimateParams) -> Result<Self> {
         let nv = mesh.positions.len();
         let nf = mesh.tris.len();
         let center = mesh.aabb().map_or(DVec3::ZERO, |b| b.center().as_dvec3());
@@ -629,13 +703,44 @@ impl Decimator {
                         face_pts[f as usize].push(v as u32);
                     }
                 }
+                let orig: Arc<[DVec3]> = if std::ptr::eq(mesh, reference) {
+                    pos.clone().into()
+                } else {
+                    reference
+                        .positions
+                        .iter()
+                        .map(|p| p.as_dvec3() - center)
+                        .collect()
+                };
+                // area-weighted unit vertex normals of the input
+                let normals = (params.max_normal_angle_deg > 0.0).then(|| {
+                    let normals: Arc<[DVec3]> = vfaces
+                        .par_iter()
+                        .map(|fs| {
+                            fs.iter()
+                                .map(|&f| {
+                                    let [a, b, c] = tris[f as usize].map(|v| pos[v as usize]);
+                                    normal(a, b, c)
+                                })
+                                .sum::<DVec3>()
+                                .normalize_or_zero()
+                        })
+                        .collect();
+                    NormalCap {
+                        min_cos: params.max_normal_angle_deg.to_radians().cos(),
+                        tris: tris.clone().into(),
+                        normals,
+                    }
+                });
                 Some(Tolerance {
                     tol2: t * t,
                     tol: t as f32,
-                    orig: pos.clone().into(),
+                    orig,
                     face_pts,
-                    bvh: Arc::new(Bvh::build(mesh)?),
+                    bvh: Arc::new(Bvh::build(reference)?),
                     scratch: Vec::new(),
+                    surface: params.surface_tolerance,
+                    normals,
                 })
             }
             None => None,
@@ -666,6 +771,7 @@ impl Decimator {
             ng: Vec::new(),
             nw: Vec::new(),
             max_valence: params.max_valence,
+            max_edge2: params.max_edge * params.max_edge,
         })
     }
 
@@ -998,12 +1104,15 @@ impl Decimator {
                 face_pts: points,
                 bvh: Arc::clone(&t.bvh),
                 scratch: Vec::new(),
+                surface: t.surface,
+                normals: t.normals.clone(),
             }),
             heap: Queue::default(),
             nk: Vec::new(),
             ng: Vec::new(),
             nw: Vec::new(),
             max_valence: self.max_valence,
+            max_edge2: self.max_edge2,
         };
         run.run(0, max_error);
         Cell { verts, faces, run }
@@ -1115,6 +1224,17 @@ impl Decimator {
         if !ok {
             return false;
         }
+        // edge length: every neighbour of either end joins the merged vertex
+        if self.max_edge2 > 0.0
+            && self
+                .nk
+                .iter()
+                .chain(&self.ng)
+                .filter(|&&w| w != k && w != g)
+                .any(|&w| p.x.distance_squared(self.pos[w as usize]) > self.max_edge2)
+        {
+            return false;
+        }
         // fold-over
         for &v in &[k, g] {
             for &f in &self.vfaces[v as usize] {
@@ -1185,6 +1305,38 @@ impl Decimator {
                     centre,
                     radius,
                 });
+            }
+        }
+        // the surface of the new faces: centroid and the midpoints of the
+        // edges at the merged vertex near the input, and the face turned
+        // little from it
+        if tol.surface || tol.normals.is_some() {
+            let center = self.center;
+            let near = |q: DVec3| tol.bvh.closest_point((q + center).as_vec3(), tol.tol);
+            for nf in &new_faces {
+                let Some(hit) = near(nf.centre) else {
+                    return false;
+                };
+                if let Some(cap) = &tol.normals {
+                    let t = cap.tris[hit.face as usize];
+                    let b = hit.barycentric.as_dvec3();
+                    let reference = (cap.normals[t[0] as usize] * b.x
+                        + cap.normals[t[1] as usize] * b.y
+                        + cap.normals[t[2] as usize] * b.z)
+                        .normalize_or_zero();
+                    let n = normal(nf.c[0], nf.c[1], nf.c[2]).normalize_or_zero();
+                    if reference != DVec3::ZERO && n.dot(reference) < cap.min_cos {
+                        return false;
+                    }
+                }
+                if tol.surface {
+                    for i in 0..3 {
+                        let (a, b) = (nf.c[i], nf.c[(i + 1) % 3]);
+                        if (a == p.x || b == p.x) && near((a + b) * 0.5).is_none() {
+                            return false;
+                        }
+                    }
+                }
             }
         }
         tol.scratch.clear();
