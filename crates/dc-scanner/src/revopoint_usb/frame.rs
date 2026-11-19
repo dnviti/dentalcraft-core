@@ -30,13 +30,14 @@ const DEPTH_BYTES: usize = DEPTH_WIDTH as usize * DEPTH_HEIGHT as usize * 2;
 const IR_BYTES: usize = DEPTH_WIDTH as usize * DEPTH_HEIGHT as usize;
 /// Bytes of the header in row 0 (the rest of the row is zero).
 const HEADER_BYTES: usize = 84;
-/// The first ten `u16` words of every header seen so far, except word
-/// [`HEADER_VARYING_WORD`].
+/// The first ten `u16` words of every header seen so far, except the
+/// words [`HEADER_VARYING_WORDS`].
 const HEADER_MAGIC: [u16; 10] = [0, 0, 0, 0x100, 0x160, 0, 12, 0, 0, 0];
-/// The header word that is not constant: `0x160` on 2026-11-16, `0x148` on
-/// 2026-11-18, on the same unit and firmware (meaning unknown, maybe a
-/// sensor reading). It is not checked.
-const HEADER_VARYING_WORD: usize = 4;
+/// The header words that are not constant, so not checked (same unit and
+/// firmware, meaning unknown): word 4 was `0x160` on 2026-11-16 and
+/// `0x148` on 2026-11-18 (maybe a sensor reading); word 6 is 12 in the
+/// 2400x600 stream and 11 in the 800x600 depth stream (2026-11-19).
+const HEADER_VARYING_WORDS: [usize; 2] = [4, 6];
 
 /// A `Y16` format of the depth node. The device offers the three sizes at
 /// 5, 10 and 15 fps nominal, but paces the frames itself: on one unit it
@@ -84,8 +85,8 @@ impl StreamMode {
 /// Header of a depth frame (row 0), little endian. Offsets observed on
 /// firmware with `bcdDevice` 0x0419:
 ///
-/// * bytes 0..20: ten `u16` words, always [`HEADER_MAGIC`] except word
-///   [`HEADER_VARYING_WORD`];
+/// * bytes 0..20: ten `u16` words, always [`HEADER_MAGIC`] except the
+///   words [`HEADER_VARYING_WORDS`];
 /// * bytes 20..24: `u32` device time in milliseconds;
 /// * then `f32`s: orientation quaternion `w, x, y, z` (24..40), gyroscope
 ///   (40..52), accelerometer in g (52..64, about `(0, 0, 1)` at rest),
@@ -127,7 +128,9 @@ impl FrameHeader {
 pub fn parse_header(row0: &[u8]) -> Option<FrameHeader> {
     let bytes = row0.get(..HEADER_BYTES)?;
     let word = |i: usize| u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);
-    if (0..HEADER_MAGIC.len()).any(|i| i != HEADER_VARYING_WORD && word(i) != HEADER_MAGIC[i]) {
+    if (0..HEADER_MAGIC.len())
+        .any(|i| !HEADER_VARYING_WORDS.contains(&i) && word(i) != HEADER_MAGIC[i])
+    {
         return None;
     }
     let f = |i: usize| {
@@ -219,6 +222,9 @@ mod tests {
     /// Row 0 of a real 2400x600 frame of the MINI 2 (serial
     /// `A26307475A6H01AB8`, `bcdDevice` 0x0419), scanner at rest on a desk.
     const ROW0: &[u8] = include_bytes!("../../tests/data/mini2_header_row0.bin");
+    /// Row 0 of a real 800x600 depth-only frame of the same unit
+    /// (2026-11-19), the scanner on the turntable rig looking down.
+    const ROW0_DEPTH: &[u8] = include_bytes!("../../tests/data/mini2_header_row0_depth.bin");
 
     /// A synthetic frame of `mode` with the real header, depth `depth(x, y)`
     /// for rows 1.., and infrared images filled with 1 and 2.
@@ -278,6 +284,20 @@ mod tests {
         let mut zero_q = ROW0.to_vec();
         zero_q[24..40].fill(0);
         assert_eq!(parse_header(&zero_q).unwrap().orientation, None);
+    }
+
+    #[test]
+    fn header_of_a_real_depth_only_frame() {
+        // word 6 is 11 in the depth-only stream (12 in the 2400x600 one):
+        // until 2026-11-19 every depth-only header was refused, so the
+        // frames had neither IMU nor device time
+        assert_eq!(u16::from_le_bytes([ROW0_DEPTH[12], ROW0_DEPTH[13]]), 11);
+        let h = parse_header(ROW0_DEPTH).unwrap();
+        assert!(h.orientation.is_some());
+        // the scanner looks about 19 degrees down: so leans the IMU's up
+        let up = h.up().unwrap();
+        let lean = up.angle_between(Vec3::Z).to_degrees();
+        assert!((15.0..25.0).contains(&lean), "{up} {lean}");
     }
 
     #[test]
