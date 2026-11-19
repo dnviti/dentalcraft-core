@@ -8,7 +8,9 @@
 //! little-endian `u16` per frame in 1/200 mm, `meta.csv` with the phase,
 //! the stop and the reported angles of every frame). Run with
 //! `DC_SCAN_DATA=/var/tmp/dc-scan-data cargo test --release -p dc-scanner
-//! --test recorded_rig -- --ignored --nocapture`.
+//! --test recorded_rig -- --ignored --nocapture`. The calibration stops
+//! test reads its own dataset (see
+//! `recorded_calibration_stops_measure_both_axes`).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -407,4 +409,68 @@ fn recorded_revolution_under_other_camera_models() {
             r.rms_deg, r.rms_mm, r.angle_gain, r.pairs
         );
     }
+}
+
+/// The stops of a calibration recorded on the rig, as the job takes them
+/// (`DC_SCAN_DATA/<DC_CAL_SET>`, default `g_calib_m125`: `stops.json` with
+/// the intrinsics and, per stop, the angles and the file of its median
+/// depth image, 800x600 little-endian `f32` mm, `NaN` invalid), measure
+/// both axes of the table. `g_calib_m125` started at -125.2 degrees: the
+/// stop at tilt -15 shows a side of the test piece that did not register
+/// from the shallow tilt pivots tried before (2026-11-19, the calibration
+/// was refused with `calibration-tracking`).
+#[test]
+#[ignore = "needs DC_SCAN_DATA with recorded calibration stops (DC_CAL_SET, default g_calib_m125)"]
+fn recorded_calibration_stops_measure_both_axes() {
+    let set = std::env::var("DC_CAL_SET").unwrap_or_else(|_| "g_calib_m125".into());
+    let dir = PathBuf::from(std::env::var_os("DC_SCAN_DATA").expect("set DC_SCAN_DATA")).join(&set);
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("stops.json")).expect("stops.json"))
+            .expect("stops.json is JSON");
+    let i = &meta["intrinsics"];
+    let num = |v: &serde_json::Value| v.as_f64().expect("a number") as f32;
+    let intr = CameraIntrinsics {
+        width: W as u32,
+        height: H as u32,
+        fx: num(&i["fx"]),
+        fy: num(&i["fy"]),
+        cx: num(&i["cx"]),
+        cy: num(&i["cy"]),
+    };
+    let stops = |key: &str| -> Vec<CalibrationStop> {
+        meta[key]
+            .as_array()
+            .expect("a list of stops")
+            .iter()
+            .map(|s| {
+                let bytes = std::fs::read(dir.join(s["file"].as_str().expect("a file")))
+                    .expect("a stop image");
+                CalibrationStop {
+                    rotate_deg: num(&s["rotate_deg"]),
+                    tilt_deg: num(&s["tilt_deg"]),
+                    depth: Arc::new(
+                        bytes
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|b| f32::from_le_bytes(*b))
+                            .collect(),
+                    ),
+                }
+            })
+            .collect()
+    };
+    let (rotation, tilt) = (stops("rotation"), stops("tilt"));
+    assert_eq!(rotation.len(), 25);
+    assert_eq!(tilt.len(), 2);
+    let o = calib::measure(&intr, &rotation, &tilt).unwrap_or_else(|(e, r)| panic!("{e}: {r:?}"));
+    println!("{set}: {:?}", o.report);
+    let t = o.tilt.expect("the tilt axis");
+    assert!(
+        t.rms_deg <= calib::MAX_RMS_DEG && t.rms_mm <= calib::MAX_RMS_MM,
+        "{t:?}"
+    );
+    // the tilt axis lies along the platter, under it
+    assert!(t.dir.dot(o.up).abs() < 0.1, "{t:?}");
+    assert!((t.point - o.platter_point).dot(o.up) < -20.0, "{t:?}");
 }

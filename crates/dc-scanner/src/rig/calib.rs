@@ -68,6 +68,13 @@ const PAIR_STATIC_MM: f32 = 0.5;
 const OBJECT_RADIUS_GATE_MM: f32 = 80.0;
 /// Fewest object pixels per stop, on average.
 const MIN_OBJECT_PIXELS: usize = 1500;
+/// Depths of the tilt axis under the platter (mm) that seed the
+/// registrations of the tilt stops. The Revopoint dual-axis table tilts
+/// about an axis 47 mm under its platter (measured): a seed 15 mm off that
+/// depth starts a ±15° tilt stop about 4 mm off, beyond the first
+/// association gate of the registration, and whether it still registers
+/// then depends on the side of the object in view.
+const TILT_PIVOT_SEEDS_MM: [f32; 8] = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0];
 
 /// One settled stop of the calibration.
 #[derive(Clone, Debug)]
@@ -684,10 +691,10 @@ fn measure_tilt(
         let delta = s.tilt_deg - reference.tilt_deg;
         let source = near(&s.depth, true);
         let mut best: Option<TrackResult> = None;
-        for depth in [0.0, -10.0, -20.0, -30.0] {
+        for depth in TILT_PIVOT_SEEDS_MM {
             for sign in [1.0, -1.0] {
                 // object motion from this tilt back to the reference
-                let seed = about(platter_point + depth * up, side * sign, -delta);
+                let seed = about(platter_point - depth * up, side * sign, -delta);
                 best = Some(better(best, register(&target, &source, intr, &seed)));
             }
         }
