@@ -158,18 +158,31 @@ fn calibrated_turntable_scan_covers_the_model_and_ignores_the_enclosure() {
     assert!(pivot_err < 1.0, "tilt axis off by {pivot_err} mm: {cal}");
     println!("calibrated in {:?}: {cal}", started.elapsed());
 
-    // --- automatic scan (stop-and-capture by default) ----------------------
+    // --- automatic scan (stop-and-capture and finish by default) ------------
     let r = run(
         &mut c,
         "scan.auto",
-        json!({"tilts_deg": [-15, 15], "rotation_deg": 360, "deg_per_s": 90, "settle_s": 0}),
+        json!({"tilts_deg": [-15, 15], "rotation_deg": 360, "deg_per_s": 90, "settle_s": 0,
+               "step_deg": 10, "resolution_mm": 0.5}),
     );
-    // per tilt: the tilt, then 37 stops every 10 degrees
-    assert_eq!(r["steps"], 76);
+    // per tilt: the tilt, then 37 stops every 10 degrees; then the six
+    // phases of the finish
+    assert_eq!(r["steps"], 76 + 6);
     let job = wait_job(&mut c, "scan.status", "auto");
     assert_eq!(job["state"], "done", "{job}");
+    assert_eq!(job["phase"], "optimise", "{job}");
+    assert_eq!(job["reconstruction"]["stops"], 74, "{job}");
+    assert_eq!(job["finish"]["boundary_loops"], 1, "{job}");
+    assert_eq!(job["finish"]["non_manifold_edges"], 0, "{job}");
     let status = run(&mut c, "scan.status", Value::Null);
-    assert_eq!(status["state"], "paused", "{status}");
+    // the scan ended with the finished mesh in the editor (undo: the raw
+    // fine mesh)
+    assert_eq!(status["state"], "stopped", "{status}");
+    assert_eq!(
+        status["editor"]["mesh_faces"], job["finish"]["faces_after"],
+        "{status}"
+    );
+    assert_eq!(status["editor"]["can_undo"], true, "{status}");
     assert!(status["tracking_lost"].as_u64().unwrap() <= 3, "{status}");
     let world = status["world_angles_deg"].clone();
     let world = RigPose {
@@ -247,7 +260,8 @@ fn calibrated_turntable_scan_covers_the_model_and_ignores_the_enclosure() {
     run(
         &mut c,
         "scan.auto",
-        json!({"tilts_deg": [0], "rotation_deg": 90, "deg_per_s": 60, "settle_s": 0}),
+        json!({"tilts_deg": [0], "rotation_deg": 90, "deg_per_s": 60, "settle_s": 0,
+               "finish": false}),
     );
     let job = wait_job(&mut c, "scan.status", "auto");
     assert_eq!(job["state"], "done", "{job}");

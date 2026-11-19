@@ -235,7 +235,7 @@ pub struct TrackResult {
 }
 
 /// The model as seen from one camera: per-pixel world points and normals.
-struct ModelView {
+pub(crate) struct ModelView {
     intr: CameraIntrinsics,
     world_to_cam: DAffine3,
     points: Vec<Vec3>,
@@ -244,8 +244,23 @@ struct ModelView {
     min_normal_cos: f64,
 }
 
+/// How well frame samples fit a [`ModelView`] (see [`ModelView::fit`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Fit {
+    /// Mean over the counted samples of the squared point-to-plane
+    /// residual, capped at the squared gate; a sample without a partner
+    /// costs the squared gate (mm²). Lower is better.
+    pub cost: f64,
+    /// RMS residual of the counted samples that found a partner (mm).
+    pub rms_mm: f64,
+    /// Counted samples that found a partner.
+    pub paired: usize,
+}
+
 impl ModelView {
-    fn new(
+    /// Ray casts `volume` from `cam_to_world` with `intr`, at most
+    /// [`TrackParams::max_model_width`] pixels wide.
+    pub(crate) fn new(
         volume: &TsdfVolume,
         intr: &CameraIntrinsics,
         cam_to_world: &Affine3A,
@@ -260,6 +275,54 @@ impl ModelView {
             points,
             normals,
             min_normal_cos: (params.max_normal_deg as f64).to_radians().cos(),
+        }
+    }
+
+    /// Robust fit of the frame samples placed by `pose` (see [`Fit`]),
+    /// pairs gated at `gate` (mm): the measure that tells which of two
+    /// poses of a view agrees better with the model.
+    pub(crate) fn fit(&self, frame: &FrameSample, pose: &DAffine3, gate: f64) -> Fit {
+        let g2 = gate * gate;
+        let (mut cost, mut sq, mut paired, mut counted) = (0.0, 0.0, 0usize, 0usize);
+        for (r, counts) in frame
+            .points
+            .par_iter()
+            .zip(frame.normals.par_iter())
+            .enumerate()
+            .with_min_len(512)
+            .map(|(i, (p, n))| {
+                let w = pose.transform_point3(p.as_dvec3());
+                let wn = pose.transform_vector3(n.as_dvec3());
+                let r = self.partner(w, wn, gate).map(|(q, n)| (w - q).dot(n));
+                (r, frame.counts(i))
+            })
+            .collect::<Vec<_>>()
+        {
+            if !counts {
+                continue;
+            }
+            counted += 1;
+            match r {
+                Some(r) => {
+                    cost += (r * r).min(g2);
+                    sq += r * r;
+                    paired += 1;
+                }
+                None => cost += g2,
+            }
+        }
+        Fit {
+            cost: if counted == 0 {
+                g2
+            } else {
+                cost / counted as f64
+            },
+            rms_mm: if paired == 0 {
+                f64::INFINITY
+            } else {
+                (sq / paired as f64).sqrt()
+            },
+            paired,
         }
     }
 
@@ -294,7 +357,7 @@ impl ModelView {
 
     /// Pairs of the frame samples placed by `pose`: frame point, model
     /// point, model normal, whether the sample counts.
-    fn pairs(
+    pub(crate) fn pairs(
         &self,
         frame: &FrameSample,
         pose: &DAffine3,
@@ -316,16 +379,16 @@ impl ModelView {
     }
 }
 
-fn to_d(a: &Affine3A) -> DAffine3 {
+pub(crate) fn to_d(a: &Affine3A) -> DAffine3 {
     DAffine3::from_mat3_translation(a.matrix3.as_dmat3(), a.translation.as_dvec3())
 }
 
-fn to_f(a: &DAffine3) -> Affine3A {
+pub(crate) fn to_f(a: &DAffine3) -> Affine3A {
     Affine3A::from_mat3_translation(a.matrix3.as_mat3(), a.translation.as_vec3())
 }
 
 /// Tukey's biweight of the residual `r` with cut-off `c`.
-fn tukey(r: f64, c: f64) -> f64 {
+pub(crate) fn tukey(r: f64, c: f64) -> f64 {
     let u = r / c;
     if u.abs() >= 1.0 {
         0.0
@@ -347,6 +410,16 @@ pub fn track_frame(
     params: &TrackParams,
 ) -> TrackResult {
     let view = ModelView::new(volume, intr, initial, params);
+    track_in_view(&view, frame, initial, params)
+}
+
+/// [`track_frame`] against a model view already ray cast from `initial`.
+pub(crate) fn track_in_view(
+    view: &ModelView,
+    frame: &FrameSample,
+    initial: &Affine3A,
+    params: &TrackParams,
+) -> TrackResult {
     let mut pose = to_d(initial);
     let mut iterations = 0;
     let (mut conditioning, mut degenerate) = (0.0, false);

@@ -53,6 +53,7 @@ use glam::{Affine3A, Quat, Vec3};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::reconstruct::{KeptStop, KeptStops, stop_correction};
 use crate::rig::fit::{angle_about, to_d};
 use crate::rig::{
     Background, RigCalibration, RigGeometry, RigInput, about, camera_world, gravity_world,
@@ -300,13 +301,18 @@ pub(crate) struct LoopOutcome {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum RigRequest {
     Capture(CaptureRequest),
-    CloseLoop { first: usize },
+    CloseLoop {
+        first: usize,
+    },
+    /// A snapshot of the kept stops.
+    Stops,
 }
 
 #[derive(Clone, Debug)]
 enum RigReply {
     Captured(StopOutcome),
     Loop(LoopOutcome),
+    Stops(Arc<KeptStops>),
 }
 
 /// Requests of the rig jobs and their replies.
@@ -351,22 +357,54 @@ impl Live {
     }
 }
 
-/// A fused stop, kept to rebuild the model after a loop closure.
+/// A fused stop, kept to rebuild the model after a loop closure and for
+/// the fine reconstruction ([`crate::reconstruct`]).
 struct StopRecord {
     /// Valid pixels of the median image: index and depth.
-    pixels: Vec<(u32, f32)>,
+    pixels: Arc<Vec<(u32, f32)>>,
     intrinsics: CameraIntrinsics,
     angles: (f32, f32),
     pose: Affine3A,
+    /// Its registration was refused: fused at the turntable pose.
+    flagged: bool,
 }
 
 impl StopRecord {
     fn depth(&self) -> Vec<f32> {
         let mut d = vec![f32::NAN; self.intrinsics.pixel_count()];
-        for &(i, z) in &self.pixels {
+        for &(i, z) in self.pixels.iter() {
             d[i as usize] = z;
         }
         d
+    }
+}
+
+/// The kept stops of `fusion` (pixels shared, cheap), with the rig
+/// `calibration` of the scan and the region of interest of `settings` when
+/// it was in use.
+fn kept_stops(
+    fusion: &Fusion,
+    calibration: Option<RigCalibration>,
+    settings: &ScanSettings,
+) -> KeptStops {
+    let roi = (settings.use_roi && fusion.rig_world && calibration.is_some())
+        .then_some((settings.roi_radius_mm, settings.roi_height_mm));
+    KeptStops {
+        stops: fusion
+            .stops
+            .iter()
+            .map(|s| KeptStop {
+                pixels: Arc::clone(&s.pixels),
+                intrinsics: s.intrinsics,
+                angles: s.angles,
+                pose: s.pose,
+                flagged: s.flagged,
+            })
+            .collect(),
+        world: fusion.world,
+        world_angles: fusion.world_angles,
+        calibration,
+        roi,
     }
 }
 
@@ -553,7 +591,7 @@ impl RigLink {
     ) -> Result<StopOutcome> {
         match self.ask(RigRequest::Capture(request), timeout, cancel)? {
             RigReply::Captured(s) => Ok(s),
-            RigReply::Loop(_) => Err(ScanError::Device("unexpected rig reply".into())),
+            _ => Err(ScanError::Device("unexpected rig reply".into())),
         }
     }
 
@@ -567,7 +605,19 @@ impl RigLink {
     ) -> Result<LoopOutcome> {
         match self.ask(RigRequest::CloseLoop { first }, timeout, cancel)? {
             RigReply::Loop(l) => Ok(l),
-            RigReply::Captured(_) => Err(ScanError::Device("unexpected rig reply".into())),
+            _ => Err(ScanError::Device("unexpected rig reply".into())),
+        }
+    }
+
+    /// A snapshot of the stops kept so far (pixels shared, cheap).
+    pub fn kept_stops(
+        &self,
+        timeout: Duration,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Arc<KeptStops>> {
+        match self.ask(RigRequest::Stops, timeout, cancel)? {
+            RigReply::Stops(s) => Ok(s),
+            _ => Err(ScanError::Device("unexpected rig reply".into())),
         }
     }
 }
@@ -813,6 +863,21 @@ impl ScanSession {
         self.shared.rig().calibration.clone()
     }
 
+    /// The stops kept by a stop-and-capture scan (`scan.auto`) for the fine
+    /// reconstruction, once the acquisition stopped; `None` while it runs,
+    /// when no stop was kept, or when frames were also fused one by one
+    /// (continuous or hand-held scanning: the stops are not the whole scan).
+    pub fn kept_stops(&self) -> Option<KeptStops> {
+        if self.state != ScanState::Stopped {
+            return None;
+        }
+        let fusion = self.fusion.as_ref()?;
+        if fusion.stops.is_empty() || fusion.loose_frames > 0 {
+            return None;
+        }
+        Some(kept_stops(fusion, self.rig_calibration(), &self.settings))
+    }
+
     /// Sets the rotation from the scanner's IMU frame to its camera frame
     /// ([`RigCalibration::camera_from_imu`]): without a rig calibration in
     /// use, the world of the next scan then stands on the true up the IMU
@@ -954,11 +1019,11 @@ impl AngleHistory {
 
 /// Largest turn about the axis a stop registration may apply to the
 /// turntable pose (degrees).
-const STOP_MAX_DELTA_DEG: f64 = 1.5;
+pub(crate) const STOP_MAX_DELTA_DEG: f64 = 1.5;
 /// Largest turn off the axis a stop registration may apply (degrees).
-const STOP_MAX_OFF_AXIS_DEG: f64 = 1.0;
+pub(crate) const STOP_MAX_OFF_AXIS_DEG: f64 = 1.0;
 /// Largest shift of the axis point a stop registration may apply (mm).
-const STOP_MAX_SHIFT_MM: f64 = 1.5;
+pub(crate) const STOP_MAX_SHIFT_MM: f64 = 1.5;
 /// A loop error beyond this (degrees) is not spread: something slipped.
 const LOOP_MAX_DEG: f32 = 3.0;
 /// A loop error below this (degrees) is left as is.
@@ -1062,14 +1127,7 @@ fn fuse_stop(
         out.rms_mm = r.rms_mm.is_finite().then_some(r.rms_mm);
         match geometry {
             Some(g) => {
-                let c = to_d(&prior).inverse() * to_d(&r.pose);
-                let (point, dir) = g.axis_at(angles.1);
-                let delta = angle_about(&c.matrix3, dir.as_dvec3()).to_degrees();
-                let total = rotation_angle(&c).to_degrees();
-                let off = (total * total - delta * delta).max(0.0).sqrt();
-                let shift = c
-                    .transform_point3(point.as_dvec3())
-                    .distance(point.as_dvec3());
+                let (delta, off, shift) = stop_correction(g, &prior, &r.pose, angles.1);
                 let accept = r.ok
                     && delta.abs() <= STOP_MAX_DELTA_DEG
                     && off <= STOP_MAX_OFF_AXIS_DEG
@@ -1101,15 +1159,18 @@ fn fuse_stop(
     fusion.velocity = Affine3A::IDENTITY;
     fusion.angles = Some(angles);
     fusion.stops.push(StopRecord {
-        pixels: depth
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| d.is_finite() && **d > 0.0)
-            .map(|(i, d)| (i as u32, *d))
-            .collect(),
+        pixels: Arc::new(
+            depth
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.is_finite() && **d > 0.0)
+                .map(|(i, d)| (i as u32, *d))
+                .collect(),
+        ),
         intrinsics: k,
         angles,
         pose,
+        flagged: out.flagged,
     });
     out.index = Some(fusion.stops.len() - 1);
     out
@@ -1197,7 +1258,7 @@ fn close_loop(
             .sum();
         if clutter > 0 && (clutter as f32) <= MAX_CLUTTER_FRACTION * total as f32 {
             for s in &mut fusion.stops[first..] {
-                s.pixels
+                Arc::make_mut(&mut s.pixels)
                     .retain(|(i, d)| !background.is_static(*i as usize, *d));
             }
             out.clutter_pixels = clutter;
@@ -1246,6 +1307,9 @@ pub struct ReplayedScan {
     pub cloud: PointCloud,
     /// The scan world frame from the camera frame of the first stop.
     pub world: Affine3A,
+    /// The fused stops, as `scan.auto` keeps them for the fine
+    /// reconstruction ([`crate::reconstruct`]).
+    pub kept: KeptStops,
 }
 
 /// A recorded stop: turntable angles `(rotate, tilt)` and the
@@ -1297,6 +1361,7 @@ pub fn fuse_recorded_stops(
         clutter_pixels: closed.clutter_pixels,
         cloud: moved(fusion.volume.extract_cloud(), &fusion.world),
         world: fusion.world,
+        kept: kept_stops(&fusion, Some(calibration.clone()), settings),
     }
 }
 
@@ -1341,6 +1406,13 @@ fn acquire(
                 // the next refresh extracts the rebuilt model
                 extracted_at = u64::MAX;
             }
+        }
+        if request == Some(RigRequest::Stops) {
+            let calibration = shared.rig().calibration.clone();
+            let stops = Arc::new(kept_stops(&fusion, calibration, settings));
+            let mut io = shared.io();
+            io.request = None;
+            io.reply = Some(RigReply::Stops(stops));
         }
         history.push(Instant::now(), probe_angles(&probe));
         let frame = match device.next_frame(FRAME_WAIT) {

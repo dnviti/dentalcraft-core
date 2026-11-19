@@ -176,6 +176,26 @@ pub enum RigJobState {
     Cancelled,
 }
 
+/// What a rig job is doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RigJobPhase {
+    /// Turning the table and capturing (one step per tilt and per stop).
+    Acquire,
+    /// `scan.auto` finish: refining the poses of the stops.
+    Refine,
+    /// Fusing the stops into the fine volume.
+    Fuse,
+    /// Extracting the mesh.
+    Extract,
+    /// Cleaning the mesh.
+    Clean,
+    /// Closing its holes.
+    FillHoles,
+    /// Optimising it.
+    Optimise,
+}
+
 /// Progress of a rig job.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RigJobStatus {
@@ -185,8 +205,13 @@ pub struct RigJobStatus {
     pub state: RigJobState,
     /// Step under way, 1-based (`steps` when done).
     pub step: u32,
-    /// Steps of the job (one per turntable move).
+    /// Steps of the job: one per turntable move, plus one per phase of the
+    /// finish of `scan.auto` (refine, fuse, extract, clean, fill holes,
+    /// optimise).
     pub steps: u32,
+    /// What `scan.auto` is doing (`null` for a calibration).
+    #[serde(default)]
+    pub phase: Option<RigJobPhase>,
     /// Tilt of the current pass (degrees), when tilting.
     pub tilt_deg: Option<f32>,
     /// Stable error code when failed.
@@ -200,7 +225,30 @@ pub struct RigJobStatus {
     /// `scan.auto`: how well the views were registered and fused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality: Option<ScanQuality>,
+    /// `scan.auto` with `finish`: the fine reconstruction from the stops
+    /// (`null` until done).
+    #[serde(default)]
+    pub reconstruction: Option<crate::reconstruct::ReconstructionReport>,
+    /// `scan.auto` with `finish`: the finish of the mesh (`null` until
+    /// done).
+    #[serde(default)]
+    pub finish: Option<dc_geom::finish::FinishReport>,
 }
+
+/// Default tilts of `scan.auto` (degrees): five passes over the table's
+/// range, so the occlusal surfaces and the steep walls are seen from above
+/// and from both sides.
+pub const AUTO_TILTS_DEG: [f32; 5] = [-30.0, -15.0, 0.0, 15.0, 30.0];
+/// Default degrees between the stops of `scan.auto` (stop-and-capture).
+pub const AUTO_STEP_DEG: f32 = 6.0;
+/// Default frames averaged (per-pixel median) at each stop of `scan.auto`.
+pub const AUTO_FRAMES_PER_STOP: u32 = 3;
+/// Default mesh resolution of the finish of `scan.auto` (mm).
+pub const AUTO_RESOLUTION_MM: f32 = crate::reconstruct::DEFAULT_RESOLUTION_MM;
+/// Range of the resolution of the fine reconstruction (mm).
+pub const RECONSTRUCT_RESOLUTION_MM: (f32, f32) = crate::reconstruct::RESOLUTION_RANGE_MM;
+/// Default largest distance the finish may move the surface (mm).
+pub const FINISH_MAX_ERROR_MM: f32 = dc_geom::finish::DEFAULT_MAX_ERROR_MM;
 
 /// Quality of a `scan.auto` run.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

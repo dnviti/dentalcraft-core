@@ -26,6 +26,14 @@
 //! rest of the motion again. At the end the job reports a [`ScanQuality`]
 //! and fails with `scan-quality-low` when too little was registered.
 //!
+//! **Finish** (`finish`, stop-and-capture): once the stops are in, the job
+//! takes a snapshot of the kept stops and, still on its thread
+//! (cancellable, one step per phase), rebuilds the fine mesh from them
+//! ([`crate::reconstruct`]) and finishes it ([`dc_geom::finish`]); the
+//! status carries both reports, and the controller, finalising the job,
+//! stops the acquisition and puts the cloud and the two meshes (raw, then
+//! finished: two undo steps) in the scan editor.
+//!
 //! **`turntable.calibrate`**, with a static object on the platter: settled
 //! stops every `step_deg` (and at `+t` / `-t` on a dual-axis table), then
 //! [`calib::measure`] (see there). A refused calibration fails the job with
@@ -36,10 +44,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
+use dc_geom::finish::{FinishParams, FinishStage, finish_mesh};
+use dc_mesh::TriMesh;
 use dc_turntable::{AxisKind, Turntable, TurntableError};
 
 use super::calib::{self, CalibrationStop};
-use super::{RigCalibration, RigJobKind, RigJobState, RigJobStatus, ScanQuality, save_calibration};
+use super::{
+    RigCalibration, RigJobKind, RigJobPhase, RigJobState, RigJobStatus, ScanQuality,
+    save_calibration,
+};
+use crate::reconstruct::{ReconstructParams, ReconstructStage, reconstruct};
 use crate::session::{CaptureRequest, RigLink, StopOutcome};
 use crate::{Result, ScanError};
 
@@ -93,6 +107,12 @@ const MIN_FUSED_FRACTION: f32 = 0.25;
 const WEAK_FUSED_FRACTION: f32 = 0.6;
 /// Warning code of a usable but weak scan.
 pub const WARN_SCAN_QUALITY_WEAK: &str = "scan-quality-weak";
+/// Steps of the finish of `scan.auto`: refine, fuse, extract, clean, fill
+/// holes, optimise.
+pub(crate) const FINISH_STEPS: u32 = 6;
+
+/// The raw and the finished mesh of a `scan.auto` finish.
+pub(crate) type FinishedMeshes = (TriMesh, TriMesh);
 
 /// Status and cancellation of a job, shared with the controller.
 #[derive(Debug)]
@@ -100,6 +120,7 @@ pub(crate) struct JobShared {
     cancel: AtomicBool,
     status: Mutex<RigJobStatus>,
     result: Mutex<Option<RigCalibration>>,
+    meshes: Mutex<Option<FinishedMeshes>>,
 }
 
 impl JobShared {
@@ -111,13 +132,17 @@ impl JobShared {
                 state: RigJobState::Running,
                 step: 0,
                 steps,
+                phase: (kind == RigJobKind::Auto).then_some(RigJobPhase::Acquire),
                 tilt_deg: None,
                 error: None,
                 error_detail: None,
                 calibration: None,
                 quality: None,
+                reconstruction: None,
+                finish: None,
             }),
             result: Mutex::new(None),
+            meshes: Mutex::new(None),
         })
     }
 
@@ -142,6 +167,20 @@ impl JobShared {
     /// The calibration measured by a finished calibrate job.
     pub fn take_result(&self) -> Option<RigCalibration> {
         self.result.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// The raw and the finished mesh of a `scan.auto` finish.
+    pub fn take_meshes(&self) -> Option<FinishedMeshes> {
+        self.meshes.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Marks a job that ended well as failed after all (`e`): the
+    /// controller could not hand its result over.
+    pub fn fail(&self, e: &ScanError) {
+        let mut s = self.lock();
+        s.state = RigJobState::Failed;
+        s.error = Some(e.code().to_owned());
+        s.error_detail = Some(e.to_string());
     }
 }
 
@@ -221,6 +260,13 @@ impl Ctx {
         if tilt.is_some() {
             s.tilt_deg = tilt;
         }
+    }
+
+    /// Starts the next step, a phase of the finish.
+    fn enter(&self, phase: RigJobPhase) {
+        let mut s = self.job.lock();
+        s.step = (s.step + 1).min(s.steps);
+        s.phase = Some(phase);
     }
 
     /// Waits while the user paused the scan.
@@ -379,6 +425,15 @@ pub(crate) enum AutoMode {
     Continuous,
 }
 
+/// The finish of `scan.auto`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FinishPlan {
+    /// Mesh resolution of the fine reconstruction (mm).
+    pub resolution_mm: f32,
+    /// Refine the poses of the stops first.
+    pub refine: bool,
+}
+
 /// `scan.auto` plan.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AutoPlan {
@@ -388,6 +443,8 @@ pub(crate) struct AutoPlan {
     pub settle: Duration,
     pub has_tilt: bool,
     pub mode: AutoMode,
+    /// Rebuild and finish the mesh at the end (stop-and-capture only).
+    pub finish: Option<FinishPlan>,
 }
 
 impl AutoPlan {
@@ -402,9 +459,14 @@ impl AutoPlan {
     }
 
     /// Steps of the job: per pass one tilt, then one step per stop (or one
-    /// rotation).
+    /// rotation); then one per phase of the finish.
     pub fn steps(&self) -> u32 {
-        (1 + self.stops_per_pass()) * self.tilts_deg.len() as u32
+        let finish = if self.finish.is_some() {
+            FINISH_STEPS
+        } else {
+            0
+        };
+        (1 + self.stops_per_pass()) * self.tilts_deg.len() as u32 + finish
     }
 }
 
@@ -417,8 +479,56 @@ pub(crate) fn start_auto(table: TableHandle, link: RigLink, plan: AutoPlan) -> R
         }?;
         let verdict = judge(&quality, plan.mode);
         ctx.job.lock().quality = Some(quality);
-        verdict
+        verdict?;
+        match &plan.finish {
+            Some(f) => finish_scan(ctx, f),
+            None => Ok(()),
+        }
     })
+}
+
+/// The finish of a stop-and-capture `scan.auto`: the fine mesh from the
+/// kept stops, then cleaned, closed and optimised; the reports go to the
+/// status, the meshes to the controller.
+fn finish_scan(ctx: &Ctx, plan: &FinishPlan) -> Result<()> {
+    // the table stands still from here on: frames keep coming, held
+    let stops = ctx
+        .link
+        .kept_stops(FRAME_TIMEOUT * 6, &|| ctx.cancelled())?;
+    let params = ReconstructParams {
+        resolution_mm: plan.resolution_mm,
+        refine: plan.refine,
+        ..ReconstructParams::default()
+    };
+    let rec = reconstruct(
+        &stops,
+        &params,
+        &|s| {
+            ctx.enter(match s {
+                ReconstructStage::Refine => RigJobPhase::Refine,
+                ReconstructStage::Fuse => RigJobPhase::Fuse,
+                ReconstructStage::Extract => RigJobPhase::Extract,
+            })
+        },
+        &|| ctx.cancelled(),
+    )?;
+    drop(stops);
+    ctx.job.lock().reconstruction = Some(rec.report.clone());
+    let (finished, report) = finish_mesh(
+        &rec.mesh,
+        &FinishParams::default(),
+        &|s| {
+            ctx.enter(match s {
+                FinishStage::Clean => RigJobPhase::Clean,
+                FinishStage::Holes => RigJobPhase::FillHoles,
+                FinishStage::Optimise => RigJobPhase::Optimise,
+            })
+        },
+        &|| ctx.cancelled(),
+    )?;
+    ctx.job.lock().finish = Some(report);
+    *ctx.job.meshes.lock().unwrap_or_else(|e| e.into_inner()) = Some((rec.mesh, finished));
+    Ok(())
 }
 
 /// The verdict on a finished `scan.auto`: an error when unusable, a
@@ -727,6 +837,7 @@ mod tests {
             settle: Duration::ZERO,
             has_tilt: true,
             mode: AutoMode::Continuous,
+            finish: None,
         };
         assert_eq!(plan.steps(), 6);
         let stops = AutoPlan {
@@ -738,6 +849,14 @@ mod tests {
         };
         assert_eq!(stops.stops_per_pass(), 37);
         assert_eq!(stops.steps(), 3 * 38);
+        let finished = AutoPlan {
+            finish: Some(FinishPlan {
+                resolution_mm: 0.1,
+                refine: true,
+            }),
+            ..stops.clone()
+        };
+        assert_eq!(finished.steps(), 3 * 38 + FINISH_STEPS);
         let c = CalibrationPlan {
             steps: 24,
             step_deg: 15.0,

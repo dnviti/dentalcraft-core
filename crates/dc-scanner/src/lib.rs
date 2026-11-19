@@ -57,6 +57,7 @@
 
 pub mod control;
 pub mod editor;
+pub mod reconstruct;
 pub mod revopoint_sdk;
 pub mod revopoint_usb;
 pub mod rig;
@@ -159,6 +160,10 @@ pub enum ScanError {
     /// `scan.auto` ended with too few views fused or registered.
     #[error("the automatic scan is unusable: {0}")]
     ScanQuality(String),
+    /// The scan kept no stops to rebuild from: only a stop-and-capture
+    /// `scan.auto` keeps them (hand-held and continuous scans do not).
+    #[error("the scan kept no stops (only stop-and-capture automatic scans keep them)")]
+    NoStops,
 }
 
 impl From<dc_turntable::TurntableError> for ScanError {
@@ -204,6 +209,7 @@ impl ScanError {
             Self::RigUncalibrated => "rig-uncalibrated",
             Self::CalibrationRefused { code, .. } => code,
             Self::ScanQuality(_) => "scan-quality-low",
+            Self::NoStops => "scan-no-stops",
         }
     }
 }
@@ -337,6 +343,7 @@ mod tests {
             ScanError::from(dc_geom::GeomError::InvalidInput("x".into())),
             ScanError::PlatformUnsupported("x".into()),
             ScanError::DeviceLost("x".into()),
+            ScanError::NoStops,
         ];
         let codes: Vec<&str> = errors.iter().map(ScanError::code).collect();
         assert_eq!(
@@ -348,7 +355,8 @@ mod tests {
                 "cancelled",
                 "geometry",
                 "platform-unsupported",
-                "device-lost"
+                "device-lost",
+                "scan-no-stops"
             ]
         );
     }

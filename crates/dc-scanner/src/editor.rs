@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use dc_geom::cloud;
+use dc_geom::finish::{DEFAULT_MAX_ERROR_MM, FinishParams, finish_mesh};
 use dc_geom::holefill::{HoleFillParams, fill_holes};
 use dc_geom::meshing::{CloudMeshParams, mesh_from_cloud};
 use dc_geom::qem::{DecimateParams, decimate};
@@ -128,6 +129,42 @@ pub enum MeshOp {
         /// Target fraction of the triangles, `(0, 1]`.
         ratio: f32,
     },
+    /// The finish of a scanned surface in one step: clean (keep the main
+    /// component, drop degenerate and non-manifold faces, fix spikes),
+    /// close every hole except the open base border (patches faired to the
+    /// curvature around them), optimise (decimation within `max_error_mm`,
+    /// border and sharp features kept, no smoothing).
+    Finish {
+        /// Components with fewer faces than this fraction of the largest
+        /// are removed, `[0, 1]` (default 1: the main component only).
+        #[serde(default = "default_island_fraction")]
+        min_island_fraction: f32,
+        /// Largest distance the optimisation may move the surface (mm),
+        /// `(0, 0.2]` (default 0.015).
+        #[serde(default = "default_max_error_mm")]
+        max_error_mm: f32,
+    },
+}
+
+fn default_island_fraction() -> f32 {
+    1.0
+}
+
+fn default_max_error_mm() -> f32 {
+    DEFAULT_MAX_ERROR_MM
+}
+
+/// Largest `max_error_mm` of [`MeshOp::Finish`] (mm).
+pub const FINISH_MAX_ERROR_LIMIT_MM: f32 = 0.2;
+
+impl MeshOp {
+    /// [`MeshOp::Finish`] with its defaults.
+    pub fn finish() -> Self {
+        Self::Finish {
+            min_island_fraction: default_island_fraction(),
+            max_error_mm: default_max_error_mm(),
+        }
+    }
 }
 
 /// Effect of a cloud edit.
@@ -151,6 +188,8 @@ pub struct ScanEditor {
     mesh: Option<Arc<TriMesh>>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
+    /// The cloud as acquired (before any cloud edit).
+    acquired: Arc<PointCloud>,
 }
 
 fn positive(name: &str, v: f32) -> Result<f32> {
@@ -187,12 +226,21 @@ fn mesh_summary(mesh: &TriMesh) -> Value {
 impl ScanEditor {
     /// Editor of `cloud`, without a mesh.
     pub fn new(cloud: PointCloud) -> Self {
+        let cloud = Arc::new(cloud);
         Self {
-            cloud: Arc::new(cloud),
+            acquired: Arc::clone(&cloud),
+            cloud,
             mesh: None,
             undo: Vec::new(),
             redo: Vec::new(),
         }
+    }
+
+    /// `true` while the cloud is the one acquired: no cloud edit applies
+    /// (none made, or all undone), so the acquisition data (the kept stops
+    /// of an automatic scan) still describe the scan.
+    pub fn cloud_is_acquired(&self) -> bool {
+        Arc::ptr_eq(&self.cloud, &self.acquired)
     }
 
     /// The current cloud.
@@ -240,6 +288,20 @@ impl ScanEditor {
         self.push_undo();
         mesh.update_normals();
         self.mesh = Some(Arc::new(mesh));
+    }
+
+    /// Replaces the mesh as one undoable step (e.g. the fine reconstruction
+    /// of an automatic scan). Returns `{"vertices", "faces"}`.
+    ///
+    /// # Errors
+    /// [`ScanError::Empty`] for a mesh without faces.
+    pub fn replace_mesh(&mut self, mesh: TriMesh) -> Result<Value> {
+        if mesh.is_empty() {
+            return Err(ScanError::Empty("mesh"));
+        }
+        let summary = mesh_summary(&mesh);
+        self.set_mesh(mesh);
+        Ok(summary)
     }
 
     /// Applies a cloud edit. Returns `{"removed", "points"}`. A deletion
@@ -375,12 +437,27 @@ impl ScanEditor {
     }
 
     /// Applies a mesh edit. Returns `{"vertices", "faces"}` plus
-    /// `holes_filled` / `removed` for the operations that count something.
+    /// `holes_filled` / `removed` for the operations that count something
+    /// and `finish` (a [`dc_geom::finish::FinishReport`]) for
+    /// [`MeshOp::Finish`].
     ///
     /// # Errors
     /// [`ScanError::Empty`] before [`ScanEditor::build_mesh`],
     /// [`ScanError::InvalidParams`] for parameters out of range, kernel errors.
     pub fn apply_mesh(&mut self, op: &MeshOp) -> Result<Value> {
+        self.apply_mesh_cancellable(op, &|| false)
+    }
+
+    /// [`ScanEditor::apply_mesh`] polling `cancel` between the stages of
+    /// the long operations ([`ScanError::Cancelled`]).
+    ///
+    /// # Errors
+    /// As [`ScanEditor::apply_mesh`].
+    pub fn apply_mesh_cancellable(
+        &mut self,
+        op: &MeshOp,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Value> {
         let m = self.mesh.as_deref().ok_or(ScanError::Empty("mesh"))?;
         let (mesh, extra) = match *op {
             MeshOp::FillHoles { max_edges } => {
@@ -389,7 +466,7 @@ impl ScanEditor {
                     ..HoleFillParams::default()
                 };
                 let (mesh, filled) = fill_holes(m, &params)?;
-                (mesh, Some(("holes_filled", filled)))
+                (mesh, Some(("holes_filled", json!(filled))))
             }
             MeshOp::Smooth {
                 iterations,
@@ -411,7 +488,7 @@ impl ScanEditor {
                     )));
                 }
                 let (mesh, removed) = remove_small_components(m, min_fraction);
-                (mesh, Some(("removed", removed)))
+                (mesh, Some(("removed", json!(removed))))
             }
             MeshOp::Decimate { ratio } => {
                 if !(ratio > 0.0 && ratio <= 1.0) {
@@ -422,13 +499,35 @@ impl ScanEditor {
                 let params = DecimateParams::to_ratio(ratio as f64);
                 (decimate(m, &params)?.mesh, None)
             }
+            MeshOp::Finish {
+                min_island_fraction,
+                max_error_mm,
+            } => {
+                if !(0.0..=1.0).contains(&min_island_fraction) {
+                    return Err(ScanError::InvalidParams(format!(
+                        "min_island_fraction {min_island_fraction} not in [0, 1]"
+                    )));
+                }
+                if !(max_error_mm > 0.0 && max_error_mm <= FINISH_MAX_ERROR_LIMIT_MM) {
+                    return Err(ScanError::InvalidParams(format!(
+                        "max_error_mm {max_error_mm} not in (0, {FINISH_MAX_ERROR_LIMIT_MM}]"
+                    )));
+                }
+                let params = FinishParams {
+                    min_island_fraction,
+                    max_error_mm,
+                    ..FinishParams::default()
+                };
+                let (mesh, report) = finish_mesh(m, &params, &|_| {}, cancel)?;
+                (mesh, Some(("finish", json!(report))))
+            }
         };
         if mesh.is_empty() {
             return Err(ScanError::Empty("mesh"));
         }
         let mut summary = mesh_summary(&mesh);
-        if let Some((key, n)) = extra {
-            summary[key] = json!(n);
+        if let Some((key, v)) = extra {
+            summary[key] = v;
         }
         self.set_mesh(mesh);
         Ok(summary)

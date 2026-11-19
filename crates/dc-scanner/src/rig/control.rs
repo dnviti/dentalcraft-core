@@ -21,15 +21,21 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::jobs::{self, AutoMode, AutoPlan, CalibrationPlan, Job, JobShared, TableHandle, lock};
-use super::{RigCalibration, RigJobKind, RigJobStatus, TurntableStatus, calibration_json};
+use super::jobs::{
+    self, AutoMode, AutoPlan, CalibrationPlan, FinishPlan, Job, JobShared, TableHandle, lock,
+};
+use super::{
+    AUTO_FRAMES_PER_STOP, AUTO_RESOLUTION_MM, AUTO_STEP_DEG, AUTO_TILTS_DEG,
+    RECONSTRUCT_RESOLUTION_MM, RigCalibration, RigJobKind, RigJobStatus, TurntableStatus,
+    calibration_json,
+};
 use crate::control::{
     NoParams, SCAN_AUTO, TURNTABLE_CALIBRATE, TURNTABLE_CALIBRATION, TURNTABLE_CONNECT,
     TURNTABLE_DEVICES, TURNTABLE_DISCONNECT, TURNTABLE_HOME, TURNTABLE_MOVE, TURNTABLE_SPEED,
     TURNTABLE_STATUS, TURNTABLE_STOP, parse,
 };
 use crate::session::ScanState;
-use crate::{Result, ScanController, ScanError};
+use crate::{Result, ScanController, ScanEditor, ScanError};
 
 /// Default discovery time of `turntable.devices` (seconds).
 const DEFAULT_DISCOVERY_S: f32 = 3.0;
@@ -122,15 +128,15 @@ pub(crate) enum AutoModeParam {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct AutoParams {
-    /// Tilts of the passes in degrees (default [-20, 0, 20]); one rotation
-    /// per tilt.
+    /// Tilts of the passes in degrees (default [-30, -15, 0, 15, 30]); one
+    /// rotation per tilt.
     tilts_deg: Option<Vec<f32>>,
     /// Rotation of each pass in degrees (default 360).
     rotation_deg: Option<f32>,
     /// `stop-and-capture` (default with a calibration) or `continuous`
     /// (default without).
     mode: Option<AutoModeParam>,
-    /// Stop-and-capture: degrees between stops, 2 to 45 (default 10).
+    /// Stop-and-capture: degrees between stops, 2 to 45 (default 6).
     step_deg: Option<f32>,
     /// Stop-and-capture: frames averaged (per-pixel median) at each stop,
     /// 1 to 10 (default 3).
@@ -146,6 +152,17 @@ pub(crate) struct AutoParams {
     /// interest and no motion prior, so only continuous and only for setups
     /// where the background is beyond the depth range.
     allow_uncalibrated: Option<bool>,
+    /// Stop-and-capture: at the end, stop the acquisition, rebuild the mesh
+    /// from the stops and finish it (clean, close the holes, optimise), so
+    /// the scan editor holds the finished mesh (default true). `false`
+    /// leaves the acquisition paused, without a mesh. Continuous scans keep
+    /// no stops and are never finished.
+    finish: Option<bool>,
+    /// Mesh resolution of the finish (voxel of the fine reconstruction),
+    /// 0.05 to 1 mm (default 0.1).
+    resolution_mm: Option<f32>,
+    /// Refine the poses of the stops before the fine fusion (default true).
+    refine: Option<bool>,
 }
 
 /// The connected table.
@@ -416,7 +433,24 @@ impl ScanController {
                 }
                 self.apply_rig();
             }
-            RigJobKind::Auto => self.session.end_hold(),
+            RigJobKind::Auto => {
+                self.session.end_hold();
+                // a finished scan: the acquisition stops, the editor gets
+                // the cloud, the fine mesh and the finished mesh (two undo
+                // steps)
+                if let Some((raw, finished)) = shared.take_meshes() {
+                    let handed = self.session.stop().and_then(|cloud| {
+                        let mut editor = ScanEditor::new(cloud);
+                        editor.replace_mesh(raw)?;
+                        editor.replace_mesh(finished)?;
+                        Ok(editor)
+                    });
+                    match handed {
+                        Ok(editor) => self.editor = Some(editor),
+                        Err(e) => shared.fail(&e),
+                    }
+                }
+            }
         }
     }
 
@@ -672,10 +706,14 @@ impl ScanController {
         if self.session.rig_calibration().is_none() && p.allow_uncalibrated != Some(true) {
             return Err(ScanError::RigUncalibrated);
         }
-        let tilts = p
-            .tilts_deg
-            .clone()
-            .unwrap_or_else(|| vec![-20.0, 0.0, 20.0]);
+        let tilt_axis = axis_of(&axes, AxisKind::Tilt).ok();
+        let tilts = p.tilts_deg.clone().unwrap_or_else(|| {
+            if tilt_axis.is_some() {
+                AUTO_TILTS_DEG.to_vec()
+            } else {
+                vec![0.0]
+            }
+        });
         if tilts.is_empty() || tilts.len() > 12 {
             return Err(ScanError::InvalidParams(
                 "tilts_deg needs 1 to 12 tilts".into(),
@@ -720,8 +758,8 @@ impl ScanController {
             }
             None if !calibrated => AutoMode::Continuous,
             _ => {
-                let step_deg = p.step_deg.unwrap_or(10.0);
-                let frames = p.frames_per_stop.unwrap_or(3);
+                let step_deg = p.step_deg.unwrap_or(AUTO_STEP_DEG);
+                let frames = p.frames_per_stop.unwrap_or(AUTO_FRAMES_PER_STOP);
                 if !(2.0..=45.0).contains(&step_deg) || !(1..=10).contains(&frames) {
                     return Err(ScanError::InvalidParams(format!(
                         "step_deg {step_deg} not in [2, 45] or frames_per_stop {frames} not in \
@@ -734,6 +772,21 @@ impl ScanController {
                 }
             }
         };
+        let resolution_mm = p.resolution_mm.unwrap_or(AUTO_RESOLUTION_MM);
+        let (lo, hi) = RECONSTRUCT_RESOLUTION_MM;
+        if !(lo..=hi).contains(&resolution_mm) {
+            return Err(ScanError::InvalidParams(format!(
+                "resolution_mm {resolution_mm} not in [{lo}, {hi}]"
+            )));
+        }
+        // continuous scans keep no stops: nothing to rebuild from
+        let finish =
+            (p.finish.unwrap_or(true) && matches!(mode, AutoMode::Stops { .. })).then(|| {
+                FinishPlan {
+                    resolution_mm,
+                    refine: p.refine.unwrap_or(true),
+                }
+            });
         match self.session.status().state {
             ScanState::Connected | ScanState::Stopped => self.session.start_held()?,
             ScanState::Scanning => self.session.rig_link().set_hold(true),
@@ -751,6 +804,7 @@ impl ScanController {
             settle: Duration::from_secs_f32(settle_s),
             has_tilt,
             mode,
+            finish,
         };
         let steps = plan.steps();
         let job = jobs::start_auto(table, self.session.rig_link(), plan)?;
