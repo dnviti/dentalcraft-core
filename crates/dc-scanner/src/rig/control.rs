@@ -128,15 +128,16 @@ pub(crate) enum AutoModeParam {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct AutoParams {
-    /// Tilts of the passes in degrees (default [-30, -15, 0, 15, 30]); one
-    /// rotation per tilt.
+    /// Tilts of the passes in degrees (default [-20, -10, 0, 10, 20] with a
+    /// tilt axis, [0] without): one rotation per tilt. Within ±20 an object
+    /// only resting on the platter stays put (at ±30 a test arch slid).
     tilts_deg: Option<Vec<f32>>,
     /// Rotation of each pass in degrees (default 360).
     rotation_deg: Option<f32>,
     /// `stop-and-capture` (default with a calibration) or `continuous`
     /// (default without).
     mode: Option<AutoModeParam>,
-    /// Stop-and-capture: degrees between stops, 2 to 45 (default 6).
+    /// Stop-and-capture: degrees between stops, 2 to 45 (default 7.5).
     step_deg: Option<f32>,
     /// Stop-and-capture: frames averaged (per-pixel median) at each stop,
     /// 1 to 10 (default 3).
@@ -161,7 +162,11 @@ pub(crate) struct AutoParams {
     /// Mesh resolution of the finish (voxel of the fine reconstruction),
     /// 0.05 to 1 mm (default 0.1).
     resolution_mm: Option<f32>,
-    /// Refine the poses of the stops before the fine fusion (default true).
+    /// Refine the poses of the stops before the fine fusion and leave out
+    /// the views that disagree with the others (an object that moved on the
+    /// platter), so they never make double walls: the reconstruction then
+    /// reports `rejected_stops`, `rejected_passes` and the warning
+    /// `scan-views-rejected` (default true).
     refine: Option<bool>,
 }
 
