@@ -22,7 +22,9 @@
 //! 4. **Platter**: the lowest dense layer of the object along the axis
 //!    (its base) gives the platter plane, where the axis point is put.
 //! 5. **Tilt** (dual-axis tables): the stops at `+t` and `-t` are
-//!    registered onto the last stop at tilt 0 and give the tilt axis.
+//!    registered onto the last stop at tilt 0 and give the tilt axis; a
+//!    tilted stop that does not register refuses the calibration with its
+//!    own code, `calibration-tilt`.
 //! 6. **Checks**: enough registered pairs, angle residual at most
 //!    [`MAX_RMS_DEG`], axis residual at most [`MAX_RMS_MM`], axis
 //!    [`AXIS_DISTANCE_MM`] from the scanner, platter seen from above,
@@ -702,15 +704,14 @@ fn measure_tilt(
             Some(r) if r.ok => samples.push((delta, r.pose)),
             _ => {
                 return Err(refuse(
-                    "calibration-tracking",
+                    "calibration-tilt",
                     format!("the stop at tilt {} could not be registered", s.tilt_deg),
                     report,
                 ));
             }
         }
     }
-    let fit =
-        fit_axis(&samples).map_err(|e| refuse("calibration-tracking", e.to_string(), report))?;
+    let fit = fit_axis(&samples).map_err(|e| refuse("calibration-tilt", e.to_string(), report))?;
     report.tilt_rms_deg = Some(fit.rms_deg);
     report.tilt_rms_mm = Some(fit.rms_mm);
     Ok(fit)
@@ -879,6 +880,17 @@ mod tests {
         assert_eq!(o.report.loop_verified, Some(true));
         assert_eq!(o.angle_gain, 1.0);
         assert!(o.report.rms_deg.unwrap() < 0.2, "{:?}", o.report);
+
+        // the turn is measured, but a tilted stop shows nothing to register:
+        // refused with the code of the tilt, not of the turn
+        let blank = CalibrationStop {
+            rotate_deg: 360.0,
+            tilt_deg: 15.0,
+            depth: Arc::new(vec![f32::NAN; stops[0].depth.len()]),
+        };
+        let (e, report) = measure(&intr, &stops, &[blank]).unwrap_err();
+        assert_eq!(e.code(), "calibration-tilt", "{e}");
+        assert!(report.rms_deg.is_some(), "{report:?}");
 
         // the table never moved: nothing turns, the run is refused
         let still = vec![0.0; 13];
