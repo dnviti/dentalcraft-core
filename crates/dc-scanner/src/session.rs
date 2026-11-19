@@ -37,7 +37,9 @@
 //! the frames out of the model while tracking goes on (tilting), like a
 //! pause, and ask the thread for settled stops: the median of a few frames
 //! registered from the turntable pose and fused (stop-and-capture), and
-//! loop closures over a revolution of stops.
+//! loop closures over a revolution of stops. Once everything is captured a
+//! job ends the acquisition (`RigLink::end_acquisition`): the stream
+//! stops and the session reports `Stopped` while the job computes.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -235,6 +237,9 @@ struct Shared {
     paused: AtomicBool,
     /// A rig job keeps the frames out of the model (tracking continues).
     hold: AtomicBool,
+    /// A rig job ended the acquisition ([`RigLink::end_acquisition`]): the
+    /// stream is off and the thread gone, its model waits to be joined.
+    ended: AtomicBool,
     live: Mutex<Live>,
     rig: Mutex<RigInput>,
     io: Mutex<RigIo>,
@@ -304,8 +309,9 @@ enum RigRequest {
     CloseLoop {
         first: usize,
     },
-    /// A snapshot of the kept stops.
-    Stops,
+    /// A snapshot of the kept stops, then the end of the acquisition: the
+    /// device stops streaming and the thread returns.
+    End,
 }
 
 #[derive(Clone, Debug)]
@@ -609,13 +615,18 @@ impl RigLink {
         }
     }
 
-    /// A snapshot of the stops kept so far (pixels shared, cheap).
-    pub fn kept_stops(
+    /// Ends the acquisition once a rig job has captured everything: a
+    /// snapshot of the kept stops is returned, the device stops streaming
+    /// (fill light off) and no frame is tracked any more, so nothing shows
+    /// a scan under way while the job computes. The session reports
+    /// [`ScanState::Stopped`] from then on and keeps the model for
+    /// [`ScanSession::stop`].
+    pub fn end_acquisition(
         &self,
         timeout: Duration,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Arc<KeptStops>> {
-        match self.ask(RigRequest::Stops, timeout, cancel)? {
+        match self.ask(RigRequest::End, timeout, cancel)? {
             RigReply::Stops(s) => Ok(s),
             _ => Err(ScanError::Device("unexpected rig reply".into())),
         }
@@ -738,6 +749,7 @@ impl ScanSession {
         self.shared.stop.store(false, Ordering::SeqCst);
         self.shared.paused.store(false, Ordering::SeqCst);
         self.shared.hold.store(hold, Ordering::SeqCst);
+        self.shared.ended.store(false, Ordering::SeqCst);
         self.shared.live().error = None;
         let shared = Arc::clone(&self.shared);
         let settings = self.settings.clone();
@@ -755,10 +767,11 @@ impl ScanSession {
     /// # Errors
     /// [`ScanError::InvalidState`] unless scanning.
     pub fn pause(&mut self) -> Result<()> {
-        if self.state != ScanState::Scanning {
+        let state = self.live_state();
+        if state != ScanState::Scanning {
             return Err(ScanError::InvalidState {
                 action: "pause",
-                state: self.state,
+                state,
             });
         }
         self.shared.paused.store(true, Ordering::SeqCst);
@@ -771,10 +784,11 @@ impl ScanSession {
     /// # Errors
     /// [`ScanError::InvalidState`] unless paused.
     pub fn resume(&mut self) -> Result<()> {
-        if self.state != ScanState::Paused {
+        let state = self.live_state();
+        if state != ScanState::Paused {
             return Err(ScanError::InvalidState {
                 action: "resume",
-                state: self.state,
+                state,
             });
         }
         self.shared.paused.store(false, Ordering::SeqCst);
@@ -843,6 +857,18 @@ impl ScanSession {
         self.shared.hold.store(false, Ordering::SeqCst);
     }
 
+    /// The state as it is: a rig job may have ended the acquisition
+    /// ([`RigLink::end_acquisition`]) while the session still holds the
+    /// thread, which is then `Stopped` already.
+    fn live_state(&self) -> ScanState {
+        match self.state {
+            ScanState::Scanning | ScanState::Paused if self.shared.ended.load(Ordering::SeqCst) => {
+                ScanState::Stopped
+            }
+            state => state,
+        }
+    }
+
     /// The acquisition as seen by a rig job thread.
     pub(crate) fn rig_link(&self) -> RigLink {
         RigLink(Arc::clone(&self.shared))
@@ -890,7 +916,7 @@ impl ScanSession {
     pub fn status(&self) -> ScanStatus {
         let live = self.shared.live();
         ScanStatus {
-            state: self.state,
+            state: self.live_state(),
             device: self.info.clone(),
             frames: live.frames,
             fused_frames: live.fused_frames,
@@ -947,6 +973,7 @@ impl ScanSession {
             return Ok(());
         };
         self.shared.stop.store(true, Ordering::SeqCst);
+        self.shared.ended.store(false, Ordering::SeqCst);
         match worker.join() {
             Ok((mut device, fusion)) => {
                 device.stop();
@@ -1407,12 +1434,17 @@ fn acquire(
                 extracted_at = u64::MAX;
             }
         }
-        if request == Some(RigRequest::Stops) {
+        if request == Some(RigRequest::End) {
             let calibration = shared.rig().calibration.clone();
             let stops = Arc::new(kept_stops(&fusion, calibration, settings));
+            // the stream ends now (fill light off): nothing is tracked while
+            // the job computes
+            device.stop();
+            shared.ended.store(true, Ordering::SeqCst);
             let mut io = shared.io();
             io.request = None;
             io.reply = Some(RigReply::Stops(stops));
+            break;
         }
         history.push(Instant::now(), probe_angles(&probe));
         let frame = match device.next_frame(FRAME_WAIT) {

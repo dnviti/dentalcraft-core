@@ -1,14 +1,17 @@
-//! The link to the turntable drops in the middle of a stop-and-capture
-//! `scan.auto` (simulated rig, link fault injected in the simulated table):
-//! the job reconnects and resumes at the stop where it was; when the link
-//! does not come back the job fails but keeps its stops, which can be
-//! exported and rebuilt.
+//! States of a stop-and-capture `scan.auto` on the simulated rig:
+//!
+//! * the link to the turntable drops mid-scan (fault injected in the
+//!   simulated table): the job reconnects and resumes at the stop where it
+//!   was; when the link does not come back the job fails but keeps its
+//!   stops, which can be exported and rebuilt;
+//! * during the finish the acquisition is over: the scan reports
+//!   `stopped`, no frame is tracked, the table is not busy.
 
 use std::time::{Duration, Instant};
 
-use dc_scanner::ScanController;
-use dc_scanner::rig::{RigCalibration, rfc3339, save_calibration};
+use dc_scanner::rig::{RigCalibration, RigJobPhase, rfc3339, save_calibration};
 use dc_scanner::sim::{self, SimOptions};
+use dc_scanner::{RigJobState, ScanController, ScanState};
 use glam::Vec3;
 use serde_json::{Value, json};
 
@@ -191,4 +194,65 @@ fn a_cancelled_stop_and_capture_scan_keeps_its_stops() {
         json!({"what": "stops", "path": path.to_string_lossy()}),
     );
     assert_eq!(out["stops"].as_u64(), Some(kept), "{out}");
+}
+
+#[test]
+fn the_finish_runs_with_the_acquisition_ended_and_the_table_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = rig(dir.path());
+    let mut params = auto_params();
+    params["finish"] = json!(true);
+    params["resolution_mm"] = json!(0.4);
+    run(&mut c, "scan.auto", params);
+    // watched without commands, as a window reads the controller
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let mut seen = Vec::new();
+    loop {
+        let job = c.auto_status().unwrap();
+        let status = c.session().status();
+        let busy = c.turntable_status().busy;
+        let finishing = job.phase.is_some_and(|p| p != RigJobPhase::Acquire);
+        if job.state != RigJobState::Running {
+            break;
+        }
+        if finishing {
+            seen.push((
+                job.phase,
+                status.state,
+                status.frames,
+                status.tracking_lost,
+                busy,
+            ));
+        }
+        assert!(Instant::now() < deadline, "{job:?}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!seen.is_empty(), "the finish was never seen running");
+    let (_, _, frames, lost, _) = seen[0];
+    for (phase, state, f, l, busy) in &seen {
+        assert_eq!(*state, ScanState::Stopped, "{phase:?}");
+        assert_eq!((*f, *l), (frames, lost), "frames tracked during {phase:?}");
+        assert!(!busy, "table busy during {phase:?}");
+    }
+    println!("{} samples during the finish, phases {:?}", seen.len(), {
+        let mut p: Vec<_> = seen.iter().map(|s| s.0).collect();
+        p.dedup();
+        p
+    });
+    let status = run(&mut c, "scan.status", Value::Null);
+    assert_eq!(status["auto"]["state"], "done", "{status}");
+    assert_eq!(status["state"], "stopped", "{status}");
+    assert_eq!(status["auto"]["kept_stops"], 10, "{status}");
+    assert!(
+        status["editor"]["mesh_faces"].as_u64().unwrap() > 0,
+        "{status}"
+    );
+    assert_eq!(status["frames"].as_u64(), Some(frames), "{status}");
+    // the kept stops are still there for another reconstruction
+    let out = run(
+        &mut c,
+        "scan.reconstruct",
+        json!({"resolution_mm": 0.5, "refine": false}),
+    );
+    assert_eq!(out["reconstruction"]["stops"], 10, "{out}");
 }

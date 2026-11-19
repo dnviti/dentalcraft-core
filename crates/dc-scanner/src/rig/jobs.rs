@@ -27,12 +27,14 @@
 //! and fails with `scan-quality-low` when too little was registered.
 //!
 //! **Finish** (`finish`, stop-and-capture): once the stops are in, the job
-//! takes a snapshot of the kept stops and, still on its thread
-//! (cancellable, one step per phase), rebuilds the fine mesh from them
-//! ([`crate::reconstruct`]) and finishes it ([`dc_geom::finish`]); the
-//! status carries both reports, and the controller, finalising the job,
-//! stops the acquisition and puts the cloud and the two meshes (raw, then
-//! finished: two undo steps) in the scan editor.
+//! ends the acquisition ([`RigLink::end_acquisition`]: the scanner stops
+//! streaming, the fill light goes off, nothing is tracked, the session
+//! reports `stopped` and the table is free) with a snapshot of the kept
+//! stops, and, still on its thread (cancellable, one step per phase),
+//! rebuilds the fine mesh from them ([`crate::reconstruct`]) and finishes
+//! it ([`dc_geom::finish`]); the status carries both reports, and the
+//! controller, finalising the job, puts the cloud and the two meshes (raw,
+//! then finished: two undo steps) in the scan editor.
 //!
 //! **`turntable.calibrate`**, with a static object on the platter: settled
 //! stops every `step_deg` (and at `+t` / `-t` on a dual-axis table), then
@@ -140,12 +142,15 @@ pub(crate) struct JobShared {
     status: Mutex<RigJobStatus>,
     result: Mutex<Option<RigCalibration>>,
     meshes: Mutex<Option<FinishedMeshes>>,
+    /// The job is done with the table (it only computes from here on).
+    table_free: AtomicBool,
 }
 
 impl JobShared {
     fn new(kind: RigJobKind, steps: u32) -> Arc<Self> {
         Arc::new(Self {
             cancel: AtomicBool::new(false),
+            table_free: AtomicBool::new(false),
             status: Mutex::new(RigJobStatus {
                 kind,
                 state: RigJobState::Running,
@@ -209,6 +214,11 @@ impl JobShared {
     /// are kept for the reconstruction and the export.
     pub fn set_kept_stops(&self, n: Option<u32>) {
         self.lock().kept_stops = n;
+    }
+
+    /// The job still uses the table (it is acquiring).
+    pub fn holds_table(&self) -> bool {
+        !self.table_free.load(Ordering::SeqCst)
     }
 }
 
@@ -539,8 +549,11 @@ fn spawn(
                         s.error_detail = Some(e.to_string());
                     }
                     drop(s);
-                    // best effort: the table may be the thing that failed
-                    let _ = lock(&ctx.table).stop();
+                    // best effort: the table may be the thing that failed;
+                    // a table the job let go of is left alone
+                    if ctx.job.holds_table() {
+                        let _ = lock(&ctx.table).stop();
+                    }
                 }
             }
         })
@@ -623,10 +636,11 @@ pub(crate) fn start_auto(table: TableHandle, link: RigLink, plan: AutoPlan) -> R
 /// kept stops, then cleaned, closed and optimised; the reports go to the
 /// status, the meshes to the controller.
 fn finish_scan(ctx: &Ctx, plan: &FinishPlan) -> Result<()> {
-    // the table stands still from here on: frames keep coming, held
+    // everything is captured: the acquisition ends and the table is free
     let stops = ctx
         .link
-        .kept_stops(FRAME_TIMEOUT * 6, &|| ctx.cancelled())?;
+        .end_acquisition(FRAME_TIMEOUT * 6, &|| ctx.cancelled())?;
+    ctx.job.table_free.store(true, Ordering::SeqCst);
     let params = ReconstructParams {
         resolution_mm: plan.resolution_mm,
         refine: plan.refine,

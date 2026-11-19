@@ -260,6 +260,14 @@ impl RigState {
         self.job.as_ref().is_some_and(|(_, j)| !j.finished())
     }
 
+    /// A running job still uses the table: it is acquiring (the finish of
+    /// `scan.auto` only computes).
+    fn job_holds_table(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|(_, j)| !j.finished() && j.shared.holds_table())
+    }
+
     fn table(&self) -> Result<&Connected> {
         self.table
             .as_ref()
@@ -354,7 +362,7 @@ impl ScanController {
             axes: c.axes.clone(),
             rotate_deg: angles.rotate_deg,
             tilt_deg: angles.tilt_deg,
-            busy: self.rig.job_running() || watching || angles.moving,
+            busy: self.rig.job_holds_table() || watching || angles.moving,
             calibrated: self.session.rig_calibration().is_some(),
             calibration_job,
         }
@@ -590,7 +598,7 @@ impl ScanController {
         moved: &[AxisKind],
         f: impl FnOnce(&mut dyn Turntable) -> dc_turntable::Result<()>,
     ) -> Result<()> {
-        if self.rig.job_running() {
+        if self.rig.job_holds_table() {
             return Err(TurntableError::Busy.into());
         }
         let table = Arc::clone(&self.rig.table()?.table);
