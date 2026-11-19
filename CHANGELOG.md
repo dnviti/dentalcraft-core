@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.3.0-alpha.6](https://github.com/dnviti-personal-org/dentalcraft-core/compare/v0.3.0-alpha.5...v0.3.0-alpha.6) (2026-11-19)
+
+
+### Features
+
+* **geom:** faithful scan finish with surface bound, normal and edge caps and denoising ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **geom:** weighted TSDF fusion with de-integration and a one-pass mesh finish ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** drive the MINI 2 fill light while streaming ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** fine 0.1 mm reconstruction and finish of automatic scans from the kept stops (scan.reconstruct, scan.mesh finish, scan.export stops) ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** scan.close ends the scan session ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** stand an uncalibrated scan on the true up from the IMU ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** use the MINI 2 factory calibration and a fast exposure profile ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **turntable:** detect a dropped Bluetooth link at once and reconnect the table with a continuous angle ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+
+
+### Bug Fixes
+
+* **scanner:** end the acquisition before the finish of an automatic scan ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** leave out the views of an object that moved before fusing a scan, with safe scan.auto defaults ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** let a host finish a rig job that ended without a command ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** read the MINI 2 frame header of the depth-only stream ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** read the turntable angle of a frame with a latency that follows the frame rate ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** refuse a calibration whose tilt fails with its own code ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** reliable turntable tracking, stop-and-capture scanning and a validated turntable calibration ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** remove the static clutter of a revolution from stop-and-capture scans ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** report the residual at the turntable pose of a flagged stop ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** resume a rig job after a turntable link drop and keep the stops of a failed scan ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** seed the tilt axis registration down to 70 mm under the platter ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** start a rig job once the turntable stands still ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** the scan world frame is the turntable frame, with the platter on XY ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** tilt the table back to 0 when a scan ends ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+* **scanner:** warn on a weak automatic scan from its residual and loop error ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+
+
+### Performance Improvements
+
+* **geom:** finish a dense scan in parallel within the same 0.015 mm bound ([75e513f](https://github.com/dnviti-personal-org/dentalcraft-core/commit/75e513f06612e7a0bc39578fc95178b37c9aa144))
+
 ## [0.3.0-alpha.5](https://github.com/dnviti-personal-org/dentalcraft-core/compare/v0.3.0-alpha.4...v0.3.0-alpha.5) (2026-11-18)
 
 
