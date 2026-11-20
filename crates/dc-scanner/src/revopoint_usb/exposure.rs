@@ -3,8 +3,7 @@
 //! **User decision, 2026-11-18 21:43** (supervised experiments, volatile
 //! registers): besides the fill light ([`super::light`]), the shell selector
 //! may receive exactly the lines of [`ExposureProfile`]. They travel as the
-//! fill-light lines do (extension unit 4, selector 7, one 60-byte
-//! `SET_CUR`), after the same checks.
+//! fill-light lines do, after the same checks ([`super::xu`]).
 //!
 //! One depth frame of the MINI 2 is 18 projected patterns; each takes the
 //! "frame time" of register `0x910`. In the dark the device's own auto
@@ -32,7 +31,7 @@
 //! auto-exposure mode is unknown, so turning the profile off sends nothing
 //! (a scanner already switched stays fast until it is unplugged).
 
-use super::light::{SHELL_PAYLOAD_LEN, payload};
+use super::xu::ShellLine;
 
 /// The exposure profiles the user authorised.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,44 +41,15 @@ pub enum ExposureProfile {
 }
 
 impl ExposureProfile {
-    /// The authorised lines of this profile, in order.
-    pub fn lines(self) -> &'static [&'static str] {
+    /// The authorised lines of this profile, in order: the auto exposure
+    /// off, the exposure, then the pattern time.
+    pub fn lines(self) -> &'static [ShellLine] {
         match self {
             Self::Fast => &[
-                "echo s 0x912 0 >/dev/rk_preisp",
-                "echo s 0x911 6000 >/dev/rk_preisp",
-                "echo s 0x910 8000 >/dev/rk_preisp",
+                ShellLine::AutoExposureOff,
+                ShellLine::Exposure6000Us,
+                ShellLine::FrameTime8000Us,
             ],
         }
-    }
-
-    /// The `SET_CUR` payloads of this profile.
-    pub fn payloads(self) -> Vec<[u8; SHELL_PAYLOAD_LEN]> {
-        self.lines().iter().map(|l| payload(l)).collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_the_authorised_lines_padded_to_60_bytes() {
-        let p = ExposureProfile::Fast.payloads();
-        let lines = ExposureProfile::Fast.lines();
-        assert_eq!(p.len(), 3);
-        for (p, l) in p.iter().zip(lines) {
-            assert_eq!(&p[..l.len()], l.as_bytes());
-            assert!(p[l.len()..].iter().all(|b| *b == 0));
-        }
-        // exactly the forms the user authorised, nothing composed
-        assert_eq!(
-            lines,
-            [
-                "echo s 0x912 0 >/dev/rk_preisp",
-                "echo s 0x911 6000 >/dev/rk_preisp",
-                "echo s 0x910 8000 >/dev/rk_preisp",
-            ]
-        );
     }
 }

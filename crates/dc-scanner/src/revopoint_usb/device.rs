@@ -13,6 +13,8 @@ use super::frame::{self, StreamMode};
 #[cfg(target_os = "linux")]
 use super::light::FillLight;
 use super::platform::{self, Address, Capture, PIX_FMT_Y16, find_devices, open_capture};
+#[cfg(target_os = "linux")]
+use super::xu;
 use super::{BACKEND_ID, REENUMERATION_GRACE, UsbOptions};
 use crate::{
     DepthFrame, DeviceInfo, Result, RevopointUsbBackend, ScanError, ScannerBackend, ScannerDevice,
@@ -60,7 +62,7 @@ impl ScannerBackend for RevopointUsbBackend {
                     let read = |file| {
                         #[cfg(target_os = "linux")]
                         if shell_unit {
-                            return idle.read_factory_file(file);
+                            return xu::read_file(&idle, file);
                         }
                         let _ = file;
                         Err(ScanError::Device(
@@ -86,7 +88,7 @@ impl ScannerBackend for RevopointUsbBackend {
         // idle, the device blinks its LEDs: off until a stream turns them on
         #[cfg(target_os = "linux")]
         if shell_unit {
-            let _ = idle.set_fill_light(FillLight::Off);
+            let _ = xu::send_lines(&idle, FillLight::Off.lines(), "light command");
         }
         drop(idle);
         Ok(Box::new(RevopointUsbDevice {
@@ -291,7 +293,7 @@ impl RevopointUsbDevice {
                 let sent = self
                     .capture
                     .as_ref()
-                    .map(|c| c.set_exposure_profile(ExposureProfile::Fast));
+                    .map(|c| xu::send_lines(c, ExposureProfile::Fast.lines(), "exposure command"));
                 if let Some(Err(e)) = sent {
                     self.exposure_note.get_or_insert_with(|| e.to_string());
                 }
@@ -305,7 +307,7 @@ impl RevopointUsbDevice {
     #[cfg(target_os = "linux")]
     fn send_light(&mut self, light: FillLight) -> bool {
         let result = match (&self.capture, self.shell_unit) {
-            (Some(capture), true) => capture.set_fill_light(light),
+            (Some(capture), true) => xu::send_lines(capture, light.lines(), "light command"),
             (Some(_), false) => Err(ScanError::Device(
                 "no extension unit 4 with the expected GUID: fill light left alone".into(),
             )),

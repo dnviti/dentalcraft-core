@@ -82,6 +82,7 @@ mod mf;
 mod v4l2;
 #[cfg(windows)]
 mod win;
+pub mod xu;
 
 // The platform layer of `device`: device discovery and the capture of the
 // depth node.
@@ -101,6 +102,7 @@ pub use exposure::ExposureProfile;
 pub use factory::FactoryFile;
 pub use frame::StreamMode;
 pub use light::FillLight;
+pub use xu::XuTransport;
 
 #[cfg(not(any(target_os = "linux", windows)))]
 use crate::{DeviceInfo, Result, ScannerBackend, ScannerDevice};

@@ -2,8 +2,8 @@
 //! `rustix::ioctl` from `linux/videodev2.h`. Only standard V4L2 calls:
 //! `QUERYCAP`, `S_FMT`, `S_PARM`, `REQBUFS`, `QUERYBUF`, `QBUF`, `DQBUF`,
 //! `STREAMON`, `STREAMOFF`; plus, through `UVCIOC_CTRL_QUERY` of
-//! `uvcvideo`, the user-authorised fill light lines of [`FillLight`] and
-//! nothing else (see [`super::light`]).
+//! `uvcvideo`, the transport of the vendor extension-unit requests of
+//! [`super::xu`] (its closed list, nothing else).
 
 #![allow(unsafe_code)]
 #![warn(clippy::undocumented_unsafe_blocks)]
@@ -20,11 +20,7 @@ use rustix::io::Errno;
 use rustix::ioctl::{Getter, Opcode, Setter, Updater, ioctl, opcode};
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 
-use super::exposure::ExposureProfile;
-use super::factory::{
-    CLOSE_PAYLOAD, FILE_PAYLOAD_LEN, FactoryFile, OPEN_SELECTOR, READ_SELECTOR, append_chunk,
-};
-use super::light::{FillLight, SHELL_PAYLOAD_LEN, SHELL_SELECTOR, SHELL_UNIT};
+use super::xu::{Selector, UNIT, XuRequest, XuTransport};
 use crate::{Result, ScanError};
 
 // ----- videodev2.h ---------------------------------------------------------
@@ -518,103 +514,55 @@ struct XuQuery {
 }
 
 const UVCIOC_CTRL_QUERY: Opcode = opcode::read_write::<XuQuery>(b'u', 0x21);
-const UVC_SET_CUR: u8 = 0x01;
-const UVC_GET_CUR: u8 = 0x81;
-const UVC_GET_LEN: u8 = 0x85;
+
+/// The `UVCIOC_CTRL_QUERY` argument of one request on `selector` of the
+/// vendor unit [`UNIT`]: `query` is the UVC request code, `data` its
+/// buffer.
+fn xu_query(selector: Selector, query: u8, data: &mut [u8]) -> XuQuery {
+    XuQuery {
+        unit: UNIT,
+        selector: selector.id(),
+        query,
+        size: data.len() as u16,
+        data: data.as_mut_ptr(),
+    }
+}
 
 impl Capture {
-    /// One query of `selector` of the vendor extension unit.
-    fn xu_query(&self, selector: u8, query: u8, data: &mut [u8]) -> Result<()> {
-        let mut q = XuQuery {
-            unit: SHELL_UNIT,
-            selector,
-            query,
-            size: data.len() as u16,
-            data: data.as_mut_ptr(),
-        };
+    /// One `UVCIOC_CTRL_QUERY` of `selector` of the vendor unit.
+    fn xu_ioctl(&self, selector: Selector, query: u8, data: &mut [u8]) -> Result<()> {
+        let mut q = xu_query(selector, query, data);
         // SAFETY: `UVCIOC_CTRL_QUERY` reads one `uvc_xu_control_query` and
         // reads or writes `size` bytes at `data`, a live buffer of that
         // length for the duration of the call.
         unsafe { ioctl(&self.fd, Updater::<UVCIOC_CTRL_QUERY, XuQuery>::new(&mut q)) }
             .map_err(|e| errno_error("UVCIOC_CTRL_QUERY", e))
     }
+}
 
-    /// Checks that `selector` of the extension unit is `expected` bytes
-    /// long (`what` names the command for the error).
-    fn check_len(&self, selector: u8, expected: usize, what: &str) -> Result<()> {
-        let mut len = [0u8; 2];
-        self.xu_query(selector, UVC_GET_LEN, &mut len)?;
-        let len = u16::from_le_bytes(len) as usize;
-        if len != expected {
-            return Err(ScanError::Device(format!(
-                "extension unit {SHELL_UNIT} selector {selector} is {len} bytes, not \
-                 {expected}: no {what} sent"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Sends shell `payloads` after checking the selector length.
-    fn send_shell(&self, payloads: Vec<[u8; SHELL_PAYLOAD_LEN]>, what: &str) -> Result<()> {
-        self.check_len(SHELL_SELECTOR, SHELL_PAYLOAD_LEN, what)?;
-        for mut p in payloads {
-            self.xu_query(SHELL_SELECTOR, UVC_SET_CUR, &mut p)?;
-        }
-        Ok(())
-    }
-
-    /// Sets the fill light (the lines of [`FillLight`], nothing else),
-    /// after checking that the shell selector is
-    /// [`SHELL_PAYLOAD_LEN`] bytes long.
-    ///
-    /// # Errors
-    /// [`ScanError::Device`] when the selector has another length or a
-    /// query fails.
-    pub fn set_fill_light(&self, light: FillLight) -> Result<()> {
-        self.send_shell(light.payloads(), "light command")
-    }
-
-    /// Applies `profile` (its lines, nothing else), with the checks of
-    /// [`Capture::set_fill_light`].
-    ///
-    /// # Errors
-    /// As [`Capture::set_fill_light`].
-    pub fn set_exposure_profile(&self, profile: ExposureProfile) -> Result<()> {
-        self.send_shell(profile.payloads(), "exposure command")
-    }
-
-    /// Reads the factory file `file` over the read-only file channel (see
-    /// [`super::factory`]): open for reading, read until the end, close.
-    /// Call it with the stream idle.
-    ///
-    /// # Errors
-    /// [`ScanError::Device`] when a selector has another length, a query
-    /// fails or a reply is malformed.
-    pub fn read_factory_file(&self, file: FactoryFile) -> Result<Vec<u8>> {
-        self.check_len(OPEN_SELECTOR, FILE_PAYLOAD_LEN, "file read")?;
-        self.check_len(READ_SELECTOR, FILE_PAYLOAD_LEN, "file read")?;
-        self.xu_query(OPEN_SELECTOR, UVC_SET_CUR, &mut file.open_payload())?;
-        let mut data = Vec::new();
-        let read = (|| -> Result<()> {
-            loop {
-                let mut reply = [0u8; FILE_PAYLOAD_LEN];
-                self.xu_query(READ_SELECTOR, UVC_GET_CUR, &mut reply)?;
-                if !append_chunk(&reply, &mut data)? {
-                    return Ok(());
-                }
+impl XuTransport for Capture {
+    fn query(&self, selector: Selector, request: XuRequest<'_>) -> Result<()> {
+        let query = request.uvc_code();
+        match request {
+            XuRequest::SetCur(payload) => {
+                // the ioctl takes a mutable buffer; `SET_CUR` only reads it
+                let mut bytes = *payload.as_bytes();
+                self.xu_ioctl(selector, query, &mut bytes)
             }
-        })();
-        // the session is closed whatever happened after it was opened
-        let mut close = CLOSE_PAYLOAD;
-        let closed = self.xu_query(OPEN_SELECTOR, UVC_SET_CUR, &mut close);
-        read.and(closed)?;
-        if data.is_empty() {
-            return Err(ScanError::Device(format!(
-                "{}: empty or missing on the device",
-                file.device_path()
-            )));
+            XuRequest::GetCur(reply) => self.xu_ioctl(selector, query, reply),
+            XuRequest::GetLen(len) => {
+                let mut bytes = [0; 2];
+                self.xu_ioctl(selector, query, &mut bytes)?;
+                *len = u16::from_le_bytes(bytes);
+                Ok(())
+            }
+            XuRequest::GetInfo(info) => {
+                let mut byte = [0; 1];
+                self.xu_ioctl(selector, query, &mut byte)?;
+                *info = byte[0];
+                Ok(())
+            }
         }
-        Ok(data)
     }
 }
 
@@ -672,5 +620,20 @@ mod tests {
         let busy = errno_error("VIDIOC_S_FMT", Errno::BUSY).to_string();
         assert!(busy.contains("another program"), "{busy}");
         assert_eq!(text(b"uvcvideo\0\0\0"), "uvcvideo");
+    }
+
+    #[test]
+    fn extension_unit_queries_address_unit_4() {
+        // a SET_CUR on the shell selector carries the 60 payload bytes
+        let mut payload = [b'x'; 60];
+        let q = xu_query(Selector::Shell, 0x01, &mut payload);
+        assert_eq!((q.unit, q.selector, q.query, q.size), (4, 7, 0x01, 60));
+        assert_eq!(q.data, payload.as_mut_ptr());
+        let mut len = [0; 2];
+        let q = xu_query(Selector::FileRead, 0x85, &mut len);
+        assert_eq!((q.unit, q.selector, q.query, q.size), (4, 2, 0x85, 2));
+        let mut info = [0; 1];
+        let q = xu_query(Selector::FileOpen, 0x86, &mut info);
+        assert_eq!((q.unit, q.selector, q.query, q.size), (4, 1, 0x86, 1));
     }
 }
