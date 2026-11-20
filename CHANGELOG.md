@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.0-alpha.7](https://github.com/dnviti-personal-org/dentalcraft-core/compare/v0.3.0-alpha.6...v0.3.0-alpha.7) (2026-11-20)
+
+
+### Features
+
+* **ble:** CoreBluetooth backend for macOS ([26176c7](https://github.com/dnviti-personal-org/dentalcraft-core/commit/26176c7c0402cf3697dbf1a87d29f4361cf274e0))
+* **scanner:** macOS capture through a user-space UVC bulk reader ([26176c7](https://github.com/dnviti-personal-org/dentalcraft-core/commit/26176c7c0402cf3697dbf1a87d29f4361cf274e0))
+* **scanner:** report what the vendor layer did in scan.status ([26176c7](https://github.com/dnviti-personal-org/dentalcraft-core/commit/26176c7c0402cf3697dbf1a87d29f4361cf274e0))
+* **scanner:** stop scan.auto at once when the rig calibration no longer fits ([26176c7](https://github.com/dnviti-personal-org/dentalcraft-core/commit/26176c7c0402cf3697dbf1a87d29f4361cf274e0))
+
+
+### Bug Fixes
+
+* **ble:** connect on Windows as on Linux (retry, rediscovery) ([26176c7](https://github.com/dnviti-personal-org/dentalcraft-core/commit/26176c7c0402cf3697dbf1a87d29f4361cf274e0))
+* **scanner:** drive the MINI 2 on Windows exactly as on Linux (fill light, factory calibration, fast exposure, newest frame) ([26176c7](https://github.com/dnviti-personal-org/dentalcraft-core/commit/26176c7c0402cf3697dbf1a87d29f4361cf274e0))
+* **scanner:** leave scanning on device loss, reload the rig calibration, name camera-access and program-location failures ([26176c7](https://github.com/dnviti-personal-org/dentalcraft-core/commit/26176c7c0402cf3697dbf1a87d29f4361cf274e0))
+
 ## [0.3.0-alpha.6](https://github.com/dnviti-personal-org/dentalcraft-core/compare/v0.3.0-alpha.5...v0.3.0-alpha.6) (2026-11-19)
 
 
