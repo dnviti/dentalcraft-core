@@ -59,6 +59,11 @@ rustix = { version = "1.1.6", features = ["fs", "mm", "event"] }
 zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
 windows = "0.62.2"
 windows-core = "0.62.2"  # COM objects implemented in Rust (`#[implement]` needs the crate by name)
+# Bluetooth LE on macOS: CoreBluetooth through the objc2 bindings (pure Rust, generated)
+objc2 = "0.6.5"
+objc2-foundation = "0.3.2"
+objc2-core-bluetooth = "0.3.2"
+dispatch2 = "0.3.1"
 
 # geometry: linear algebra (SVD, eigen) and k-d tree nearest neighbours
 nalgebra = "0.35.0"

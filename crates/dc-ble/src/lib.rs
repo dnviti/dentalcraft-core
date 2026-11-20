@@ -8,11 +8,15 @@
 //! Backends (all pure Rust, no C toolchain or system library at build time):
 //! - Linux: BlueZ over D-Bus, through `zbus`'s blocking API.
 //! - Windows: WinRT (`BluetoothLEDevice`, GATT) through the `windows` crate.
+//! - macOS: CoreBluetooth through the `objc2` bindings. Only inside an app
+//!   bundle whose `Info.plist` declares `NSBluetoothAlwaysUsageDescription`
+//!   (macOS kills any other process that touches Bluetooth); elsewhere every
+//!   call fails with [`BleError::AppBundleRequired`].
 //! - Other platforms: every call fails with [`BleError::Unsupported`].
 //!
-//! Alpha: the Linux and Windows code paths could not be exercised against real
-//! hardware yet; the protocol logic on top ([`chunks`], profiles) is tested
-//! with fakes.
+//! Alpha: the Windows and macOS code paths could not be exercised against
+//! real hardware yet; the protocol logic on top ([`chunks`], profiles, the
+//! macOS state machine) is tested with fakes.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,16 +35,27 @@ mod winrt;
 #[cfg(windows)]
 use winrt as platform;
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos as platform;
+// The platform-free half of the macOS backend, tested everywhere.
+#[cfg(any(target_os = "macos", test))]
+mod macos_logic;
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 mod unsupported;
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 use unsupported as platform;
 
 /// A Bluetooth LE device seen during a scan.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BleDeviceInfo {
     /// Stable identifier to pass to [`connect_serial`]: the Bluetooth address
-    /// (`AA:BB:CC:DD:EE:FF`) on both Linux and Windows.
+    /// (`AA:BB:CC:DD:EE:FF`) on Linux and Windows; on macOS, which never
+    /// reveals addresses, CoreBluetooth's identifier of the peripheral
+    /// (`8C1F4A9E-…`, a UUID that is stable on that Mac only). Treat it as
+    /// opaque.
     pub id: String,
     /// Advertised local name, when known.
     pub name: Option<String>,
@@ -69,6 +84,16 @@ pub enum BleError {
     /// The link to the device was lost.
     #[error("Bluetooth device disconnected")]
     Disconnected,
+    /// The user (or a device policy) refused Bluetooth to this application
+    /// (macOS: System Settings › Privacy & Security › Bluetooth).
+    #[error("this application is not allowed to use Bluetooth")]
+    Unauthorized,
+    /// macOS only lets an application bundle that explains its use of
+    /// Bluetooth (`NSBluetoothAlwaysUsageDescription`) touch it; this
+    /// process is not one (e.g. the bare command-line tool: drive the open
+    /// application instead).
+    #[error("Bluetooth needs the DentalCraft application bundle on macOS")]
+    AppBundleRequired,
     /// Any other failure reported by the operating system's Bluetooth stack.
     #[error("Bluetooth error: {0}")]
     Platform(String),
@@ -84,6 +109,8 @@ impl BleError {
             Self::NotFound => "ble-not-found",
             Self::Timeout => "ble-timeout",
             Self::Disconnected => "ble-disconnected",
+            Self::Unauthorized => "ble-unauthorized",
+            Self::AppBundleRequired => "ble-app-bundle-required",
             Self::Platform(_) => "ble-platform",
         }
     }
@@ -91,7 +118,8 @@ impl BleError {
 
 /// Whether a link is still up, shared by the link and its observers: the
 /// platform marks it lost as soon as the system reports the device
-/// disconnected (BlueZ `Connected` false, WinRT connection status), before
+/// disconnected (BlueZ `Connected` false, WinRT connection status,
+/// CoreBluetooth `didDisconnectPeripheral` or adapter state), before
 /// any read or write fails, and [`BleLink::close`] marks it too. Cheap to
 /// clone and to read from any thread; never does I/O.
 #[derive(Clone, Debug, Default)]
@@ -188,7 +216,8 @@ pub fn scan(
 /// service and characteristics, enable notifications and return the link.
 /// `timeout` bounds the whole connection setup. An id listed by an earlier
 /// [`scan`] stays valid: a device the system no longer knows (BlueZ forgets
-/// unpaired devices about 30 s after they disconnect) is discovered again.
+/// unpaired devices about 30 s after they disconnect; CoreBluetooth forgets
+/// peripherals too, eventually) is discovered again.
 pub fn connect_serial(
     device_id: &str,
     profile: &SerialProfile,
@@ -267,6 +296,11 @@ mod tests {
         assert_eq!(BleError::NotFound.code(), "ble-not-found");
         assert_eq!(BleError::Timeout.code(), "ble-timeout");
         assert_eq!(BleError::Disconnected.code(), "ble-disconnected");
+        assert_eq!(BleError::Unauthorized.code(), "ble-unauthorized");
+        assert_eq!(
+            BleError::AppBundleRequired.code(),
+            "ble-app-bundle-required"
+        );
         assert_eq!(BleError::Platform("x".into()).code(), "ble-platform");
     }
 
@@ -285,11 +319,18 @@ mod tests {
     /// the probe must fail cleanly with `NoAdapter`; a missing or
     /// non-activatable `bluetoothd` and a missing system bus map to it too. On
     /// a machine that does have an adapter the call may succeed or report it
-    /// off. Other platforms report `Unsupported`.
+    /// off. On macOS a test binary is no app bundle, so it is refused. Other
+    /// platforms report `Unsupported`.
     #[test]
     fn availability_maps_a_missing_stack_to_no_adapter() {
         match availability() {
-            Ok(()) | Err(BleError::AdapterOff | BleError::NoAdapter | BleError::Unsupported) => {}
+            Ok(())
+            | Err(
+                BleError::AdapterOff
+                | BleError::NoAdapter
+                | BleError::Unsupported
+                | BleError::AppBundleRequired,
+            ) => {}
             Err(e) => panic!("unexpected availability error: {e}"),
         }
         if !std::path::Path::new("/sys/class/bluetooth").exists() && cfg!(target_os = "linux") {
