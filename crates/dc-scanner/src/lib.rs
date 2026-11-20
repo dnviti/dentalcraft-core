@@ -133,6 +133,12 @@ pub enum ScanError {
     /// The backend does not run on this operating system.
     #[error("scanner backend not supported on this platform: {0}")]
     PlatformUnsupported(String),
+    /// The system keeps the video stream of the scanner for itself (macOS:
+    /// its camera driver holds the streaming interface and refuses to hand
+    /// it over), so scanning is not available on this computer; scan files
+    /// can still be imported.
+    #[error("the system keeps the scanner's video stream: {0}")]
+    PlatformCaptureDenied(String),
     /// The device left while streaming (unplugged, USB reset).
     #[error("scanner disconnected: {0}")]
     DeviceLost(String),
@@ -204,6 +210,7 @@ impl ScanError {
             Self::SdkMissing(_) => "sdk-missing",
             Self::SdkUnauthorized(_) => "sdk-unauthorized",
             Self::PlatformUnsupported(_) => "platform-unsupported",
+            Self::PlatformCaptureDenied(_) => "platform-capture-denied",
             Self::DeviceLost(_) => "device-lost",
             Self::Turntable(e) => e.code(),
             Self::Calibration(_) => "calibration",
@@ -344,7 +351,7 @@ pub trait ScannerBackend: Send + Sync {
 
 /// The registered backends. The simulated backend `sim` is always present;
 /// `revopoint-sdk` lists no device until the Revopoint SDK is installed;
-/// `revopoint-usb` (Linux, Windows) lists the Revopoint scanners on USB.
+/// `revopoint-usb` (Linux, Windows, macOS) lists the Revopoint scanners on USB.
 pub fn backends() -> Vec<Box<dyn ScannerBackend>> {
     vec![
         Box::new(revopoint_sdk::RevopointSdkBackend::default()),
@@ -385,6 +392,7 @@ mod tests {
             ScanError::from(dc_geom::GeomError::Cancelled),
             ScanError::from(dc_geom::GeomError::InvalidInput("x".into())),
             ScanError::PlatformUnsupported("x".into()),
+            ScanError::PlatformCaptureDenied("x".into()),
             ScanError::DeviceLost("x".into()),
             ScanError::NoStops,
         ];
@@ -398,6 +406,7 @@ mod tests {
                 "cancelled",
                 "geometry",
                 "platform-unsupported",
+                "platform-capture-denied",
                 "device-lost",
                 "scan-no-stops"
             ]
@@ -409,7 +418,7 @@ mod tests {
         let ids: Vec<&str> = backends().iter().map(|b| b.id()).collect();
         assert_eq!(ids, ["revopoint-sdk", "revopoint-usb", "sim"]);
         let usb = backend("revopoint-usb").unwrap();
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             usb.availability().unwrap();
         } else if cfg!(windows) {
             // Media Foundation may be missing (Windows N without the Media

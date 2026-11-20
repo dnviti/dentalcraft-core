@@ -1,33 +1,39 @@
 //! Revopoint MINI 2 over plain USB video, backend `revopoint-usb` (alpha,
-//! Linux and Windows).
+//! Linux, Windows and macOS).
 //!
 //! The MINI 2 computes depth on the device and streams it as a standard UVC
 //! camera (USB `2207:110c`): the depth node (interface 0) sends `Y16`
 //! frames, the colour node (interface 2) `MJPG` 1600x1200. This backend
 //! reads the depth node with the standard capture API of the system, plain
 //! V4L2 calls on Linux (`v4l2`) and Media Foundation on Windows (`mf`, on
-//! the inbox UVC driver `usbvideo`), and needs no vendor SDK. Its vendor
+//! the inbox UVC driver `usbvideo`); on macOS, whose camera stack does not
+//! deliver `Y16`, its own user-space UVC reader ([`uvc_bulk`]) streams the
+//! video-streaming interface it takes from the system (`macos`, else
+//! `platform-capture-denied`). It needs no vendor SDK. Its vendor
 //! commands are closed lists the user authorised on 2026-11-18, the same on
 //! every platform ([`xu`]: one protocol layer, carried by `uvcvideo` on
-//! Linux and by the kernel-streaming properties of the video source on
-//! Windows): the fill light ([`light`]: on while streaming, off after), the
-//! fast exposure profile ([`exposure`]) and the read-only factory
-//! calibration file read ([`factory`]). What they did, and the intrinsics in
-//! use, is reported the same way on every platform
-//! ([`crate::ScannerDevice::vendor_status`], `vendor` of `scan.status`). It
-//! sends no other extension-unit request, no HID report and no firmware.
-//! The colour stream is not read (it is not registered to the depth image,
-//! and stopping it also resets the depth stream).
+//! Linux, by the kernel-streaming properties of the video source on
+//! Windows and by class requests on endpoint 0 on macOS): the fill light
+//! ([`light`]: on while streaming, off after), the fast exposure profile
+//! ([`exposure`]) and the read-only factory calibration file read
+//! ([`factory`]). What they did, and the intrinsics in use, is reported the
+//! same way on every platform ([`crate::ScannerDevice::vendor_status`],
+//! `vendor` of `scan.status`). It sends no other extension-unit request, no
+//! HID report and no firmware. The colour stream is not read (it is not
+//! registered to the depth image, and stopping it also resets the depth
+//! stream).
 //!
 //! * **Discovery.** [`ScannerBackend::list`] enumerates the USB devices with
 //!   `nusb` and keeps the `2207:110c` devices. On Linux their V4L2 nodes are
 //!   under `/sys/bus/usb/devices/<port>:1.0/video4linux/` (depth) and
 //!   `<port>:1.2` (colour); on Windows the depth node is the Media
 //!   Foundation video source of interface 0 (`...&MI_00`) whose parent
-//!   device node is the listed USB device. It lists, by serial number, only
-//!   the devices whose depth node exists: a scanner held by another program
-//!   (e.g. the USB redirection of a virtual machine, which unbinds
-//!   `uvcvideo`) or still re-enumerating cannot stream and is not offered.
+//!   device node is the listed USB device; on macOS it is the device itself
+//!   when it has the video-streaming interface 1. It lists, by serial
+//!   number, only the devices whose depth node exists: a scanner held by
+//!   another program (e.g. the USB redirection of a virtual machine, which
+//!   unbinds `uvcvideo`) or still re-enumerating cannot stream and is not
+//!   offered.
 //!   The same USB id is used by the MINI and the POP4, so the name says
 //!   "MINI 2" only for the `bcdDevice` seen on the MINI 2
 //!   ([`MINI2_BCD_DEVICE`]), else it is generic.
@@ -36,7 +42,7 @@
 //!   times the depth scale; `0` is no depth. Frames are copied out of the
 //!   driver buffers before these are queued again; frames queued behind the
 //!   one read are newer, and the backend keeps the newest (V4L2 driver
-//!   queue on Linux, the same bounded queue on Windows).
+//!   queue on Linux, the same bounded queue on Windows and macOS).
 //! * **Calibration.** Intrinsics and depth scale come from a user file, else
 //!   the factory calibration read from the scanner and cached, else the
 //!   alpha defaults, see [`calib`] and [`factory`]. The depth scale is an
@@ -70,11 +76,12 @@
 //! resume never trigger a reconnection; only stop / start do.
 //!
 //! On Windows without Media Foundation (N editions without the Media
-//! Feature Pack) and on other platforms [`ScannerBackend::availability`]
-//! reports `platform-unsupported` and no device is listed.
+//! Feature Pack) and on other platforms than Linux, Windows and macOS
+//! [`ScannerBackend::availability`] reports `platform-unsupported` and no
+//! device is listed.
 
 pub mod calib;
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 mod device;
 pub mod exposure;
 pub mod factory;
@@ -84,10 +91,14 @@ mod ks;
 pub mod light;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(windows)]
 mod mf;
-#[cfg(any(windows, test))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos", test))]
 mod ring;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod uvc_bulk;
 #[cfg(target_os = "linux")]
 mod v4l2;
 #[cfg(windows)]
@@ -98,6 +109,8 @@ pub mod xu;
 // depth node.
 #[cfg(target_os = "linux")]
 use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
 #[cfg(windows)]
 use win as platform;
 
@@ -106,7 +119,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 pub use calib::{Calibration, CalibrationSource};
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 pub use device::RevopointUsbDevice;
 pub use exposure::ExposureProfile;
 pub use factory::FactoryFile;
@@ -114,7 +127,7 @@ pub use frame::StreamMode;
 pub use light::FillLight;
 pub use xu::XuTransport;
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 use crate::{DeviceInfo, Result, ScannerBackend, ScannerDevice};
 
 /// Id of the USB backend.
@@ -200,7 +213,7 @@ impl RevopointUsbBackend {
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 impl ScannerBackend for RevopointUsbBackend {
     fn id(&self) -> &'static str {
         BACKEND_ID
@@ -208,8 +221,8 @@ impl ScannerBackend for RevopointUsbBackend {
 
     fn availability(&self) -> Result<()> {
         Err(crate::ScanError::PlatformUnsupported(format!(
-            "{BACKEND_ID} uses V4L2 (Linux) or Media Foundation (Windows); on this system use \
-             revopoint-sdk"
+            "{BACKEND_ID} uses V4L2 (Linux), Media Foundation (Windows) or IOKit (macOS); on \
+             this system use revopoint-sdk"
         )))
     }
 

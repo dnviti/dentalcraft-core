@@ -39,6 +39,11 @@ windows = { workspace = true, features = [
 ] }
 windows-core.workspace = true
 
+# the USB video reader of `revopoint_usb::uvc_bulk` (IOKit through nusb, plus
+# a few direct IOKit calls in `revopoint_usb::macos`)
+[target.'cfg(target_os = "macos")'.dependencies]
+nusb.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 
