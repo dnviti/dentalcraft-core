@@ -6,11 +6,11 @@
 //! waits for the end of the motion so `busy` clears by itself. Nothing here
 //! holds the controller while a table moves.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use dc_turntable::sim::{self as table_sim, SimRig, SimTurntableBackend};
 use dc_turntable::{
@@ -25,7 +25,7 @@ use super::jobs::{
     self, AutoMode, AutoPlan, CalibrationPlan, FinishPlan, Job, JobShared, TableHandle, lock,
 };
 use super::{
-    AUTO_FRAMES_PER_STOP, AUTO_RESOLUTION_MM, AUTO_STEP_DEG, AUTO_TILTS_DEG,
+    AUTO_FRAMES_PER_STOP, AUTO_RESOLUTION_MM, AUTO_STEP_DEG, AUTO_TILTS_DEG, CALIBRATION_FILE,
     RECONSTRUCT_RESOLUTION_MM, RigCalibration, RigJobKind, RigJobState, RigJobStatus,
     TurntableStatus, calibration_json,
 };
@@ -216,6 +216,17 @@ impl Watcher {
     }
 }
 
+/// A version of the rig calibration file: its modification time and size;
+/// `None` when there is no file.
+type FileStamp = Option<(Option<SystemTime>, u64)>;
+
+/// The version of the calibration file in `dir` now.
+fn file_stamp(dir: &Path) -> FileStamp {
+    std::fs::metadata(dir.join(CALIBRATION_FILE))
+        .ok()
+        .map(|m| (m.modified().ok(), m.len()))
+}
+
 /// Turntable side of the [`ScanController`].
 pub(crate) struct RigState {
     sim: Arc<SimRig>,
@@ -226,7 +237,9 @@ pub(crate) struct RigState {
     last_auto: Option<Arc<JobShared>>,
     last_calibration: Option<Arc<JobShared>>,
     calibration: Option<RigCalibration>,
-    loaded: bool,
+    /// The version of the calibration file `calibration` was read from;
+    /// `None` before the first read.
+    read: Option<FileStamp>,
 }
 
 impl Default for RigState {
@@ -240,7 +253,7 @@ impl Default for RigState {
             last_auto: None,
             last_calibration: None,
             calibration: None,
-            loaded: false,
+            read: None,
         }
     }
 }
@@ -279,14 +292,21 @@ impl RigState {
             .ok_or(ScanError::Turntable(TurntableError::NotConnected))
     }
 
-    /// Loads the stored calibration once.
-    fn ensure_loaded(&mut self) -> Result<()> {
-        if !self.loaded {
-            self.loaded = true;
-            if let Some(dir) = &self.dir {
-                self.calibration = super::load_calibration(dir)?;
-            }
+    /// Reads the stored calibration when the file changed since it was last
+    /// read (first use, written by another run, copied in, removed): a
+    /// calibration file added while the app runs is used without a
+    /// restart. An unreadable file leaves the calibration in memory as it
+    /// was.
+    fn refresh(&mut self) -> Result<()> {
+        let Some(dir) = &self.dir else {
+            return Ok(());
+        };
+        let stamp = file_stamp(dir);
+        if self.read == Some(stamp) {
+            return Ok(());
         }
+        self.calibration = super::load_calibration(dir)?;
+        self.read = Some(stamp);
         Ok(())
     }
 }
@@ -330,7 +350,7 @@ impl ScanController {
     /// from it.
     pub fn set_rig_dir(&mut self, dir: impl Into<PathBuf>) {
         self.rig.dir = Some(dir.into());
-        self.rig.loaded = false;
+        self.rig.read = None;
         self.rig.calibration = None;
     }
 
@@ -383,25 +403,32 @@ impl ScanController {
         self.rig.last_calibration.as_ref().map(|j| j.status())
     }
 
-    /// The stored rig calibration (read at `turntable.connect` and
-    /// `turntable.calibration`, replaced by `turntable.calibrate`).
+    /// The stored rig calibration (read again, when its file changed, at
+    /// `scan.connect`, `turntable.connect`, `turntable.calibration`,
+    /// `scan.auto` and `turntable.calibrate`; replaced by a calibration
+    /// that `turntable.calibrate` measured).
     pub fn calibration(&self) -> Option<RigCalibration> {
         self.rig.calibration.clone()
     }
 
-    /// A rig job (`scan.auto`, `turntable.calibrate`) ended and is not
-    /// finalised yet: until then the acquisition still runs held, as the
-    /// job left it. Every command finalises it first; a host that only
-    /// reads the controller calls [`ScanController::finish_rig_job`].
-    pub fn rig_job_ended(&self) -> bool {
-        self.rig.job.as_ref().is_some_and(|(_, j)| j.finished())
+    /// A rig job (`scan.auto`, `turntable.calibrate`) ended, or the stream
+    /// failed by itself (the scanner was lost), and is not finalised yet:
+    /// until then the session holds the acquisition as the job or the
+    /// stream left it. Every command finalises it first; a host that only
+    /// reads the controller calls [`ScanController::finish_ended`].
+    pub fn needs_finish(&self) -> bool {
+        match &self.rig.job {
+            Some((_, j)) => j.finished(),
+            None => self.session.stream_failed(),
+        }
     }
 
-    /// Finalises a rig job that ended, as any command does first: after a
+    /// Finalises what ended, as any command does first: after a
     /// calibration the acquisition is reset and the new calibration
-    /// applied, after `scan.auto` the acquisition goes on paused. Nothing
-    /// happens while the job runs.
-    pub fn finish_rig_job(&mut self) {
+    /// applied, after `scan.auto` the acquisition goes on paused, after a
+    /// failed stream the acquisition stops and the editor gets what was
+    /// fused. Nothing happens while a job runs.
+    pub fn finish_ended(&mut self) {
         self.reap_rig(false);
     }
 
@@ -431,8 +458,21 @@ impl ScanController {
     /// Finalises a finished job: after a calibration the acquisition is
     /// reset and the new calibration applied; after `scan.auto` the
     /// acquisition goes on paused. With `cancel`, a running job is
-    /// cancelled first and the settle watcher stopped.
+    /// cancelled first and the settle watcher stopped. Without a job, an
+    /// acquisition whose stream failed is stopped: the editor gets what
+    /// was fused.
     pub(crate) fn reap_rig(&mut self, cancel: bool) {
+        self.reap_job(cancel);
+        if self.rig.job.is_none()
+            && self.session.stream_failed()
+            && let Ok(cloud) = self.session.stop()
+            && !cloud.is_empty()
+        {
+            self.editor = Some(ScanEditor::new(cloud));
+        }
+    }
+
+    fn reap_job(&mut self, cancel: bool) {
         if cancel {
             if let Some((_, job)) = &self.rig.job {
                 job.shared.cancel();
@@ -466,8 +506,9 @@ impl ScanController {
             RigJobKind::Calibrate => {
                 self.session.reset();
                 if let Some(c) = shared.take_result() {
+                    // the job wrote it to the file: that version is read
                     self.rig.calibration = Some(c);
-                    self.rig.loaded = true;
+                    self.rig.read = self.rig.dir.as_deref().map(file_stamp);
                 }
                 self.apply_rig();
             }
@@ -516,7 +557,7 @@ impl ScanController {
     pub(crate) fn apply_rig(&mut self) {
         // an unreadable calibration file must not prevent a connection:
         // turntable.calibration reports it
-        let _ = self.rig.ensure_loaded();
+        let _ = self.rig.refresh();
         let serial = self.session.status().device.and_then(|d| d.serial);
         let (calibration, probe) = match &self.rig.table {
             Some(c) => {
@@ -601,7 +642,7 @@ impl ScanController {
             }
             TURNTABLE_CALIBRATION => {
                 let NoParams {} = parse(params)?;
-                self.rig.ensure_loaded()?;
+                self.rig.refresh()?;
                 Ok(calibration_json(self.rig.calibration.as_ref()))
             }
             SCAN_AUTO => {
@@ -760,6 +801,14 @@ impl ScanController {
 
     fn auto(&mut self, p: &AutoParams) -> Result<Value> {
         let (table, axes, _) = self.job_prerequisites()?;
+        // a calibration file written since the connection is used (a scan
+        // under way keeps the rig it started with)
+        if !matches!(
+            self.session.status().state,
+            ScanState::Scanning | ScanState::Paused
+        ) {
+            self.apply_rig();
+        }
         if self.session.rig_calibration().is_none() && p.allow_uncalibrated != Some(true) {
             return Err(ScanError::RigUncalibrated);
         }
@@ -872,6 +921,8 @@ impl ScanController {
 
     fn calibrate(&mut self, p: &CalibrateParams) -> Result<Value> {
         let (table, axes, info) = self.job_prerequisites()?;
+        // the calibration shown while measuring is the stored one
+        let _ = self.rig.refresh();
         let steps = p.steps.unwrap_or(24);
         let step_deg = p.step_deg.unwrap_or(15.0);
         let total = steps as f32 * step_deg;
@@ -992,6 +1043,88 @@ mod tests {
         // connecting again gives a working table
         run(&mut c, TURNTABLE_CONNECT, json!({"backend": "sim"}));
         assert!(c.turntable_status().connected);
+    }
+
+    #[test]
+    fn a_lost_scanner_stops_the_scan_and_keeps_what_was_fused() {
+        let mut c = ScanController::new();
+        run(
+            &mut c,
+            crate::control::SCAN_CONNECT,
+            json!({"backend": "sim", "options": {"realtime": false, "lost_after": 8, "width": 160, "height": 100}}),
+        );
+        run(&mut c, crate::control::SCAN_START, json!({}));
+        let start = std::time::Instant::now();
+        while !c.needs_finish() {
+            assert!(start.elapsed().as_secs() < 60, "{:?}", c.session().status());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let st = c.session().status();
+        assert_eq!(st.state, ScanState::Stopped);
+        assert_eq!((st.fps, st.tracking_ok), (0.0, false));
+        // a window that only reads finalises it: the editor gets the cloud
+        c.finish_ended();
+        assert!(!c.needs_finish());
+        assert!(c.editor().is_some_and(|e| !e.cloud().is_empty()));
+        let st = run(&mut c, crate::control::SCAN_STATUS, json!({}));
+        assert_eq!(st["state"], "stopped", "{st}");
+        assert_eq!(st["error"], "device-lost", "{st}");
+        assert_eq!(st["fps"], 0.0, "{st}");
+    }
+
+    #[test]
+    fn a_calibration_file_written_while_the_app_runs_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = ScanController::new();
+        c.set_rig_dir(dir.path());
+        run(
+            &mut c,
+            crate::control::SCAN_CONNECT,
+            json!({"backend": "sim", "options": {"realtime": false, "width": 64, "height": 40}}),
+        );
+        run(&mut c, TURNTABLE_CONNECT, json!({"backend": "sim"}));
+        assert_eq!(c.calibration(), None);
+        // no calibration: scan.auto refuses before it reads its parameters
+        let auto = |c: &mut ScanController| {
+            c.execute(SCAN_AUTO, &json!({"tilts_deg": []}), &|| false)
+                .unwrap_err()
+                .code()
+        };
+        assert_eq!(auto(&mut c), "rig-uncalibrated");
+        // a calibration of this scanner and table appears (another run of
+        // the app, a copy): scan.auto uses it without a new connection
+        let calibration = RigCalibration {
+            axis_point: [0.0, 0.0, 150.0],
+            axis_dir: [0.0, 0.0, 1.0],
+            platter_up: [0.0, 0.0, -1.0],
+            tilt_axis_point: None,
+            tilt_axis_dir: None,
+            scanner_serial: c.session().status().device.and_then(|d| d.serial),
+            turntable_id: table_sim::DEVICE_ID.into(),
+            created: "2026-11-20T12:00:00Z".into(),
+            fit_rms_deg: 0.1,
+            fit_rms_mm: 0.05,
+            angle_gain: 1.0,
+            fit_pairs: 24,
+            imu_up: None,
+        };
+        super::super::save_calibration(dir.path(), &calibration).unwrap();
+        assert_eq!(auto(&mut c), "invalid-params");
+        assert!(c.turntable_status().calibrated);
+        assert_eq!(c.calibration().unwrap().fit_pairs, 24);
+        // changed: turntable.calibration reads the new one
+        let changed = RigCalibration {
+            fit_pairs: 7,
+            ..calibration
+        };
+        super::super::save_calibration(dir.path(), &changed).unwrap();
+        let out = run(&mut c, TURNTABLE_CALIBRATION, json!({}));
+        assert_eq!(out["fit_pairs"], 7, "{out}");
+        // removed: none any more, at the next connection
+        std::fs::remove_file(dir.path().join(CALIBRATION_FILE)).unwrap();
+        run(&mut c, TURNTABLE_CONNECT, json!({"backend": "sim"}));
+        assert_eq!(c.calibration(), None);
+        assert!(!c.turntable_status().calibrated);
     }
 
     #[test]

@@ -244,8 +244,10 @@ struct Shared {
     paused: AtomicBool,
     /// A rig job keeps the frames out of the model (tracking continues).
     hold: AtomicBool,
-    /// A rig job ended the acquisition ([`RigLink::end_acquisition`]): the
-    /// stream is off and the thread gone, its model waits to be joined.
+    /// The acquisition ended without the session: a rig job ended it
+    /// ([`RigLink::end_acquisition`]) or its stream failed (device lost).
+    /// The stream is off and the thread gone, its model waits to be
+    /// joined.
     ended: AtomicBool,
     live: Mutex<Live>,
     rig: Mutex<RigInput>,
@@ -731,7 +733,7 @@ impl ScanSession {
     }
 
     fn start_with(&mut self, hold: bool) -> Result<()> {
-        match self.state {
+        match self.live_state() {
             ScanState::Connected | ScanState::Stopped => {}
             ScanState::Idle => return Err(ScanError::NotConnected),
             state => {
@@ -741,6 +743,9 @@ impl ScanSession {
                 });
             }
         }
+        // a stream that ended by itself (device lost, rig job) gives the
+        // device and the model back first: the scan goes on from them
+        self.join()?;
         let mut device = self.device.take().ok_or(ScanError::NotConnected)?;
         let started = self
             .settings
@@ -868,9 +873,9 @@ impl ScanSession {
         self.shared.hold.store(false, Ordering::SeqCst);
     }
 
-    /// The state as it is: a rig job may have ended the acquisition
-    /// ([`RigLink::end_acquisition`]) while the session still holds the
-    /// thread, which is then `Stopped` already.
+    /// The state as it is: a rig job ([`RigLink::end_acquisition`]) or a
+    /// failed stream may have ended the acquisition while the session still
+    /// holds the thread, which is then `Stopped` already.
     fn live_state(&self) -> ScanState {
         match self.state {
             ScanState::Scanning | ScanState::Paused if self.shared.ended.load(Ordering::SeqCst) => {
@@ -878,6 +883,15 @@ impl ScanSession {
             }
             state => state,
         }
+    }
+
+    /// The stream failed by itself (the device was lost) and the session
+    /// still holds that ended acquisition: [`ScanSession::stop`] takes its
+    /// model back.
+    pub(crate) fn stream_failed(&self) -> bool {
+        self.worker.is_some()
+            && self.shared.ended.load(Ordering::SeqCst)
+            && self.shared.live().error.is_some()
     }
 
     /// The acquisition as seen by a rig job thread.
@@ -974,11 +988,10 @@ impl ScanSession {
     }
 
     fn require_idle(&self, action: &'static str) -> Result<()> {
-        match self.state {
-            ScanState::Scanning | ScanState::Paused => Err(ScanError::InvalidState {
-                action,
-                state: self.state,
-            }),
+        match self.live_state() {
+            state @ (ScanState::Scanning | ScanState::Paused) => {
+                Err(ScanError::InvalidState { action, state })
+            }
             _ => Ok(()),
         }
     }
@@ -1639,6 +1652,16 @@ fn acquire(
             last_publish = Some(now);
         }
     }
+    // nothing streams any more: no frame rate, nothing tracked
+    let mut live = shared.live();
+    live.fps = 0.0;
+    live.tracking_ok = false;
+    if live.error.is_some() {
+        // the stream failed (device lost): the session is no longer
+        // scanning; its model waits to be joined, as after a rig job
+        shared.ended.store(true, Ordering::SeqCst);
+    }
+    drop(live);
     (device, fusion)
 }
 
@@ -1780,6 +1803,52 @@ mod tests {
         assert!(!cloud.is_empty());
         let p = s.preview().unwrap();
         assert_eq!(p.cloud.len(), cloud.len());
+    }
+
+    #[test]
+    fn a_lost_device_ends_the_scan_by_itself() {
+        let mut s = ScanSession::new(ScanSettings::default());
+        let backend = SimBackend::new(SimOptions {
+            realtime: false,
+            lost_after: Some(6),
+            width: 160,
+            height: 100,
+            ..SimOptions::default()
+        });
+        s.connect_with(&backend, UPPER_ID).unwrap();
+        s.start().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while s.status().state != ScanState::Stopped {
+            assert!(Instant::now() < deadline, "{:?}", s.status());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // no scan under way any more: no frame rate, nothing tracked, the
+        // reason given
+        let st = s.status();
+        assert_eq!(st.frames, 6);
+        assert_eq!(st.fps, 0.0);
+        assert!(!st.tracking_ok);
+        assert_eq!(st.error.as_deref(), Some("device-lost"));
+        assert!(s.stream_failed());
+        assert_eq!(s.pause().unwrap_err().code(), "invalid-state");
+        // the settings may change, as with any stopped scan
+        s.set_settings(ScanSettings::default()).unwrap();
+        // stop takes back what was fused
+        let cloud = s.stop().unwrap();
+        assert!(!cloud.is_empty());
+        assert!(!s.stream_failed());
+        assert_eq!(s.status().state, ScanState::Stopped);
+        // the scan may go on (the device is still lost: it ends again)
+        s.start().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !s.stream_failed() {
+            assert!(Instant::now() < deadline, "{:?}", s.status());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // and start again without a stop in between
+        s.start().unwrap();
+        s.reset();
+        assert_eq!(s.status().state, ScanState::Connected);
     }
 
     /// A simulated device with a vendor layer: its light follows the stream.

@@ -56,6 +56,9 @@ pub struct SimOptions {
     pub realtime: bool,
     /// Stop producing frames after this many (`None`: endless).
     pub max_frames: Option<u64>,
+    /// The device is lost (as if unplugged) after this many frames: its
+    /// stream fails with `device-lost` from then on (`None`: never).
+    pub lost_after: Option<u64>,
     /// Depth image width in pixels.
     pub width: u32,
     /// Depth image height in pixels.
@@ -79,6 +82,7 @@ impl Default for SimOptions {
         Self {
             realtime: true,
             max_frames: None,
+            lost_after: None,
             width: 640,
             height: 400,
             fps: 10.0,
@@ -475,6 +479,12 @@ impl ScannerDevice for SimDevice {
         let Some(started) = self.started else {
             return Err(ScanError::Device("stream not started".into()));
         };
+        if self.options.lost_after.is_some_and(|m| self.frame >= m) {
+            self.set_streaming(false);
+            return Err(ScanError::DeviceLost(
+                "the simulated scanner was unplugged".into(),
+            ));
+        }
         if self.options.max_frames.is_some_and(|m| self.frame >= m) {
             // no frame will pace the turntable any more
             self.set_streaming(false);

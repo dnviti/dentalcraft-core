@@ -142,6 +142,16 @@ pub enum ScanError {
     /// The device left while streaming (unplugged, USB reset).
     #[error("scanner disconnected: {0}")]
     DeviceLost(String),
+    /// The system does not let this program use the scanner's camera
+    /// (Windows: camera access for desktop apps is off in the privacy
+    /// settings).
+    #[error("camera access denied: {0}")]
+    CameraAccessDenied(String),
+    /// The system refuses to open the scanner's camera because of where the
+    /// program runs from (Windows: a network or shared drive); a copy of
+    /// the program on a local disk opens it.
+    #[error("the scanner cannot be opened from where the program runs: {0}")]
+    ProgramLocation(String),
     /// The turntable failed or refused (its code, e.g.
     /// `turntable-not-connected`, `ble-no-adapter`).
     #[error(transparent)]
@@ -212,6 +222,8 @@ impl ScanError {
             Self::PlatformUnsupported(_) => "platform-unsupported",
             Self::PlatformCaptureDenied(_) => "platform-capture-denied",
             Self::DeviceLost(_) => "device-lost",
+            Self::CameraAccessDenied(_) => "camera-access-denied",
+            Self::ProgramLocation(_) => "program-location",
             Self::Turntable(e) => e.code(),
             Self::Calibration(_) => "calibration",
             Self::RigUncalibrated => "rig-uncalibrated",
@@ -394,6 +406,8 @@ mod tests {
             ScanError::PlatformUnsupported("x".into()),
             ScanError::PlatformCaptureDenied("x".into()),
             ScanError::DeviceLost("x".into()),
+            ScanError::CameraAccessDenied("x".into()),
+            ScanError::ProgramLocation("x".into()),
             ScanError::NoStops,
         ];
         let codes: Vec<&str> = errors.iter().map(ScanError::code).collect();
@@ -408,6 +422,8 @@ mod tests {
                 "platform-unsupported",
                 "platform-capture-denied",
                 "device-lost",
+                "camera-access-denied",
+                "program-location",
                 "scan-no-stops"
             ]
         );

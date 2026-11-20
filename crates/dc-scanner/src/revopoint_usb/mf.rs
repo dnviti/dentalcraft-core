@@ -85,6 +85,10 @@ const BUSY: [HRESULT; 4] = [
 const ACCESS_DENIED: HRESULT = win32(5);
 /// `ERROR_NOT_READY`: the device is still starting.
 const NOT_READY: HRESULT = win32(21);
+/// `ERROR_NOT_FOUND`: what `MFCreateDeviceSource` returns for a device
+/// that is there when the program runs from a network or shared drive
+/// (see [`super::location`]).
+const ELEMENT_NOT_FOUND: HRESULT = win32(1168);
 
 /// A failed call as a scanner error: a vanished device is `device-lost`.
 pub(super) fn hr_error(call: &str, hr: HRESULT) -> ScanError {
@@ -94,13 +98,69 @@ pub(super) fn hr_error(call: &str, hr: HRESULT) -> ScanError {
     } else if BUSY.contains(&hr) {
         ScanError::Device(format!("{detail} (another program is using the scanner)"))
     } else if hr == ACCESS_DENIED {
-        ScanError::Device(format!(
+        ScanError::CameraAccessDenied(format!(
             "{detail} (camera access is off in the Windows privacy settings: allow desktop \
              apps to access the camera)"
         ))
     } else {
         ScanError::Device(detail)
     }
+}
+
+/// The error of `MFCreateDeviceSource` failing with `hr`: `ERROR_NOT_FOUND`
+/// for a listed device is the program's location ([`super::location`]);
+/// `location` is the folder of the program and the kind of drive it is on
+/// when that is not a local disk.
+fn open_error(hr: HRESULT, location: Option<(String, &'static str)>) -> ScanError {
+    let e = hr_error("MFCreateDeviceSource", hr);
+    if hr != ELEMENT_NOT_FOUND {
+        return e;
+    }
+    let detail = format!(
+        "MFCreateDeviceSource: {} ({:#010x})",
+        hr.message(),
+        hr.0 as u32
+    );
+    match location {
+        Some((dir, what)) => {
+            ScanError::ProgramLocation(super::location::advice(&detail, &dir, what))
+        }
+        None => ScanError::Device(format!(
+            "{detail} (if DentalCraft runs from a network or shared drive, copy it to a local \
+             disk and start it from there)"
+        )),
+    }
+}
+
+/// The folder of the running program and the kind of drive it is on, when
+/// that is not a local disk ([`super::location::not_local`]).
+fn program_location() -> Option<(String, &'static str)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{
+        GetDriveTypeW, GetVolumeInformationW, GetVolumePathNameW,
+    };
+    use windows::core::PCWSTR;
+    let exe = std::env::current_exe().ok()?;
+    let wide: Vec<u16> = exe.as_os_str().encode_wide().chain([0]).collect();
+    let mut root = [0u16; 1024];
+    // SAFETY: a NUL-terminated path and an output buffer, both alive for
+    // the call.
+    unsafe { GetVolumePathNameW(PCWSTR(wide.as_ptr()), &mut root) }.ok()?;
+    // SAFETY: `root` is NUL-terminated (written by the call above).
+    let drive_type = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+    let mut fs = [0u16; 64];
+    // SAFETY: as above; `fs` is an output buffer alive for the call.
+    let file_system = unsafe {
+        GetVolumeInformationW(PCWSTR(root.as_ptr()), None, None, None, None, Some(&mut fs))
+    }
+    .map(|()| {
+        let end = fs.iter().position(|&c| c == 0).unwrap_or(fs.len());
+        String::from_utf16_lossy(&fs[..end])
+    })
+    .unwrap_or_default();
+    let what = super::location::not_local(drive_type, &file_system)?;
+    let dir = exe.parent().unwrap_or(&exe).display().to_string();
+    Some((dir, what))
 }
 
 // ----- run-time loaded entry points ----------------------------------------
@@ -485,7 +545,11 @@ impl Capture {
         // one reference to an `IMFMediaSource`.
         unsafe { (api.create_device_source)(attributes.as_raw(), &mut raw) }
             .ok()
-            .map_err(|e| fail("MFCreateDeviceSource", e))?;
+            .map_err(|e| {
+                let hr = e.code();
+                let location = (hr == ELEMENT_NOT_FOUND).then(program_location).flatten();
+                (hr, open_error(hr, location))
+            })?;
         // SAFETY: a non-null owned `IMFMediaSource` pointer.
         let source = unsafe { IMFMediaSource::from_raw(raw) };
         let shutdown = |e| {
@@ -748,8 +812,24 @@ mod tests {
         assert_eq!(hr_error("x", win32(6)).code(), "device-lost");
         let busy = hr_error("x", MF_E_VIDEO_RECORDING_DEVICE_PREEMPTED).to_string();
         assert!(busy.contains("another program"), "{busy}");
-        let denied = hr_error("x", ACCESS_DENIED).to_string();
-        assert!(denied.contains("privacy"), "{denied}");
+        let denied = hr_error("x", ACCESS_DENIED);
+        assert_eq!(denied.code(), "camera-access-denied");
+        assert!(denied.to_string().contains("privacy"), "{denied}");
         assert_eq!(win32(5), HRESULT(0x8007_0005_u32 as i32));
+        // the device is listed but cannot be opened from a shared drive
+        assert_eq!(ELEMENT_NOT_FOUND, HRESULT(0x8007_0490_u32 as i32));
+        let shared = open_error(
+            ELEMENT_NOT_FOUND,
+            Some((r"Z:\dc-test".into(), "shared or virtual drive")),
+        );
+        assert_eq!(shared.code(), "program-location");
+        assert!(shared.to_string().contains(r"Z:\dc-test"), "{shared}");
+        let local = open_error(ELEMENT_NOT_FOUND, None);
+        assert_eq!(local.code(), "device");
+        assert!(local.to_string().contains("local disk"), "{local}");
+        assert_eq!(
+            open_error(ACCESS_DENIED, None).code(),
+            "camera-access-denied"
+        );
     }
 }

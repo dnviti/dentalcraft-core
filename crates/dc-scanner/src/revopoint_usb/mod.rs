@@ -91,6 +91,8 @@ mod ks;
 pub mod light;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(any(windows, test))]
+mod location;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]
