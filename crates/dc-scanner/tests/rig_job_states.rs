@@ -5,7 +5,9 @@
 //!   was; when the link does not come back the job fails but keeps its
 //!   stops, which can be exported and rebuilt;
 //! * during the finish the acquisition is over: the scan reports
-//!   `stopped`, no frame is tracked, the table is not busy.
+//!   `stopped`, no frame is tracked, the table is not busy;
+//! * a calibration made before the turntable was moved stops the scan on
+//!   its first views (`calibration-outdated`) until it is measured again.
 
 use std::time::{Duration, Instant};
 
@@ -37,9 +39,8 @@ fn wait_auto(c: &mut ScanController) -> Value {
 }
 
 /// The exact calibration of the simulated rig (scene +Z the rotation
-/// axis through the origin, tilt about +X under the platter), stored in
-/// `dir`, so the stop-and-capture mode runs without measuring it.
-fn store_true_calibration(dir: &std::path::Path) {
+/// axis through the origin, tilt about +X under the platter).
+fn true_calibration() -> RigCalibration {
     let options = SimOptions {
         realtime: false,
         width: WIDTH,
@@ -48,7 +49,7 @@ fn store_true_calibration(dir: &std::path::Path) {
     };
     let to_cam = sim::rig_camera_pose(&options).inverse();
     let axis_dir = to_cam.transform_vector3(Vec3::Z).normalize();
-    let c = RigCalibration {
+    RigCalibration {
         axis_point: to_cam.transform_point3(Vec3::ZERO).into(),
         axis_dir: axis_dir.into(),
         platter_up: axis_dir.into(),
@@ -66,8 +67,13 @@ fn store_true_calibration(dir: &std::path::Path) {
         angle_gain: 1.0,
         fit_pairs: 24,
         imu_up: None,
-    };
-    save_calibration(dir, &c).unwrap();
+    }
+}
+
+/// The exact calibration of the simulated rig, stored in `dir`, so the
+/// stop-and-capture mode runs without measuring it.
+fn store_true_calibration(dir: &std::path::Path) {
+    save_calibration(dir, &true_calibration()).unwrap();
 }
 
 /// A controller on the simulated rig, calibrated.
@@ -93,6 +99,47 @@ fn rig(dir: &std::path::Path) -> ScanController {
 fn auto_params() -> Value {
     json!({"mode": "stop-and-capture", "tilts_deg": [0], "rotation_deg": 90, "step_deg": 10,
            "frames_per_stop": 1, "deg_per_s": 90, "settle_s": 0, "finish": false})
+}
+
+/// The calibration of the simulated rig made before its turntable was
+/// moved, as on the user's rig (2026-11-20): the table now turns about an
+/// axis 16 mm away from the stored one.
+fn moved_calibration() -> RigCalibration {
+    let mut c = true_calibration();
+    let dir = Vec3::from(c.axis_dir);
+    c.axis_point = (Vec3::from(c.axis_point) + 16.0 * dir.any_orthonormal_vector()).into();
+    c
+}
+
+#[test]
+fn an_outdated_calibration_stops_the_scan_on_its_first_views() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = rig(dir.path());
+    // the turntable moved after the calibration
+    save_calibration(dir.path(), &moved_calibration()).unwrap();
+    run(&mut c, "scan.auto", auto_params());
+    let job = wait_auto(&mut c);
+    assert_eq!(job["state"], "failed", "{job}");
+    assert_eq!(job["error"], "calibration-outdated", "{job}");
+    // at once: the world view and the six views judged
+    assert_eq!(job["quality"]["stops"], 7, "{job}");
+    let table = run(&mut c, "turntable.status", Value::Null);
+    assert_eq!(table["calibration_outdated"], true, "{table}");
+    // the stops taken are kept, as for any failed scan
+    let status = run(&mut c, "scan.status", Value::Null);
+    assert_eq!(status["state"], "stopped", "{status}");
+    assert_eq!(status["auto"]["kept_stops"], 7, "{status}");
+
+    // calibrated again on the rig as it stands: the scan goes through
+    store_true_calibration(dir.path());
+    run(&mut c, "scan.reset", Value::Null);
+    run(&mut c, "scan.auto", auto_params());
+    let job = wait_auto(&mut c);
+    assert_eq!(job["state"], "done", "{job}");
+    assert_eq!(job["quality"]["stops"], 10, "{job}");
+    let table = run(&mut c, "turntable.status", Value::Null);
+    assert_eq!(table["calibration_outdated"], false, "{table}");
+    run(&mut c, "turntable.disconnect", Value::Null);
 }
 
 #[test]

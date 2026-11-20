@@ -240,6 +240,9 @@ pub(crate) struct RigState {
     /// The version of the calibration file `calibration` was read from;
     /// `None` before the first read.
     read: Option<FileStamp>,
+    /// The latest `scan.auto` found the calibration outdated (cleared by a
+    /// new calibration: measured, or a changed calibration file).
+    outdated: bool,
 }
 
 impl Default for RigState {
@@ -254,6 +257,7 @@ impl Default for RigState {
             last_calibration: None,
             calibration: None,
             read: None,
+            outdated: false,
         }
     }
 }
@@ -307,6 +311,7 @@ impl RigState {
         }
         self.calibration = super::load_calibration(dir)?;
         self.read = Some(stamp);
+        self.outdated = false;
         Ok(())
     }
 }
@@ -352,6 +357,7 @@ impl ScanController {
         self.rig.dir = Some(dir.into());
         self.rig.read = None;
         self.rig.calibration = None;
+        self.rig.outdated = false;
     }
 
     /// The rig shared by the simulated scanner and the simulated table.
@@ -372,6 +378,7 @@ impl ScanController {
                 tilt_deg: None,
                 busy: false,
                 calibrated: false,
+                calibration_outdated: self.rig.outdated,
                 calibration_job,
             };
         };
@@ -389,6 +396,7 @@ impl ScanController {
             tilt_deg: angles.tilt_deg,
             busy: self.rig.job_holds_table() || watching || angles.moving,
             calibrated: self.session.rig_calibration().is_some(),
+            calibration_outdated: self.rig.outdated,
             calibration_job,
         }
     }
@@ -509,6 +517,7 @@ impl ScanController {
                     // the job wrote it to the file: that version is read
                     self.rig.calibration = Some(c);
                     self.rig.read = self.rig.dir.as_deref().map(file_stamp);
+                    self.rig.outdated = false;
                 }
                 self.apply_rig();
             }
@@ -539,6 +548,9 @@ impl ScanController {
                 }
                 let kept = self.session.kept_stops().map(|k| k.stops.len() as u32);
                 shared.set_kept_stops(kept);
+                if shared.status().error.as_deref() == Some(ScanError::CALIBRATION_OUTDATED) {
+                    self.rig.outdated = true;
+                }
             }
         }
     }

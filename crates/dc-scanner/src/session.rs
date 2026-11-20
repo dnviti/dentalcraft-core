@@ -58,7 +58,8 @@ use serde::{Deserialize, Serialize};
 use crate::reconstruct::{KeptStop, KeptStops, stop_correction};
 use crate::rig::fit::{angle_about, to_d};
 use crate::rig::{
-    Background, RigCalibration, RigGeometry, RigInput, about, camera_world, gravity_world,
+    Background, CalibrationCheck, RigCalibration, RigGeometry, RigInput, about, camera_world,
+    gravity_world,
 };
 use crate::tracking::{FrameSample, TrackParams, sample_frame, track_frame};
 use crate::{
@@ -298,6 +299,12 @@ pub(crate) struct StopOutcome {
     pub delta_deg: f32,
     /// RMS residual of the registration (mm), when it ran.
     pub rms_mm: Option<f32>,
+    /// A refused registration: the fraction of the stop's samples that lie
+    /// on the model, within the finest association gate, at the turntable
+    /// pose (low: the view is not where the rig calibration puts it).
+    /// `None` for an accepted registration, the first view and a view
+    /// without samples.
+    pub prior_fit: Option<f32>,
 }
 
 /// Outcome of a loop closure.
@@ -1167,6 +1174,7 @@ fn fuse_stop(
         flagged: false,
         delta_deg: 0.0,
         rms_mm: None,
+        prior_fit: None,
     };
     let params = track_params(true);
     let s = sample(&depth, &k, &params, geometry.map(|g| (g, angles.1)));
@@ -1204,6 +1212,8 @@ fn fuse_stop(
                     };
                     let r0 = track_frame(&fusion.volume, &s, &k, &prior, &at_prior);
                     out.rms_mm = r0.rms_mm.is_finite().then_some(r0.rms_mm);
+                    let counted = s.counted();
+                    out.prior_fit = (counted > 0).then(|| r0.inliers as f32 / counted as f32);
                     prior
                 }
             }
@@ -1348,6 +1358,10 @@ pub struct ReplayedStop {
     pub delta_deg: f32,
     /// RMS registration residual (mm).
     pub rms_mm: Option<f32>,
+    /// A refused registration: the fraction of its samples on the model at
+    /// the turntable pose (low: the view is not where the rig calibration
+    /// puts it).
+    pub prior_fit: Option<f32>,
 }
 
 /// Outcome of [`fuse_recorded_stops`].
@@ -1368,6 +1382,11 @@ pub struct ReplayedScan {
     /// The fused stops, as `scan.auto` keeps them for the fine
     /// reconstruction ([`crate::reconstruct`]).
     pub kept: KeptStops,
+    /// The calibration check of `scan.auto` ([`crate::rig::CalibrationCheck`])
+    /// found the calibration outdated on the first views of the first
+    /// pass: the live scan would have stopped there with
+    /// `calibration-outdated`.
+    pub calibration_outdated: bool,
 }
 
 /// A recorded stop: turntable angles `(rotate, tilt)` and the
@@ -1377,8 +1396,10 @@ pub type RecordedStop = ((f32, f32), Arc<Vec<f32>>);
 
 /// Runs recorded stop images through the stop-and-capture fusion of
 /// `scan.auto`, offline: region of interest, registration from the
-/// turntable pose of `calibration`, fusion, then a loop closure over all
-/// the stops. For tests and tuning on recorded data.
+/// turntable pose of `calibration`, fusion, the calibration check on the
+/// first pass (the recording goes on where the live scan would stop),
+/// then a loop closure over all the stops. For tests and tuning on
+/// recorded data.
 pub fn fuse_recorded_stops(
     settings: &ScanSettings,
     calibration: &RigCalibration,
@@ -1390,7 +1411,11 @@ pub fn fuse_recorded_stops(
     let k = *intrinsics;
     let w = k.width as usize;
     let mut out = Vec::new();
+    let mut check = CalibrationCheck::default();
+    let first_tilt = stops.first().map(|(a, _)| a.1);
+    let mut first_pass = true;
     for (angles, depth) in stops {
+        first_pass &= Some(angles.1) == first_tilt;
         let cropped: Vec<f32> = depth
             .iter()
             .enumerate()
@@ -1404,11 +1429,16 @@ pub fn fuse_recorded_stops(
             })
             .collect();
         let s = fuse_stop(&mut fusion, Some(&g), Arc::new(cropped), k, *angles);
+        // a view registered after the world view, as `scan.auto` judges it
+        if first_pass && s.index.is_some_and(|i| i > 0) {
+            check.note(s.flagged, s.prior_fit);
+        }
         out.push(ReplayedStop {
             fused: s.index.is_some(),
             flagged: s.flagged,
             delta_deg: s.delta_deg,
             rms_mm: s.rms_mm,
+            prior_fit: s.prior_fit,
         });
     }
     let closed = close_loop(&mut fusion, Some(&g), settings, 0);
@@ -1420,6 +1450,7 @@ pub fn fuse_recorded_stops(
         cloud: moved(fusion.volume.extract_cloud(), &fusion.world),
         world: fusion.world,
         kept: kept_stops(&fusion, Some(calibration.clone()), settings),
+        calibration_outdated: check.outdated(),
     }
 }
 
@@ -1557,6 +1588,7 @@ fn acquire(
                             flagged: false,
                             delta_deg: 0.0,
                             rms_mm: None,
+                            prior_fit: None,
                         }
                     };
                     stop = Some(out.index.is_some());

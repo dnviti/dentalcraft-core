@@ -174,6 +174,11 @@ pub enum ScanError {
         /// Technical detail with the measured values (untranslated).
         detail: String,
     },
+    /// `scan.auto` stopped at its first stops: the views do not move the
+    /// way the turntable calibration predicts, so the scanner or the
+    /// turntable moved since it was measured (calibrate again).
+    #[error("the turntable calibration no longer fits the rig: {0}")]
+    CalibrationOutdated(String),
     /// `scan.auto` ended with too few views fused or registered.
     #[error("the automatic scan is unusable: {0}")]
     ScanQuality(String),
@@ -203,6 +208,9 @@ impl From<dc_geom::GeomError> for ScanError {
 }
 
 impl ScanError {
+    /// [`ScanError::code`] of [`ScanError::CalibrationOutdated`].
+    pub const CALIBRATION_OUTDATED: &'static str = "calibration-outdated";
+
     /// Stable identifier, the same in every language (kebab-case).
     pub fn code(&self) -> &'static str {
         match self {
@@ -228,6 +236,7 @@ impl ScanError {
             Self::Calibration(_) => "calibration",
             Self::RigUncalibrated => "rig-uncalibrated",
             Self::CalibrationRefused { code, .. } => code,
+            Self::CalibrationOutdated(_) => Self::CALIBRATION_OUTDATED,
             Self::ScanQuality(_) => "scan-quality-low",
             Self::NoStops => "scan-no-stops",
         }
@@ -408,6 +417,7 @@ mod tests {
             ScanError::DeviceLost("x".into()),
             ScanError::CameraAccessDenied("x".into()),
             ScanError::ProgramLocation("x".into()),
+            ScanError::CalibrationOutdated("x".into()),
             ScanError::NoStops,
         ];
         let codes: Vec<&str> = errors.iter().map(ScanError::code).collect();
@@ -424,6 +434,7 @@ mod tests {
                 "device-lost",
                 "camera-access-denied",
                 "program-location",
+                "calibration-outdated",
                 "scan-no-stops"
             ]
         );
