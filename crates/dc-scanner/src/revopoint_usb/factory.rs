@@ -31,7 +31,9 @@
 
 use std::path::{Path, PathBuf};
 
-use super::calib::{Calibration, default_calib_dir, parse_camparam, parse_pl_bin};
+use super::calib::{
+    Calibration, CalibrationSource, default_calib_dir, parse_camparam, parse_pl_bin,
+};
 use crate::{Result, ScanError};
 
 /// The factory files the backend may read: a closed list.
@@ -89,23 +91,26 @@ fn parse(file: FactoryFile, bytes: &[u8]) -> Result<Calibration> {
     }
 }
 
-/// The factory calibration cached in `dir`, else read with `read` (each
-/// file once, `Camparam` then `Pl`) and cached there. A cached file that
-/// does not parse is an error, not a reason to read the device again.
+/// The factory calibration cached in `dir`
+/// ([`CalibrationSource::FactoryCached`]), else read with `read` (each file
+/// once, `Camparam` then `Pl`) and cached there
+/// ([`CalibrationSource::Factory`]). A cached file that does not parse is an
+/// error, not a reason to read the device again.
 ///
 /// # Errors
 /// The read or parse error of the last file tried.
 pub fn load_or_read(
     dir: &Path,
     mut read: impl FnMut(FactoryFile) -> Result<Vec<u8>>,
-) -> Result<(Calibration, PathBuf)> {
+) -> Result<(Calibration, CalibrationSource)> {
     let files = [FactoryFile::Camparam, FactoryFile::Pl];
     for file in files {
         let path = dir.join(file.cache_name());
         if let Ok(bytes) = std::fs::read(&path) {
-            return parse(file, &bytes)
-                .map(|c| (c, path.clone()))
-                .map_err(|e| ScanError::InvalidParams(format!("{}: {e}", path.display())));
+            return match parse(file, &bytes) {
+                Ok(c) => Ok((c, CalibrationSource::FactoryCached(path))),
+                Err(e) => Err(ScanError::InvalidParams(format!("{}: {e}", path.display()))),
+            };
         }
     }
     let mut last = ScanError::Device("no factory calibration file".into());
@@ -116,7 +121,7 @@ pub fn load_or_read(
                 let path = dir.join(file.cache_name());
                 // a cache that cannot be written only costs a read next time
                 let _ = write_atomic(&path, &bytes);
-                return Ok((c, path));
+                return Ok((c, CalibrationSource::Factory(path)));
             }
             Err(e) => last = e,
         }
@@ -161,7 +166,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut asked = Vec::new();
         // camparam missing on the device: Pl.bin is used and cached
-        let (c, path) = load_or_read(dir.path(), |f| {
+        let (c, source) = load_or_read(dir.path(), |f| {
             asked.push(f);
             match f {
                 FactoryFile::Camparam => Err(ScanError::Device("empty".into())),
@@ -170,14 +175,18 @@ mod tests {
         })
         .unwrap();
         assert_eq!(asked, [FactoryFile::Camparam, FactoryFile::Pl]);
-        assert_eq!(path, dir.path().join("Pl.bin"));
+        let cached = dir.path().join("Pl.bin");
+        assert_eq!(source, CalibrationSource::Factory(cached.clone()));
+        assert_eq!(source.name(), "factory");
         assert_eq!(
             (c.intrinsics.fx, c.intrinsics.cx, c.intrinsics.cy),
             (1142.0, 163.0, 330.0)
         );
         // the cache answers, the device is not asked again
-        let (again, _) = load_or_read(dir.path(), |_| panic!("read again")).unwrap();
+        let (again, source) = load_or_read(dir.path(), |_| panic!("read again")).unwrap();
         assert_eq!(again, c);
+        assert_eq!(source, CalibrationSource::FactoryCached(cached));
+        assert_eq!(source.name(), "factory-cached");
         // a broken cache is an error, still without reading the device
         std::fs::write(dir.path().join("Pl.bin"), b"short").unwrap();
         assert!(load_or_read(dir.path(), |_| panic!("read again")).is_err());

@@ -12,10 +12,12 @@
 //! Linux and by the kernel-streaming properties of the video source on
 //! Windows): the fill light ([`light`]: on while streaming, off after), the
 //! fast exposure profile ([`exposure`]) and the read-only factory
-//! calibration file read ([`factory`]). It sends no other extension-unit
-//! request, no HID report and no firmware. The colour stream is not read
-//! (it is not registered to the depth image, and stopping it also resets
-//! the depth stream).
+//! calibration file read ([`factory`]). What they did, and the intrinsics in
+//! use, is reported the same way on every platform
+//! ([`crate::ScannerDevice::vendor_status`], `vendor` of `scan.status`). It
+//! sends no other extension-unit request, no HID report and no firmware.
+//! The colour stream is not read (it is not registered to the depth image,
+//! and stopping it also resets the depth stream).
 //!
 //! * **Discovery.** [`ScannerBackend::list`] enumerates the USB devices with
 //!   `nusb` and keeps the `2207:110c` devices. On Linux their V4L2 nodes are

@@ -61,7 +61,9 @@ use crate::rig::{
     Background, RigCalibration, RigGeometry, RigInput, about, camera_world, gravity_world,
 };
 use crate::tracking::{FrameSample, TrackParams, sample_frame, track_frame};
-use crate::{DepthFrame, DeviceInfo, Result, ScanError, ScannerBackend, ScannerDevice, backend};
+use crate::{
+    DepthFrame, DeviceInfo, Result, ScanError, ScannerBackend, ScannerDevice, VendorStatus, backend,
+};
 
 /// Shortest time between two preview refreshes.
 pub const PREVIEW_INTERVAL: Duration = Duration::from_millis(200);
@@ -215,6 +217,11 @@ pub struct ScanStatus {
     /// `[tilt, yaw]` in degrees, tilt > 0 looking down, yaw 0 looking at
     /// the axis (along −X).
     pub scanner_deg: Option<[f32; 2]>,
+    /// What the vendor layer of the device did (fill light, fast exposure,
+    /// origin of the intrinsics and the intrinsics in use, see
+    /// [`VendorStatus`]); `None` without a device or for a device without
+    /// one.
+    pub vendor: Option<VendorStatus>,
 }
 
 /// What the live view draws.
@@ -349,6 +356,10 @@ struct Live {
     /// The up direction measured by the device IMU, smoothed over the
     /// recent frames (frame of the IMU).
     imu_up: Option<Vec3>,
+    /// The vendor status of the device while the acquisition thread holds
+    /// it, published when the stream starts, at its first frame and when
+    /// it ends.
+    vendor: Option<VendorStatus>,
 }
 
 impl Live {
@@ -931,6 +942,11 @@ impl ScanSession {
             rig_world: live.rig_world,
             imu_world: live.imu_world,
             scanner_deg: live.world.as_ref().map(scanner_angles),
+            // the acquisition thread publishes it while it holds the device
+            vendor: match &self.device {
+                Some(device) => device.vendor_status(),
+                None => live.vendor.clone(),
+            },
         }
     }
 
@@ -986,7 +1002,9 @@ impl ScanSession {
                 self.info = None;
                 self.state = ScanState::Idle;
                 let detail = "the acquisition thread panicked".to_owned();
-                self.shared.live().error = Some(("device", detail.clone()));
+                let mut live = self.shared.live();
+                live.error = Some(("device", detail.clone()));
+                live.vendor = None;
                 Err(ScanError::Device(detail))
             }
         }
@@ -1407,7 +1425,14 @@ fn acquire(
     let mut extracted_at = shared.live().fused_frames;
     let mut last_publish: Option<Instant> = None;
     let mut last_frame: Option<Instant> = None;
-    shared.live().latency = device.latency();
+    // what the device did when its stream started; again at the first frame
+    // (a restart reopens the device inside `next_frame`) and at the end
+    let mut started = false;
+    {
+        let mut live = shared.live();
+        live.latency = device.latency();
+        live.vendor = device.vendor_status();
+    }
     let mut history = AngleHistory::default();
     let probe_angles = |probe: &Option<dc_turntable::AngleProbe>| {
         probe
@@ -1440,6 +1465,7 @@ fn acquire(
             // the stream ends now (fill light off): nothing is tracked while
             // the job computes
             device.stop();
+            shared.live().vendor = device.vendor_status();
             shared.ended.store(true, Ordering::SeqCst);
             let mut io = shared.io();
             io.request = None;
@@ -1451,10 +1477,16 @@ fn acquire(
             Ok(Some(frame)) => frame,
             Ok(None) => continue,
             Err(e) => {
-                shared.live().error = Some((e.code(), e.to_string()));
+                let mut live = shared.live();
+                live.error = Some((e.code(), e.to_string()));
+                live.vendor = device.vendor_status();
                 break;
             }
         };
+        if !started {
+            started = true;
+            shared.live().vendor = device.vendor_status();
+        }
         let arrived = Instant::now();
         history.push(arrived, probe_angles(&probe));
         let k = frame.intrinsics;
@@ -1748,6 +1780,98 @@ mod tests {
         assert!(!cloud.is_empty());
         let p = s.preview().unwrap();
         assert_eq!(p.cloud.len(), cloud.len());
+    }
+
+    /// A simulated device with a vendor layer: its light follows the stream.
+    struct VendorSim {
+        inner: Box<dyn ScannerDevice>,
+        streaming: bool,
+    }
+
+    impl ScannerDevice for VendorSim {
+        fn info(&self) -> DeviceInfo {
+            self.inner.info()
+        }
+
+        fn start(&mut self) -> Result<()> {
+            self.inner.start()?;
+            self.streaming = true;
+            Ok(())
+        }
+
+        fn stop(&mut self) {
+            self.inner.stop();
+            self.streaming = false;
+        }
+
+        fn next_frame(&mut self, timeout: Duration) -> Result<Option<DepthFrame>> {
+            self.inner.next_frame(timeout)
+        }
+
+        fn vendor_status(&self) -> Option<VendorStatus> {
+            Some(VendorStatus {
+                fill_light: if self.streaming { "on" } else { "off" }.into(),
+                fill_light_note: None,
+                fast_exposure: "applied".into(),
+                fast_exposure_note: None,
+                calibration: "factory",
+                calibration_note: None,
+                fx: 1142.37,
+                fy: 1142.37,
+                cx: 163.19,
+                cy: 329.85,
+            })
+        }
+    }
+
+    struct VendorSimBackend(SimBackend);
+
+    impl ScannerBackend for VendorSimBackend {
+        fn id(&self) -> &'static str {
+            "vendor-sim"
+        }
+
+        fn list(&self) -> Result<Vec<DeviceInfo>> {
+            self.0.list()
+        }
+
+        fn open(&self, device_id: &str) -> Result<Box<dyn ScannerDevice>> {
+            Ok(Box::new(VendorSim {
+                inner: self.0.open(device_id)?,
+                streaming: false,
+            }))
+        }
+    }
+
+    #[test]
+    fn the_status_reports_the_vendor_layer_in_every_state() {
+        let light = |s: &ScanSession| s.status().vendor.map(|v| v.fill_light.into_owned());
+        let mut s = ScanSession::new(ScanSettings::default());
+        // a device without a vendor layer
+        s.connect_with(&sim(4), UPPER_ID).unwrap();
+        assert_eq!(s.status().vendor, None);
+        // connected: the session holds the device
+        s.connect_with(&VendorSimBackend(sim(1000)), UPPER_ID)
+            .unwrap();
+        assert_eq!(light(&s).as_deref(), Some("off"));
+        let json = serde_json::to_value(s.status()).unwrap();
+        assert_eq!(json["vendor"]["fill_light"], "off");
+        assert_eq!(json["vendor"]["calibration"], "factory");
+        // scanning: the acquisition thread publishes it
+        s.start().unwrap();
+        wait_frames(&s, 2);
+        let v = s.status().vendor.unwrap();
+        assert_eq!(
+            (&*v.fill_light, &*v.fast_exposure, v.calibration),
+            ("on", "applied", "factory")
+        );
+        assert_eq!((v.fx, v.cx, v.cy), (1142.37, 163.19, 329.85));
+        // stopped: the device is back, its light off
+        s.stop().unwrap();
+        assert_eq!(light(&s).as_deref(), Some("off"));
+        s.disconnect();
+        assert_eq!(s.status().vendor, None);
+        assert!(serde_json::to_value(s.status()).unwrap()["vendor"].is_null());
     }
 
     #[test]

@@ -65,6 +65,7 @@ pub mod session;
 pub mod sim;
 pub mod tracking;
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -251,6 +252,43 @@ pub struct DeviceInfo {
     pub serial: Option<String>,
 }
 
+/// What the vendor layer of a device did, the same on every platform
+/// ([`ScannerDevice::vendor_status`], reported in [`ScanStatus::vendor`]): a
+/// remote test reads it instead of looking at the scanner. The states are
+/// stable strings; in `error:<code>` the code is a [`ScanError::code`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct VendorStatus {
+    /// The fill light: `on` (sent on for the current stream), `off` (sent
+    /// off), `unsupported` (the device has no vendor unit: nothing is sent)
+    /// or `error:<code>` (the latest request failed).
+    pub fill_light: Cow<'static, str>,
+    /// Why the fill light is `unsupported` or in error.
+    pub fill_light_note: Option<String>,
+    /// The fast exposure profile: `applied` (sent since the device was
+    /// opened; it stays in effect until the scanner is unplugged),
+    /// `pending` (asked: sent when the stream starts), `off` (not asked:
+    /// nothing sent), `unsupported` or `error:<code>`.
+    pub fast_exposure: Cow<'static, str>,
+    /// Why the profile is `unsupported` or in error.
+    pub fast_exposure_note: Option<String>,
+    /// Where the pinhole below comes from: `user` (a calibration file),
+    /// `factory` (read from the scanner when it was opened),
+    /// `factory-cached` (the copy cached for its serial by an earlier
+    /// opening) or `estimate` (the field-of-view defaults).
+    pub calibration: &'static str,
+    /// Why the factory calibration is not in use, when the pinhole is the
+    /// estimate.
+    pub calibration_note: Option<String>,
+    /// Focal length along x of the depth image in use, pixels.
+    pub fx: f32,
+    /// Focal length along y, pixels.
+    pub fy: f32,
+    /// Principal point x, pixels.
+    pub cx: f32,
+    /// Principal point y, pixels.
+    pub cy: f32,
+}
+
 /// An opened device. See the crate doc for the contract of each method.
 pub trait ScannerDevice: Send {
     /// Identity of the device.
@@ -281,6 +319,11 @@ pub trait ScannerDevice: Send {
     /// may follow the frame rate: the acquisition asks at every frame.
     fn latency(&self) -> Duration {
         Duration::ZERO
+    }
+    /// What the vendor layer of the device did ([`VendorStatus`]); `None`
+    /// for a device without one.
+    fn vendor_status(&self) -> Option<VendorStatus> {
+        None
     }
 }
 
