@@ -6,10 +6,16 @@
 //! STA) is never involved and (b) a hung WinRT call can be abandoned after a
 //! timeout instead of blocking the caller forever.
 //!
-//! Alpha: written against the `windows` 0.62 sources and never compiled or run
-//! on a Windows machine yet.
+//! A connection behaves as the BlueZ one: an id listed by an earlier scan
+//! stays valid (Windows opens an unpaired device by its address only while
+//! it has heard it lately, so a forgotten one is listened for again, at most
+//! [`REDISCOVER_TIMEOUT`]), and a link that does not come up is tried again
+//! ([`CONNECT_ATTEMPTS`] in all, [`CONNECT_RETRY_DELAY`] apart, within the
+//! timeout): the Revopoint turntable misses its first connection events
+//! about once in four, whatever the host.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -41,11 +47,21 @@ const E_RADIO_UNAVAILABLE: i32 = 0x8007_10DFu32 as i32;
 const E_POINTER: i32 = 0x8000_4003u32 as i32;
 /// How long to wait for a worker beyond its own deadline.
 const WORKER_SLACK: Duration = Duration::from_secs(5);
+/// Most attempts of one connection setup, as on BlueZ.
+const CONNECT_ATTEMPTS: u32 = 4;
+/// Pause before trying a connection that did not come up again.
+const CONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Longest wait for the advertisement of a device Windows forgot (an
+/// advertising device shows up within a second).
+const REDISCOVER_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the watcher state is looked at while listening.
+const LISTEN_POLL: Duration = Duration::from_millis(100);
 
 fn map_err(e: windows::core::Error) -> BleError {
     match e.code().0 {
         E_RADIO_UNAVAILABLE => BleError::AdapterOff,
-        E_POINTER => BleError::NotFound,
+        // a null object: windows-rs reports it as an empty error (code 0)
+        E_POINTER | 0 => BleError::NotFound,
         _ => BleError::Platform(format!("{} ({:#010x})", e.message(), e.code().0)),
     }
 }
@@ -333,13 +349,18 @@ impl Drop for WinLink {
     }
 }
 
-fn first_service(device: &BluetoothLEDevice, service: Uuid) -> Result<GattDeviceService, BleError> {
+/// The GATT service `service` of `device`; `Ok(None)` when the device did
+/// not answer: the link did not come up.
+fn first_service(
+    device: &BluetoothLEDevice,
+    service: Uuid,
+) -> Result<Option<GattDeviceService>, BleError> {
     let result = device
         .GetGattServicesForUuidWithCacheModeAsync(guid(service), BluetoothCacheMode::Uncached)
         .and_then(|op| op.join())
         .map_err(map_err)?;
     match result.Status().map_err(map_err)? {
-        GattCommunicationStatus::Unreachable => return Err(BleError::NotFound),
+        GattCommunicationStatus::Unreachable => return Ok(None),
         status => map_status(status, "service discovery")?,
     }
     result
@@ -347,7 +368,66 @@ fn first_service(device: &BluetoothLEDevice, service: Uuid) -> Result<GattDevice
         .map_err(map_err)?
         .into_iter()
         .next()
+        .map(Some)
         .ok_or_else(|| BleError::Platform("GATT serial service not found on the device".into()))
+}
+
+/// The device at `address`; [`BleError::NotFound`] when Windows does not
+/// know it.
+fn device_at(address: u64) -> Result<BluetoothLEDevice, BleError> {
+    BluetoothLEDevice::FromBluetoothAddressAsync(address)
+        .and_then(|op| op.join())
+        .map_err(map_err)
+}
+
+/// Listens to advertisements until `address` is heard, for at most
+/// [`REDISCOVER_TIMEOUT`] and never past `deadline`.
+///
+/// Windows opens an unpaired device by its address only while it has heard
+/// it lately: an id listed by an earlier scan (or kept across a restart of
+/// the application) is then unknown although the device is right there and
+/// advertising, as on BlueZ.
+fn listen_for(address: u64, deadline: Instant) -> Result<(), BleError> {
+    let deadline = deadline.min(Instant::now() + REDISCOVER_TIMEOUT);
+    let heard = Arc::new(AtomicBool::new(false));
+    let watcher = BluetoothLEAdvertisementWatcher::new().map_err(map_err)?;
+    watcher
+        .SetScanningMode(BluetoothLEScanningMode::Active)
+        .map_err(map_err)?;
+    let flag = heard.clone();
+    let token = watcher
+        .Received(&TypedEventHandler::<
+            BluetoothLEAdvertisementWatcher,
+            BluetoothLEAdvertisementReceivedEventArgs,
+        >::new(
+            move |_, args: Ref<BluetoothLEAdvertisementReceivedEventArgs>| {
+                if let Some(args) = args.as_ref()
+                    && args.BluetoothAddress()? == address
+                {
+                    flag.store(true, Ordering::Release);
+                }
+                Ok(())
+            },
+        ))
+        .map_err(map_err)?;
+    let started = watcher.Start().map_err(map_err);
+    while started.is_ok() && !heard.load(Ordering::Acquire) {
+        let now = Instant::now();
+        if now >= deadline
+            || watcher.Status().map_err(map_err)? == BluetoothLEAdvertisementWatcherStatus::Aborted
+        {
+            break;
+        }
+        thread::sleep(LISTEN_POLL.min(deadline - now));
+    }
+    let _ = watcher.Stop();
+    let _ = watcher.RemoveReceived(token);
+    started?;
+    if heard.load(Ordering::Acquire) {
+        Ok(())
+    } else {
+        Err(BleError::NotFound)
+    }
 }
 
 fn find_characteristic(
@@ -375,13 +455,31 @@ fn has(properties: GattCharacteristicProperties, flag: GattCharacteristicPropert
 fn connect_blocking(
     device_id: &str,
     profile: &SerialProfile,
+    deadline: Instant,
 ) -> Result<Box<dyn BleLink>, BleError> {
     let address = parse_address(device_id).ok_or(BleError::NotFound)?;
-    let device = BluetoothLEDevice::FromBluetoothAddressAsync(address)
-        .and_then(|op| op.join())
-        .map_err(map_err)?;
+    let device = match device_at(address) {
+        // forgotten by Windows: heard again, it opens
+        Err(BleError::NotFound) => {
+            listen_for(address, deadline)?;
+            device_at(address)?
+        }
+        other => other?,
+    };
 
-    let service = first_service(&device, profile.service)?;
+    // The first GATT request brings the link up; one that did not come up
+    // (the peripheral missed its first connection events) is tried again.
+    let mut attempts = 1;
+    let service = loop {
+        if let Some(service) = first_service(&device, profile.service)? {
+            break service;
+        }
+        if attempts >= CONNECT_ATTEMPTS || Instant::now() + CONNECT_RETRY_DELAY >= deadline {
+            return Err(BleError::NotFound);
+        }
+        attempts += 1;
+        thread::sleep(CONNECT_RETRY_DELAY);
+    };
     let write_char = find_characteristic(&service, profile.write_char, "write characteristic")?;
     let notify_char = find_characteristic(&service, profile.notify_char, "notify characteristic")?;
 
@@ -480,7 +578,8 @@ pub(crate) fn connect_serial(
     availability()?;
     let id = device_id.to_owned();
     let profile = *profile;
-    on_worker(timeout, move || connect_blocking(&id, &profile))
+    let deadline = Instant::now() + timeout;
+    on_worker(timeout, move || connect_blocking(&id, &profile, deadline))
 }
 
 #[cfg(test)]
@@ -493,5 +592,20 @@ mod tests {
         assert_eq!(a, 0xAABB_CCDD_EE0F);
         assert_eq!(format_address(a), "AA:BB:CC:DD:EE:0F");
         assert!(parse_address("nonsense").is_none());
+    }
+
+    #[test]
+    fn a_null_object_is_not_found() {
+        // what `join` returns for an operation that completed with null
+        assert!(matches!(
+            map_err(windows::core::Error::empty()),
+            BleError::NotFound
+        ));
+        assert!(matches!(
+            map_err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                E_RADIO_UNAVAILABLE
+            ))),
+            BleError::AdapterOff
+        ));
     }
 }
