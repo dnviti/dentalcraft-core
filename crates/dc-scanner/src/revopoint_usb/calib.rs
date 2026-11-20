@@ -89,13 +89,29 @@ impl Default for Calibration {
 /// Where a [`Calibration`] comes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CalibrationSource {
-    /// No file: the alpha defaults.
+    /// No file: the alpha defaults (a field-of-view estimate).
     Defaults,
     /// This file, over the defaults.
     File(PathBuf),
-    /// The factory calibration of the scanner, cached in this file
-    /// ([`super::factory`]).
+    /// The factory calibration read from the scanner when it was opened,
+    /// cached in this file ([`super::factory`]).
     Factory(PathBuf),
+    /// The factory calibration of the scanner cached in this file when an
+    /// earlier opening read it: the scanner was not asked.
+    FactoryCached(PathBuf),
+}
+
+impl CalibrationSource {
+    /// The stable name of the source ([`crate::VendorStatus::calibration`]):
+    /// `estimate`, `user`, `factory` or `factory-cached`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Defaults => "estimate",
+            Self::File(_) => "user",
+            Self::Factory(_) => "factory",
+            Self::FactoryCached(_) => "factory-cached",
+        }
+    }
 }
 
 /// The keys of a calibration file; each one overrides its default.

@@ -1,17 +1,11 @@
 //! The factory calibration stored on the scanner, read once and cached.
 //!
 //! **User decision, 2026-11-18 21:43.** The MINI 2 keeps its factory stereo
-//! calibration in files on its own Linux. They can be read over the UVC
-//! extension unit 4 (GUID [`super::light::SHELL_UNIT_GUID`]) with a read-only
-//! file channel, as the vendor SDK does (`libuvcReadFile`, reverse
-//! engineered on the POP4 by BR1ZB3AR/All3DScan, `RE_NOTES.md`):
-//!
-//! 1. open: selector [`OPEN_SELECTOR`] `SET_CUR` of [`FILE_PAYLOAD_LEN`] bytes,
-//!    `[0x01, path, NUL]` ([`OPEN_FOR_READ`] is the only opcode sent);
-//! 2. read: selector [`READ_SELECTOR`] `GET_CUR` of [`FILE_PAYLOAD_LEN`]
-//!    bytes, `[len as u32 LE (<= 56), data]`, until `len` is 0;
-//! 3. close: selector [`OPEN_SELECTOR`] `SET_CUR` of [`FILE_PAYLOAD_LEN`]
-//!    zero bytes (it ends the session; it writes nothing).
+//! calibration in files on its own Linux. They can be read over the vendor
+//! extension unit with a read-only file channel, as the vendor SDK does
+//! (`libuvcReadFile`, reverse engineered on the POP4 by BR1ZB3AR/All3DScan,
+//! `RE_NOTES.md`): open for reading, read in chunks, close
+//! ([`super::xu::read_file`]).
 //!
 //! The user authorised reading, and only reading, the files of the closed
 //! list [`FactoryFile`]: no path can be built from outside, no other opcode
@@ -37,21 +31,10 @@
 
 use std::path::{Path, PathBuf};
 
-use super::calib::{Calibration, default_calib_dir, parse_camparam, parse_pl_bin};
+use super::calib::{
+    Calibration, CalibrationSource, default_calib_dir, parse_camparam, parse_pl_bin,
+};
 use crate::{Result, ScanError};
-
-/// Selector that opens (and closes) a file of the device.
-pub const OPEN_SELECTOR: u8 = 1;
-/// Selector that returns the next chunk of the open file.
-pub const READ_SELECTOR: u8 = 2;
-/// Bytes of one request of either selector.
-pub const FILE_PAYLOAD_LEN: usize = 60;
-/// Opcode "open for reading", the only one sent.
-pub const OPEN_FOR_READ: u8 = 0x01;
-/// Largest data of one chunk (the payload less its length word).
-pub const MAX_CHUNK: usize = FILE_PAYLOAD_LEN - 4;
-/// Largest file accepted (the calibration files are a few KiB).
-pub const MAX_FILE_BYTES: usize = 64 * 1024;
 
 /// The factory files the backend may read: a closed list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,43 +61,6 @@ impl FactoryFile {
             Self::Pl => "Pl.bin",
         }
     }
-
-    /// The open request: `[OPEN_FOR_READ, path, NUL]`, NUL padded.
-    pub fn open_payload(self) -> [u8; FILE_PAYLOAD_LEN] {
-        let path = self.device_path().as_bytes();
-        let mut p = [0u8; FILE_PAYLOAD_LEN];
-        p[0] = OPEN_FOR_READ;
-        p[1..=path.len()].copy_from_slice(path);
-        p
-    }
-}
-
-/// The close request: all zero.
-pub const CLOSE_PAYLOAD: [u8; FILE_PAYLOAD_LEN] = [0; FILE_PAYLOAD_LEN];
-
-/// Appends the data of one read reply to `out`; `false` at the end of the
-/// file (length 0).
-///
-/// # Errors
-/// [`ScanError::Device`] for a length above [`MAX_CHUNK`] or a file larger
-/// than [`MAX_FILE_BYTES`].
-pub fn append_chunk(reply: &[u8; FILE_PAYLOAD_LEN], out: &mut Vec<u8>) -> Result<bool> {
-    let len = u32::from_le_bytes([reply[0], reply[1], reply[2], reply[3]]) as usize;
-    if len == 0 {
-        return Ok(false);
-    }
-    if len > MAX_CHUNK {
-        return Err(ScanError::Device(format!(
-            "factory file read: chunk of {len} bytes (at most {MAX_CHUNK})"
-        )));
-    }
-    if out.len() + len > MAX_FILE_BYTES {
-        return Err(ScanError::Device(format!(
-            "factory file read: more than {MAX_FILE_BYTES} bytes"
-        )));
-    }
-    out.extend_from_slice(&reply[4..4 + len]);
-    Ok(true)
 }
 
 /// The cache directory of the scanner `serial`:
@@ -145,23 +91,26 @@ fn parse(file: FactoryFile, bytes: &[u8]) -> Result<Calibration> {
     }
 }
 
-/// The factory calibration cached in `dir`, else read with `read` (each
-/// file once, `Camparam` then `Pl`) and cached there. A cached file that
-/// does not parse is an error, not a reason to read the device again.
+/// The factory calibration cached in `dir`
+/// ([`CalibrationSource::FactoryCached`]), else read with `read` (each file
+/// once, `Camparam` then `Pl`) and cached there
+/// ([`CalibrationSource::Factory`]). A cached file that does not parse is an
+/// error, not a reason to read the device again.
 ///
 /// # Errors
 /// The read or parse error of the last file tried.
 pub fn load_or_read(
     dir: &Path,
     mut read: impl FnMut(FactoryFile) -> Result<Vec<u8>>,
-) -> Result<(Calibration, PathBuf)> {
+) -> Result<(Calibration, CalibrationSource)> {
     let files = [FactoryFile::Camparam, FactoryFile::Pl];
     for file in files {
         let path = dir.join(file.cache_name());
         if let Ok(bytes) = std::fs::read(&path) {
-            return parse(file, &bytes)
-                .map(|c| (c, path.clone()))
-                .map_err(|e| ScanError::InvalidParams(format!("{}: {e}", path.display())));
+            return match parse(file, &bytes) {
+                Ok(c) => Ok((c, CalibrationSource::FactoryCached(path))),
+                Err(e) => Err(ScanError::InvalidParams(format!("{}: {e}", path.display()))),
+            };
         }
     }
     let mut last = ScanError::Device("no factory calibration file".into());
@@ -172,7 +121,7 @@ pub fn load_or_read(
                 let path = dir.join(file.cache_name());
                 // a cache that cannot be written only costs a read next time
                 let _ = write_atomic(&path, &bytes);
-                return Ok((c, path));
+                return Ok((c, CalibrationSource::Factory(path)));
             }
             Err(e) => last = e,
         }
@@ -192,35 +141,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn requests_are_the_documented_bytes() {
-        let p = FactoryFile::Camparam.open_payload();
-        assert_eq!(p[0], 0x01);
-        assert_eq!(&p[1..29], b"/data/camparam/camparam.yaml");
-        assert!(p[29..].iter().all(|b| *b == 0));
-        let p = FactoryFile::Pl.open_payload();
-        assert_eq!(&p[..23], b"\x01/data/camparam/Pl.bin\0");
-        assert!(p[23..].iter().all(|b| *b == 0));
-        assert!(CLOSE_PAYLOAD.iter().all(|b| *b == 0));
-    }
-
-    #[test]
-    fn chunks_are_appended_until_length_zero() {
-        let mut reply = [0u8; FILE_PAYLOAD_LEN];
-        reply[..4].copy_from_slice(&3u32.to_le_bytes());
-        reply[4..7].copy_from_slice(b"abc");
-        reply[7] = b'x';
-        let mut out = Vec::new();
-        assert!(append_chunk(&reply, &mut out).unwrap());
-        assert_eq!(out, b"abc");
-        assert!(!append_chunk(&[0; FILE_PAYLOAD_LEN], &mut out).unwrap());
-        reply[..4].copy_from_slice(&57u32.to_le_bytes());
-        assert_eq!(append_chunk(&reply, &mut out).unwrap_err().code(), "device");
-        let mut full = vec![0u8; MAX_FILE_BYTES - 2];
-        reply[..4].copy_from_slice(&3u32.to_le_bytes());
-        assert!(append_chunk(&reply, &mut full).is_err());
-    }
 
     #[test]
     fn cache_dir_needs_a_plain_serial() {
@@ -246,7 +166,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut asked = Vec::new();
         // camparam missing on the device: Pl.bin is used and cached
-        let (c, path) = load_or_read(dir.path(), |f| {
+        let (c, source) = load_or_read(dir.path(), |f| {
             asked.push(f);
             match f {
                 FactoryFile::Camparam => Err(ScanError::Device("empty".into())),
@@ -255,14 +175,18 @@ mod tests {
         })
         .unwrap();
         assert_eq!(asked, [FactoryFile::Camparam, FactoryFile::Pl]);
-        assert_eq!(path, dir.path().join("Pl.bin"));
+        let cached = dir.path().join("Pl.bin");
+        assert_eq!(source, CalibrationSource::Factory(cached.clone()));
+        assert_eq!(source.name(), "factory");
         assert_eq!(
             (c.intrinsics.fx, c.intrinsics.cx, c.intrinsics.cy),
             (1142.0, 163.0, 330.0)
         );
         // the cache answers, the device is not asked again
-        let (again, _) = load_or_read(dir.path(), |_| panic!("read again")).unwrap();
+        let (again, source) = load_or_read(dir.path(), |_| panic!("read again")).unwrap();
         assert_eq!(again, c);
+        assert_eq!(source, CalibrationSource::FactoryCached(cached));
+        assert_eq!(source.name(), "factory-cached");
         // a broken cache is an error, still without reading the device
         std::fs::write(dir.path().join("Pl.bin"), b"short").unwrap();
         assert!(load_or_read(dir.path(), |_| panic!("read again")).is_err());

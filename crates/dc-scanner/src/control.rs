@@ -240,6 +240,9 @@ struct SimOptionsParams {
     realtime: Option<bool>,
     /// Stop producing frames after this many (default: endless).
     frames: Option<u64>,
+    /// The scanner is lost (as if unplugged) after this many frames: its
+    /// stream fails with `device-lost` (default: never).
+    lost_after: Option<u64>,
     /// Depth image width in pixels (default 640).
     width: Option<u32>,
     /// Depth image height in pixels (default 400).
@@ -264,6 +267,9 @@ impl SimOptionsParams {
         }
         if let Some(v) = self.frames {
             o.max_frames = Some(v);
+        }
+        if let Some(v) = self.lost_after {
+            o.lost_after = Some(v);
         }
         if let Some(v) = self.width {
             o.width = v;

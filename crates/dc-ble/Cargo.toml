@@ -1,6 +1,6 @@
 [package]
 name = "dc-ble"
-description = "Blocking Bluetooth LE serial links (GATT write and notify): BlueZ on Linux, WinRT on Windows"
+description = "Blocking Bluetooth LE serial links (GATT write and notify): BlueZ on Linux, WinRT on Windows, CoreBluetooth on macOS"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -28,8 +28,22 @@ windows = { workspace = true, features = [
     "Storage_Streams",
 ] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-core-bluetooth.workspace = true
+dispatch2.workspace = true
+
 [dev-dependencies]
 serde_json.workspace = true
 
-[lints]
-workspace = true
+# The workspace lints, except `unsafe_code`: denied here instead of forbidden,
+# so that only `macos` (CoreBluetooth through objc2, whose calls are all
+# `unsafe`) can allow it.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

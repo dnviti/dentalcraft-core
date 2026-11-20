@@ -58,10 +58,13 @@ use serde::{Deserialize, Serialize};
 use crate::reconstruct::{KeptStop, KeptStops, stop_correction};
 use crate::rig::fit::{angle_about, to_d};
 use crate::rig::{
-    Background, RigCalibration, RigGeometry, RigInput, about, camera_world, gravity_world,
+    Background, CalibrationCheck, RigCalibration, RigGeometry, RigInput, about, camera_world,
+    gravity_world,
 };
 use crate::tracking::{FrameSample, TrackParams, sample_frame, track_frame};
-use crate::{DepthFrame, DeviceInfo, Result, ScanError, ScannerBackend, ScannerDevice, backend};
+use crate::{
+    DepthFrame, DeviceInfo, Result, ScanError, ScannerBackend, ScannerDevice, VendorStatus, backend,
+};
 
 /// Shortest time between two preview refreshes.
 pub const PREVIEW_INTERVAL: Duration = Duration::from_millis(200);
@@ -215,6 +218,11 @@ pub struct ScanStatus {
     /// `[tilt, yaw]` in degrees, tilt > 0 looking down, yaw 0 looking at
     /// the axis (along −X).
     pub scanner_deg: Option<[f32; 2]>,
+    /// What the vendor layer of the device did (fill light, fast exposure,
+    /// origin of the intrinsics and the intrinsics in use, see
+    /// [`VendorStatus`]); `None` without a device or for a device without
+    /// one.
+    pub vendor: Option<VendorStatus>,
 }
 
 /// What the live view draws.
@@ -237,8 +245,10 @@ struct Shared {
     paused: AtomicBool,
     /// A rig job keeps the frames out of the model (tracking continues).
     hold: AtomicBool,
-    /// A rig job ended the acquisition ([`RigLink::end_acquisition`]): the
-    /// stream is off and the thread gone, its model waits to be joined.
+    /// The acquisition ended without the session: a rig job ended it
+    /// ([`RigLink::end_acquisition`]) or its stream failed (device lost).
+    /// The stream is off and the thread gone, its model waits to be
+    /// joined.
     ended: AtomicBool,
     live: Mutex<Live>,
     rig: Mutex<RigInput>,
@@ -289,6 +299,12 @@ pub(crate) struct StopOutcome {
     pub delta_deg: f32,
     /// RMS residual of the registration (mm), when it ran.
     pub rms_mm: Option<f32>,
+    /// A refused registration: the fraction of the stop's samples that lie
+    /// on the model, within the finest association gate, at the turntable
+    /// pose (low: the view is not where the rig calibration puts it).
+    /// `None` for an accepted registration, the first view and a view
+    /// without samples.
+    pub prior_fit: Option<f32>,
 }
 
 /// Outcome of a loop closure.
@@ -349,6 +365,10 @@ struct Live {
     /// The up direction measured by the device IMU, smoothed over the
     /// recent frames (frame of the IMU).
     imu_up: Option<Vec3>,
+    /// The vendor status of the device while the acquisition thread holds
+    /// it, published when the stream starts, at its first frame and when
+    /// it ends.
+    vendor: Option<VendorStatus>,
 }
 
 impl Live {
@@ -720,7 +740,7 @@ impl ScanSession {
     }
 
     fn start_with(&mut self, hold: bool) -> Result<()> {
-        match self.state {
+        match self.live_state() {
             ScanState::Connected | ScanState::Stopped => {}
             ScanState::Idle => return Err(ScanError::NotConnected),
             state => {
@@ -730,6 +750,9 @@ impl ScanSession {
                 });
             }
         }
+        // a stream that ended by itself (device lost, rig job) gives the
+        // device and the model back first: the scan goes on from them
+        self.join()?;
         let mut device = self.device.take().ok_or(ScanError::NotConnected)?;
         let started = self
             .settings
@@ -857,9 +880,9 @@ impl ScanSession {
         self.shared.hold.store(false, Ordering::SeqCst);
     }
 
-    /// The state as it is: a rig job may have ended the acquisition
-    /// ([`RigLink::end_acquisition`]) while the session still holds the
-    /// thread, which is then `Stopped` already.
+    /// The state as it is: a rig job ([`RigLink::end_acquisition`]) or a
+    /// failed stream may have ended the acquisition while the session still
+    /// holds the thread, which is then `Stopped` already.
     fn live_state(&self) -> ScanState {
         match self.state {
             ScanState::Scanning | ScanState::Paused if self.shared.ended.load(Ordering::SeqCst) => {
@@ -867,6 +890,15 @@ impl ScanSession {
             }
             state => state,
         }
+    }
+
+    /// The stream failed by itself (the device was lost) and the session
+    /// still holds that ended acquisition: [`ScanSession::stop`] takes its
+    /// model back.
+    pub(crate) fn stream_failed(&self) -> bool {
+        self.worker.is_some()
+            && self.shared.ended.load(Ordering::SeqCst)
+            && self.shared.live().error.is_some()
     }
 
     /// The acquisition as seen by a rig job thread.
@@ -931,6 +963,11 @@ impl ScanSession {
             rig_world: live.rig_world,
             imu_world: live.imu_world,
             scanner_deg: live.world.as_ref().map(scanner_angles),
+            // the acquisition thread publishes it while it holds the device
+            vendor: match &self.device {
+                Some(device) => device.vendor_status(),
+                None => live.vendor.clone(),
+            },
         }
     }
 
@@ -958,11 +995,10 @@ impl ScanSession {
     }
 
     fn require_idle(&self, action: &'static str) -> Result<()> {
-        match self.state {
-            ScanState::Scanning | ScanState::Paused => Err(ScanError::InvalidState {
-                action,
-                state: self.state,
-            }),
+        match self.live_state() {
+            state @ (ScanState::Scanning | ScanState::Paused) => {
+                Err(ScanError::InvalidState { action, state })
+            }
             _ => Ok(()),
         }
     }
@@ -986,7 +1022,9 @@ impl ScanSession {
                 self.info = None;
                 self.state = ScanState::Idle;
                 let detail = "the acquisition thread panicked".to_owned();
-                self.shared.live().error = Some(("device", detail.clone()));
+                let mut live = self.shared.live();
+                live.error = Some(("device", detail.clone()));
+                live.vendor = None;
                 Err(ScanError::Device(detail))
             }
         }
@@ -1136,6 +1174,7 @@ fn fuse_stop(
         flagged: false,
         delta_deg: 0.0,
         rms_mm: None,
+        prior_fit: None,
     };
     let params = track_params(true);
     let s = sample(&depth, &k, &params, geometry.map(|g| (g, angles.1)));
@@ -1173,6 +1212,8 @@ fn fuse_stop(
                     };
                     let r0 = track_frame(&fusion.volume, &s, &k, &prior, &at_prior);
                     out.rms_mm = r0.rms_mm.is_finite().then_some(r0.rms_mm);
+                    let counted = s.counted();
+                    out.prior_fit = (counted > 0).then(|| r0.inliers as f32 / counted as f32);
                     prior
                 }
             }
@@ -1317,6 +1358,10 @@ pub struct ReplayedStop {
     pub delta_deg: f32,
     /// RMS registration residual (mm).
     pub rms_mm: Option<f32>,
+    /// A refused registration: the fraction of its samples on the model at
+    /// the turntable pose (low: the view is not where the rig calibration
+    /// puts it).
+    pub prior_fit: Option<f32>,
 }
 
 /// Outcome of [`fuse_recorded_stops`].
@@ -1337,6 +1382,11 @@ pub struct ReplayedScan {
     /// The fused stops, as `scan.auto` keeps them for the fine
     /// reconstruction ([`crate::reconstruct`]).
     pub kept: KeptStops,
+    /// The calibration check of `scan.auto` ([`crate::rig::CalibrationCheck`])
+    /// found the calibration outdated on the first views of the first
+    /// pass: the live scan would have stopped there with
+    /// `calibration-outdated`.
+    pub calibration_outdated: bool,
 }
 
 /// A recorded stop: turntable angles `(rotate, tilt)` and the
@@ -1346,8 +1396,10 @@ pub type RecordedStop = ((f32, f32), Arc<Vec<f32>>);
 
 /// Runs recorded stop images through the stop-and-capture fusion of
 /// `scan.auto`, offline: region of interest, registration from the
-/// turntable pose of `calibration`, fusion, then a loop closure over all
-/// the stops. For tests and tuning on recorded data.
+/// turntable pose of `calibration`, fusion, the calibration check on the
+/// first pass (the recording goes on where the live scan would stop),
+/// then a loop closure over all the stops. For tests and tuning on
+/// recorded data.
 pub fn fuse_recorded_stops(
     settings: &ScanSettings,
     calibration: &RigCalibration,
@@ -1359,7 +1411,11 @@ pub fn fuse_recorded_stops(
     let k = *intrinsics;
     let w = k.width as usize;
     let mut out = Vec::new();
+    let mut check = CalibrationCheck::default();
+    let first_tilt = stops.first().map(|(a, _)| a.1);
+    let mut first_pass = true;
     for (angles, depth) in stops {
+        first_pass &= Some(angles.1) == first_tilt;
         let cropped: Vec<f32> = depth
             .iter()
             .enumerate()
@@ -1373,11 +1429,16 @@ pub fn fuse_recorded_stops(
             })
             .collect();
         let s = fuse_stop(&mut fusion, Some(&g), Arc::new(cropped), k, *angles);
+        // a view registered after the world view, as `scan.auto` judges it
+        if first_pass && s.index.is_some_and(|i| i > 0) {
+            check.note(s.flagged, s.prior_fit);
+        }
         out.push(ReplayedStop {
             fused: s.index.is_some(),
             flagged: s.flagged,
             delta_deg: s.delta_deg,
             rms_mm: s.rms_mm,
+            prior_fit: s.prior_fit,
         });
     }
     let closed = close_loop(&mut fusion, Some(&g), settings, 0);
@@ -1389,6 +1450,7 @@ pub fn fuse_recorded_stops(
         cloud: moved(fusion.volume.extract_cloud(), &fusion.world),
         world: fusion.world,
         kept: kept_stops(&fusion, Some(calibration.clone()), settings),
+        calibration_outdated: check.outdated(),
     }
 }
 
@@ -1407,7 +1469,14 @@ fn acquire(
     let mut extracted_at = shared.live().fused_frames;
     let mut last_publish: Option<Instant> = None;
     let mut last_frame: Option<Instant> = None;
-    shared.live().latency = device.latency();
+    // what the device did when its stream started; again at the first frame
+    // (a restart reopens the device inside `next_frame`) and at the end
+    let mut started = false;
+    {
+        let mut live = shared.live();
+        live.latency = device.latency();
+        live.vendor = device.vendor_status();
+    }
     let mut history = AngleHistory::default();
     let probe_angles = |probe: &Option<dc_turntable::AngleProbe>| {
         probe
@@ -1440,6 +1509,7 @@ fn acquire(
             // the stream ends now (fill light off): nothing is tracked while
             // the job computes
             device.stop();
+            shared.live().vendor = device.vendor_status();
             shared.ended.store(true, Ordering::SeqCst);
             let mut io = shared.io();
             io.request = None;
@@ -1451,10 +1521,16 @@ fn acquire(
             Ok(Some(frame)) => frame,
             Ok(None) => continue,
             Err(e) => {
-                shared.live().error = Some((e.code(), e.to_string()));
+                let mut live = shared.live();
+                live.error = Some((e.code(), e.to_string()));
+                live.vendor = device.vendor_status();
                 break;
             }
         };
+        if !started {
+            started = true;
+            shared.live().vendor = device.vendor_status();
+        }
         let arrived = Instant::now();
         history.push(arrived, probe_angles(&probe));
         let k = frame.intrinsics;
@@ -1512,6 +1588,7 @@ fn acquire(
                             flagged: false,
                             delta_deg: 0.0,
                             rms_mm: None,
+                            prior_fit: None,
                         }
                     };
                     stop = Some(out.index.is_some());
@@ -1607,6 +1684,16 @@ fn acquire(
             last_publish = Some(now);
         }
     }
+    // nothing streams any more: no frame rate, nothing tracked
+    let mut live = shared.live();
+    live.fps = 0.0;
+    live.tracking_ok = false;
+    if live.error.is_some() {
+        // the stream failed (device lost): the session is no longer
+        // scanning; its model waits to be joined, as after a rig job
+        shared.ended.store(true, Ordering::SeqCst);
+    }
+    drop(live);
     (device, fusion)
 }
 
@@ -1748,6 +1835,144 @@ mod tests {
         assert!(!cloud.is_empty());
         let p = s.preview().unwrap();
         assert_eq!(p.cloud.len(), cloud.len());
+    }
+
+    #[test]
+    fn a_lost_device_ends_the_scan_by_itself() {
+        let mut s = ScanSession::new(ScanSettings::default());
+        let backend = SimBackend::new(SimOptions {
+            realtime: false,
+            lost_after: Some(6),
+            width: 160,
+            height: 100,
+            ..SimOptions::default()
+        });
+        s.connect_with(&backend, UPPER_ID).unwrap();
+        s.start().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while s.status().state != ScanState::Stopped {
+            assert!(Instant::now() < deadline, "{:?}", s.status());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // no scan under way any more: no frame rate, nothing tracked, the
+        // reason given
+        let st = s.status();
+        assert_eq!(st.frames, 6);
+        assert_eq!(st.fps, 0.0);
+        assert!(!st.tracking_ok);
+        assert_eq!(st.error.as_deref(), Some("device-lost"));
+        assert!(s.stream_failed());
+        assert_eq!(s.pause().unwrap_err().code(), "invalid-state");
+        // the settings may change, as with any stopped scan
+        s.set_settings(ScanSettings::default()).unwrap();
+        // stop takes back what was fused
+        let cloud = s.stop().unwrap();
+        assert!(!cloud.is_empty());
+        assert!(!s.stream_failed());
+        assert_eq!(s.status().state, ScanState::Stopped);
+        // the scan may go on (the device is still lost: it ends again)
+        s.start().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !s.stream_failed() {
+            assert!(Instant::now() < deadline, "{:?}", s.status());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // and start again without a stop in between
+        s.start().unwrap();
+        s.reset();
+        assert_eq!(s.status().state, ScanState::Connected);
+    }
+
+    /// A simulated device with a vendor layer: its light follows the stream.
+    struct VendorSim {
+        inner: Box<dyn ScannerDevice>,
+        streaming: bool,
+    }
+
+    impl ScannerDevice for VendorSim {
+        fn info(&self) -> DeviceInfo {
+            self.inner.info()
+        }
+
+        fn start(&mut self) -> Result<()> {
+            self.inner.start()?;
+            self.streaming = true;
+            Ok(())
+        }
+
+        fn stop(&mut self) {
+            self.inner.stop();
+            self.streaming = false;
+        }
+
+        fn next_frame(&mut self, timeout: Duration) -> Result<Option<DepthFrame>> {
+            self.inner.next_frame(timeout)
+        }
+
+        fn vendor_status(&self) -> Option<VendorStatus> {
+            Some(VendorStatus {
+                fill_light: if self.streaming { "on" } else { "off" }.into(),
+                fill_light_note: None,
+                fast_exposure: "applied".into(),
+                fast_exposure_note: None,
+                calibration: "factory",
+                calibration_note: None,
+                fx: 1142.37,
+                fy: 1142.37,
+                cx: 163.19,
+                cy: 329.85,
+            })
+        }
+    }
+
+    struct VendorSimBackend(SimBackend);
+
+    impl ScannerBackend for VendorSimBackend {
+        fn id(&self) -> &'static str {
+            "vendor-sim"
+        }
+
+        fn list(&self) -> Result<Vec<DeviceInfo>> {
+            self.0.list()
+        }
+
+        fn open(&self, device_id: &str) -> Result<Box<dyn ScannerDevice>> {
+            Ok(Box::new(VendorSim {
+                inner: self.0.open(device_id)?,
+                streaming: false,
+            }))
+        }
+    }
+
+    #[test]
+    fn the_status_reports_the_vendor_layer_in_every_state() {
+        let light = |s: &ScanSession| s.status().vendor.map(|v| v.fill_light.into_owned());
+        let mut s = ScanSession::new(ScanSettings::default());
+        // a device without a vendor layer
+        s.connect_with(&sim(4), UPPER_ID).unwrap();
+        assert_eq!(s.status().vendor, None);
+        // connected: the session holds the device
+        s.connect_with(&VendorSimBackend(sim(1000)), UPPER_ID)
+            .unwrap();
+        assert_eq!(light(&s).as_deref(), Some("off"));
+        let json = serde_json::to_value(s.status()).unwrap();
+        assert_eq!(json["vendor"]["fill_light"], "off");
+        assert_eq!(json["vendor"]["calibration"], "factory");
+        // scanning: the acquisition thread publishes it
+        s.start().unwrap();
+        wait_frames(&s, 2);
+        let v = s.status().vendor.unwrap();
+        assert_eq!(
+            (&*v.fill_light, &*v.fast_exposure, v.calibration),
+            ("on", "applied", "factory")
+        );
+        assert_eq!((v.fx, v.cx, v.cy), (1142.37, 163.19, 329.85));
+        // stopped: the device is back, its light off
+        s.stop().unwrap();
+        assert_eq!(light(&s).as_deref(), Some("off"));
+        s.disconnect();
+        assert_eq!(s.status().vendor, None);
+        assert!(serde_json::to_value(s.status()).unwrap()["vendor"].is_null());
     }
 
     #[test]

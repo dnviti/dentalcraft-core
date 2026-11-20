@@ -12,7 +12,8 @@
 //! test reads its own dataset (see
 //! `recorded_calibration_stops_measure_both_axes`); the reconstruction
 //! replay reads a dataset or the stops exported by `scan.export` (see
-//! `recorded_stops_reconstruct`).
+//! `recorded_stops_reconstruct`); the check of an outdated rig calibration
+//! reads two exported scans (see `recorded_scans_check_the_rig_calibration`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -819,4 +820,66 @@ fn recorded_stops_reconstruct() {
     }
     assert_eq!(report.non_manifold_edges, 0);
     assert_eq!(report.components, 1);
+}
+
+/// The live stop-and-capture fusion of the stops exported from a scan
+/// (`scan.export` `stops`) under the calibration they were taken with: the
+/// views, flags and the verdict of the calibration check.
+fn replay_exported(dir: &Path) -> (usize, dc_scanner::session::ReplayedScan) {
+    let kept = read_stops(dir).expect("a stops directory");
+    let calibration = kept
+        .calibration
+        .clone()
+        .expect("stops of a calibrated scan");
+    let k = kept.stops[0].intrinsics;
+    let stops: Vec<RecordedStop> = kept
+        .stops
+        .iter()
+        .map(|s| {
+            let mut depth = vec![f32::NAN; (k.width * k.height) as usize];
+            for &(i, z) in s.pixels.iter() {
+                depth[i as usize] = z;
+            }
+            (s.angles, Arc::new(depth))
+        })
+        .collect();
+    let n = stops.len();
+    (
+        n,
+        fuse_recorded_stops(&ScanSettings::default(), &calibration, &k, &stops),
+    )
+}
+
+/// The calibration check of `scan.auto` on real scans: the Windows scan of
+/// 2026-11-20, taken with the calibration of 2026-11-19 after the user had
+/// turned and moved the turntable (`DC_SCAN_STOPS_OUTDATED`, the live scan
+/// flagged 243 of 245 views and its reconstruction rejected 241), must stop
+/// on its first views; the Linux scan of 2026-11-19 with the same
+/// calibration on the rig as it stood (`DC_SCAN_STOPS_FITTING`, 19 of 245
+/// views flagged, none rejected) must not.
+#[test]
+#[ignore = "needs DC_SCAN_STOPS_OUTDATED and DC_SCAN_STOPS_FITTING (exported scans)"]
+fn recorded_scans_check_the_rig_calibration() {
+    for (key, outdated) in [
+        ("DC_SCAN_STOPS_OUTDATED", true),
+        ("DC_SCAN_STOPS_FITTING", false),
+    ] {
+        let dir = PathBuf::from(std::env::var_os(key).unwrap_or_else(|| panic!("set {key}")));
+        let (n, scan) = replay_exported(&dir);
+        let flagged = scan.stops.iter().filter(|s| s.flagged).count();
+        let first: Vec<String> = scan
+            .stops
+            .iter()
+            .skip(1)
+            .take(dc_scanner::rig::CHECK_VIEWS as usize)
+            .map(|s| format!("{}/{:?}", u8::from(s.flagged), s.prior_fit))
+            .collect();
+        println!(
+            "{}: {n} stops, {flagged} flagged, first views (flagged/fit) {}, outdated {}",
+            dir.display(),
+            first.join(" "),
+            scan.calibration_outdated
+        );
+        assert_eq!(scan.calibration_outdated, outdated, "{}", dir.display());
+    }
 }

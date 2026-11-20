@@ -3,23 +3,64 @@
 //! doc of [`super`]). The platform layer ([`super::platform`]) finds the
 //! devices and their depth capture node and streams that node.
 
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use super::calib::{Calibration, CalibrationSource, load_calibration};
-#[cfg(target_os = "linux")]
 use super::exposure::ExposureProfile;
 use super::factory;
 use super::frame::{self, StreamMode};
-#[cfg(target_os = "linux")]
 use super::light::FillLight;
 use super::platform::{self, Address, Capture, PIX_FMT_Y16, find_devices, open_capture};
+use super::xu;
 use super::{BACKEND_ID, REENUMERATION_GRACE, UsbOptions};
 use crate::{
     DepthFrame, DeviceInfo, Result, RevopointUsbBackend, ScanError, ScannerBackend, ScannerDevice,
+    VendorStatus,
 };
 
 /// Longest sleep of one reconnection step inside `next_frame`.
 const RECONNECT_STEP: Duration = Duration::from_millis(100);
+
+/// What the device did with one vendor setting, as [`VendorStatus`]
+/// reports it.
+#[derive(Clone, Debug, PartialEq)]
+enum Vendor {
+    /// The state named: `on` or `off` for the fill light; `off`, `pending`
+    /// or `applied` for the exposure profile.
+    State(&'static str),
+    /// The device has no vendor unit: nothing is sent (why).
+    Unsupported(String),
+    /// The latest request failed: its error code and text.
+    Failed(&'static str, String),
+}
+
+impl Vendor {
+    /// The outcome of the lines that put the device in `state`: `send` runs
+    /// only when the device has the vendor unit (`unit`, else why not).
+    fn of(
+        unit: &std::result::Result<(), String>,
+        state: &'static str,
+        send: impl FnOnce() -> Result<()>,
+    ) -> Self {
+        match unit {
+            Err(why) => Self::Unsupported(why.clone()),
+            Ok(()) => match send() {
+                Ok(()) => Self::State(state),
+                Err(e) => Self::Failed(e.code(), e.to_string()),
+            },
+        }
+    }
+
+    /// The state as [`VendorStatus`] names it, and its note.
+    fn report(&self) -> (Cow<'static, str>, Option<String>) {
+        match self {
+            Self::State(state) => (Cow::Borrowed(*state), None),
+            Self::Unsupported(why) => (Cow::Borrowed("unsupported"), Some(why.clone())),
+            Self::Failed(code, why) => (Cow::Owned(format!("error:{code}")), Some(why.clone())),
+        }
+    }
+}
 
 impl ScannerBackend for RevopointUsbBackend {
     fn id(&self) -> &'static str {
@@ -49,30 +90,24 @@ impl ScannerBackend for RevopointUsbBackend {
         let (mut calibration, mut calibration_source) = load_calibration()?;
         // the node must open; it is closed again until `start`
         let idle = open_capture(&node).map_err(|(_, e)| e)?;
-        #[cfg(target_os = "linux")]
-        let shell_unit = found.has_shell_unit();
+        // the vendor unit, checked before any request reaches it
+        let unit = platform::vendor_unit(&found, &idle);
         let mut calibration_note = None;
         // no user file: the factory calibration, cached or read now (the
         // stream is idle, as the file channel requires)
         if calibration_source == CalibrationSource::Defaults {
             match found.info.serial.as_deref().and_then(factory::cache_dir) {
                 Some(dir) => {
-                    let read = |file| {
-                        #[cfg(target_os = "linux")]
-                        if shell_unit {
-                            return idle.read_factory_file(file);
-                        }
-                        let _ = file;
-                        Err(ScanError::Device(
-                            "the factory calibration is read on Linux, from a device with \
-                             the vendor extension unit"
-                                .into(),
-                        ))
+                    let read = |file| match &unit {
+                        Ok(()) => xu::read_file(&idle, file),
+                        Err(why) => Err(ScanError::Device(format!(
+                            "{why}: the factory calibration is not read"
+                        ))),
                     };
                     match factory::load_or_read(&dir, read) {
-                        Ok((c, path)) => {
+                        Ok((c, source)) => {
                             calibration = c;
-                            calibration_source = CalibrationSource::Factory(path);
+                            calibration_source = source;
                         }
                         Err(e) => calibration_note = Some(e.to_string()),
                     }
@@ -84,10 +119,9 @@ impl ScannerBackend for RevopointUsbBackend {
             }
         }
         // idle, the device blinks its LEDs: off until a stream turns them on
-        #[cfg(target_os = "linux")]
-        if shell_unit {
-            let _ = idle.set_fill_light(FillLight::Off);
-        }
+        let light = Vendor::of(&unit, "off", || {
+            xu::send_lines(&idle, FillLight::Off.lines(), "light command")
+        });
         drop(idle);
         Ok(Box::new(RevopointUsbDevice {
             info: found.info,
@@ -104,11 +138,10 @@ impl ScannerBackend for RevopointUsbBackend {
             spare: Vec::new(),
             latest_ir: None,
             fill_light: true,
-            shell_unit: false,
-            light_on: false,
-            light_note: None,
+            unit,
+            light,
             fast_exposure: false,
-            exposure_note: None,
+            exposure: Vendor::State("off"),
             last_frame_us: None,
             period: None,
         }))
@@ -149,16 +182,16 @@ pub struct RevopointUsbDevice {
     latest_ir: Option<Vec<u8>>,
     /// Turn the fill light on while streaming (see [`super::light`]).
     fill_light: bool,
-    /// The current enumeration has the vendor shell extension unit.
-    shell_unit: bool,
-    /// The fill light was turned on for the current stream.
-    light_on: bool,
-    /// Why the fill light was not driven, once.
-    light_note: Option<String>,
+    /// The current enumeration has the vendor extension unit (checked by
+    /// the platform, see [`super::xu`]); why not, when it has not.
+    unit: std::result::Result<(), String>,
+    /// What the fill light requests did: `on` while it is on for the
+    /// current stream.
+    light: Vendor,
     /// Apply [`ExposureProfile::Fast`] when a stream starts.
     fast_exposure: bool,
-    /// Why the exposure profile was not applied, once.
-    exposure_note: Option<String>,
+    /// What the exposure profile requests did.
+    exposure: Vendor,
     /// Driver timestamp of the latest complete frame dequeued (µs).
     last_frame_us: Option<u64>,
     /// Smoothed frame period of the stream, once two frames came.
@@ -201,8 +234,9 @@ impl std::fmt::Debug for RevopointUsbDevice {
             .field("mode", &self.mode)
             .field("fill_light", &self.fill_light)
             .field("fast_exposure", &self.fast_exposure)
-            .field("shell_unit", &self.shell_unit)
-            .field("light_on", &self.light_on)
+            .field("vendor_unit", &self.unit.is_ok())
+            .field("light", &self.light)
+            .field("exposure", &self.exposure)
             .finish_non_exhaustive()
     }
 }
@@ -273,63 +307,45 @@ impl RevopointUsbDevice {
             .set_fps(self.options.fps)
             .and_then(|()| capture.start(self.options.buffers.max(2)))
             .map_err(NotYet::Fail)?;
+        let unit = platform::vendor_unit(&found, &capture);
         self.mode = mode;
         self.address = found.address;
         self.capture = Some(capture);
         self.restart = None;
         self.reconnect_deadline = None;
-        #[cfg(target_os = "linux")]
+        self.unit = unit;
+        self.send_light(if self.fill_light {
+            FillLight::On
+        } else {
+            FillLight::Off
+        });
+        if self.fast_exposure
+            && let Some(capture) = &self.capture
         {
-            self.shell_unit = found.has_shell_unit();
-            let light = if self.fill_light {
-                FillLight::On
-            } else {
-                FillLight::Off
-            };
-            self.light_on = self.send_light(light) && self.fill_light;
-            if self.fast_exposure && self.shell_unit {
-                let sent = self
-                    .capture
-                    .as_ref()
-                    .map(|c| c.set_exposure_profile(ExposureProfile::Fast));
-                if let Some(Err(e)) = sent {
-                    self.exposure_note.get_or_insert_with(|| e.to_string());
-                }
-            }
+            self.exposure = Vendor::of(&self.unit, "applied", || {
+                xu::send_lines(capture, ExposureProfile::Fast.lines(), "exposure command")
+            });
         }
         Ok(())
     }
 
-    /// Sends `light` on the open stream when the device has the vendor
-    /// shell unit; a refusal is noted once.
-    #[cfg(target_os = "linux")]
-    fn send_light(&mut self, light: FillLight) -> bool {
-        let result = match (&self.capture, self.shell_unit) {
-            (Some(capture), true) => capture.set_fill_light(light),
-            (Some(_), false) => Err(ScanError::Device(
-                "no extension unit 4 with the expected GUID: fill light left alone".into(),
-            )),
-            (None, _) => return false,
+    /// Sends `light` on the open stream and keeps what it did.
+    fn send_light(&mut self, light: FillLight) {
+        let Some(capture) = &self.capture else {
+            return;
         };
-        match result {
-            Ok(()) => true,
-            Err(e) => {
-                self.light_note.get_or_insert_with(|| e.to_string());
-                false
-            }
-        }
+        let state = match light {
+            FillLight::On => "on",
+            FillLight::Off => "off",
+        };
+        self.light = Vendor::of(&self.unit, state, || {
+            xu::send_lines(capture, light.lines(), "light command")
+        });
     }
 
-    /// Why the fill light was not driven, when it was not (the first
-    /// reason only).
-    pub fn fill_light_note(&self) -> Option<&str> {
-        self.light_note.as_deref()
-    }
-
-    /// Why the exposure profile was not applied, when it was not (the
-    /// first reason only).
-    pub fn exposure_note(&self) -> Option<&str> {
-        self.exposure_note.as_deref()
+    /// The fill light is on for the current stream.
+    fn light_on(&self) -> bool {
+        self.light == Vendor::State("on")
     }
 
     /// Sets the requested mode, else [`StreamMode::Depth`].
@@ -350,12 +366,10 @@ impl RevopointUsbDevice {
     /// The stream ended (stopped or lost): forget it, the fill light off
     /// first (left on, or blinking, it would stay so after the scan).
     fn end_stream(&mut self) {
-        #[cfg(target_os = "linux")]
-        if self.capture.is_some() && self.shell_unit {
+        if self.capture.is_some() && self.unit.is_ok() {
             // a device that left the bus refuses it: nothing to do then
             self.send_light(FillLight::Off);
         }
-        self.light_on = false;
         if let Some(mut capture) = self.capture.take() {
             capture.stop();
             #[allow(
@@ -446,18 +460,20 @@ impl ScannerDevice for RevopointUsbDevice {
 
     fn set_fill_light(&mut self, on: bool) -> Result<()> {
         self.fill_light = on;
-        #[cfg(target_os = "linux")]
-        if self.capture.is_some() && on != self.light_on {
-            let sent = self.send_light(if on { FillLight::On } else { FillLight::Off });
-            self.light_on = on && sent;
+        if self.capture.is_some() && on != self.light_on() {
+            self.send_light(if on { FillLight::On } else { FillLight::Off });
         }
         Ok(())
     }
 
     fn set_fast_exposure(&mut self, on: bool) -> Result<()> {
-        // applied when the next stream starts (the registers stay set
-        // across restarts until the scanner is unplugged)
+        // applied when the next stream starts; once applied the registers
+        // stay set across restarts until the scanner is unplugged, and
+        // turning the profile off sends nothing
         self.fast_exposure = on;
+        if self.exposure != Vendor::State("applied") {
+            self.exposure = Vendor::State(if on { "pending" } else { "off" });
+        }
         Ok(())
     }
 
@@ -498,6 +514,10 @@ impl ScannerDevice for RevopointUsbDevice {
             Err(e) => {
                 if e.code() == "device-lost" {
                     self.end_stream();
+                    // perhaps unplugged: back to its factory exposure until
+                    // the next stream sends the profile again
+                    self.exposure =
+                        Vendor::State(if self.fast_exposure { "pending" } else { "off" });
                 }
                 Err(e)
             }
@@ -506,6 +526,24 @@ impl ScannerDevice for RevopointUsbDevice {
 
     fn latency(&self) -> Duration {
         latency_of(self.period, self.options.latency)
+    }
+
+    fn vendor_status(&self) -> Option<VendorStatus> {
+        let (fill_light, fill_light_note) = self.light.report();
+        let (fast_exposure, fast_exposure_note) = self.exposure.report();
+        let k = &self.calibration.intrinsics;
+        Some(VendorStatus {
+            fill_light,
+            fill_light_note,
+            fast_exposure,
+            fast_exposure_note,
+            calibration: self.calibration_source.name(),
+            calibration_note: self.calibration_note.clone(),
+            fx: k.fx,
+            fy: k.fy,
+            cx: k.cx,
+            cy: k.cy,
+        })
     }
 }
 
@@ -559,5 +597,104 @@ mod tests {
         note_frame(&mut last, &mut period, 1_000_000 + 19 * 89_000 + 3_000_000);
         let p = period.unwrap().as_secs_f64();
         assert!((p - 0.089).abs() < 1e-4, "{p}");
+    }
+
+    #[test]
+    fn vendor_outcomes_have_stable_names() {
+        let missing: std::result::Result<(), String> = Err("no unit 4".into());
+        let unsupported = Vendor::of(&missing, "on", || panic!("nothing is sent"));
+        assert_eq!(
+            unsupported.report(),
+            ("unsupported".into(), Some("no unit 4".into()))
+        );
+        assert_eq!(
+            Vendor::of(&Ok(()), "on", || Ok(())).report(),
+            ("on".into(), None)
+        );
+        let failed = Vendor::of(&Ok(()), "off", || {
+            Err(ScanError::DeviceLost("the scanner left".into()))
+        });
+        let (state, note) = failed.report();
+        assert_eq!(state, "error:device-lost");
+        assert!(note.unwrap().contains("the scanner left"));
+    }
+
+    /// A device as `open` leaves it, without a stream.
+    fn idle_device(
+        unit: std::result::Result<(), String>,
+        source: CalibrationSource,
+    ) -> RevopointUsbDevice {
+        let light = Vendor::of(&unit, "off", || Ok(()));
+        let mut calibration = Calibration::default();
+        calibration.intrinsics.fx = 1142.37;
+        calibration.intrinsics.fy = 1142.37;
+        calibration.intrinsics.cx = 163.19;
+        calibration.intrinsics.cy = 329.85;
+        RevopointUsbDevice {
+            info: DeviceInfo {
+                backend: BACKEND_ID.into(),
+                id: "A26307475A6H01AB8".into(),
+                name: "Revopoint MINI 2 (USB)".into(),
+                serial: Some("A26307475A6H01AB8".into()),
+            },
+            options: UsbOptions::default(),
+            calibration,
+            calibration_source: source,
+            calibration_note: None,
+            address: Address::default(),
+            capture: None,
+            mode: StreamMode::Depth,
+            restart: None,
+            reconnect_deadline: None,
+            buf: Vec::new(),
+            spare: Vec::new(),
+            latest_ir: None,
+            fill_light: true,
+            unit,
+            light,
+            fast_exposure: false,
+            exposure: Vendor::State("off"),
+            last_frame_us: None,
+            period: None,
+        }
+    }
+
+    #[test]
+    fn the_vendor_status_says_what_was_sent() {
+        let mut d = idle_device(Ok(()), CalibrationSource::FactoryCached("/x/Pl.bin".into()));
+        let s = d.vendor_status().unwrap();
+        assert_eq!(
+            (&*s.fill_light, &*s.fast_exposure, s.calibration),
+            ("off", "off", "factory-cached")
+        );
+        assert_eq!((s.fx, s.fy, s.cx, s.cy), (1142.37, 1142.37, 163.19, 329.85));
+        assert_eq!((s.fill_light_note, s.fast_exposure_note), (None, None));
+        // the profile waits for the stream; once applied it stays in effect
+        d.set_fast_exposure(true).unwrap();
+        assert_eq!(d.vendor_status().unwrap().fast_exposure, "pending");
+        d.set_fast_exposure(false).unwrap();
+        assert_eq!(d.vendor_status().unwrap().fast_exposure, "off");
+        d.exposure = Vendor::State("applied");
+        d.set_fast_exposure(false).unwrap();
+        assert_eq!(d.vendor_status().unwrap().fast_exposure, "applied");
+        // without a stream the light is only remembered for the next one
+        d.set_fill_light(true).unwrap();
+        assert_eq!(d.vendor_status().unwrap().fill_light, "off");
+        // the JSON of `scan.status`
+        let json = serde_json::to_value(d.vendor_status().unwrap()).unwrap();
+        assert_eq!(json["fill_light"], "off");
+        assert_eq!(json["fast_exposure"], "applied");
+        assert_eq!(json["calibration"], "factory-cached");
+        assert!(json["fill_light_note"].is_null());
+        assert!((json["fx"].as_f64().unwrap() - 1142.37).abs() < 1e-3);
+
+        // a device without the vendor unit gets nothing, and says why
+        let d = idle_device(
+            Err("no extension unit 4 in the USB descriptors".into()),
+            CalibrationSource::Defaults,
+        );
+        let s = d.vendor_status().unwrap();
+        assert_eq!((&*s.fill_light, s.calibration), ("unsupported", "estimate"));
+        assert!(s.fill_light_note.unwrap().contains("no extension unit 4"));
     }
 }

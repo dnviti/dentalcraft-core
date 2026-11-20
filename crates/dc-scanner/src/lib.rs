@@ -65,6 +65,7 @@ pub mod session;
 pub mod sim;
 pub mod tracking;
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -132,9 +133,25 @@ pub enum ScanError {
     /// The backend does not run on this operating system.
     #[error("scanner backend not supported on this platform: {0}")]
     PlatformUnsupported(String),
+    /// The system keeps the video stream of the scanner for itself (macOS:
+    /// its camera driver holds the streaming interface and refuses to hand
+    /// it over), so scanning is not available on this computer; scan files
+    /// can still be imported.
+    #[error("the system keeps the scanner's video stream: {0}")]
+    PlatformCaptureDenied(String),
     /// The device left while streaming (unplugged, USB reset).
     #[error("scanner disconnected: {0}")]
     DeviceLost(String),
+    /// The system does not let this program use the scanner's camera
+    /// (Windows: camera access for desktop apps is off in the privacy
+    /// settings).
+    #[error("camera access denied: {0}")]
+    CameraAccessDenied(String),
+    /// The system refuses to open the scanner's camera because of where the
+    /// program runs from (Windows: a network or shared drive); a copy of
+    /// the program on a local disk opens it.
+    #[error("the scanner cannot be opened from where the program runs: {0}")]
+    ProgramLocation(String),
     /// The turntable failed or refused (its code, e.g.
     /// `turntable-not-connected`, `ble-no-adapter`).
     #[error(transparent)]
@@ -157,6 +174,11 @@ pub enum ScanError {
         /// Technical detail with the measured values (untranslated).
         detail: String,
     },
+    /// `scan.auto` stopped at its first stops: the views do not move the
+    /// way the turntable calibration predicts, so the scanner or the
+    /// turntable moved since it was measured (calibrate again).
+    #[error("the turntable calibration no longer fits the rig: {0}")]
+    CalibrationOutdated(String),
     /// `scan.auto` ended with too few views fused or registered.
     #[error("the automatic scan is unusable: {0}")]
     ScanQuality(String),
@@ -186,6 +208,9 @@ impl From<dc_geom::GeomError> for ScanError {
 }
 
 impl ScanError {
+    /// [`ScanError::code`] of [`ScanError::CalibrationOutdated`].
+    pub const CALIBRATION_OUTDATED: &'static str = "calibration-outdated";
+
     /// Stable identifier, the same in every language (kebab-case).
     pub fn code(&self) -> &'static str {
         match self {
@@ -203,11 +228,15 @@ impl ScanError {
             Self::SdkMissing(_) => "sdk-missing",
             Self::SdkUnauthorized(_) => "sdk-unauthorized",
             Self::PlatformUnsupported(_) => "platform-unsupported",
+            Self::PlatformCaptureDenied(_) => "platform-capture-denied",
             Self::DeviceLost(_) => "device-lost",
+            Self::CameraAccessDenied(_) => "camera-access-denied",
+            Self::ProgramLocation(_) => "program-location",
             Self::Turntable(e) => e.code(),
             Self::Calibration(_) => "calibration",
             Self::RigUncalibrated => "rig-uncalibrated",
             Self::CalibrationRefused { code, .. } => code,
+            Self::CalibrationOutdated(_) => Self::CALIBRATION_OUTDATED,
             Self::ScanQuality(_) => "scan-quality-low",
             Self::NoStops => "scan-no-stops",
         }
@@ -251,6 +280,43 @@ pub struct DeviceInfo {
     pub serial: Option<String>,
 }
 
+/// What the vendor layer of a device did, the same on every platform
+/// ([`ScannerDevice::vendor_status`], reported in [`ScanStatus::vendor`]): a
+/// remote test reads it instead of looking at the scanner. The states are
+/// stable strings; in `error:<code>` the code is a [`ScanError::code`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct VendorStatus {
+    /// The fill light: `on` (sent on for the current stream), `off` (sent
+    /// off), `unsupported` (the device has no vendor unit: nothing is sent)
+    /// or `error:<code>` (the latest request failed).
+    pub fill_light: Cow<'static, str>,
+    /// Why the fill light is `unsupported` or in error.
+    pub fill_light_note: Option<String>,
+    /// The fast exposure profile: `applied` (sent since the device was
+    /// opened; it stays in effect until the scanner is unplugged),
+    /// `pending` (asked: sent when the stream starts), `off` (not asked:
+    /// nothing sent), `unsupported` or `error:<code>`.
+    pub fast_exposure: Cow<'static, str>,
+    /// Why the profile is `unsupported` or in error.
+    pub fast_exposure_note: Option<String>,
+    /// Where the pinhole below comes from: `user` (a calibration file),
+    /// `factory` (read from the scanner when it was opened),
+    /// `factory-cached` (the copy cached for its serial by an earlier
+    /// opening) or `estimate` (the field-of-view defaults).
+    pub calibration: &'static str,
+    /// Why the factory calibration is not in use, when the pinhole is the
+    /// estimate.
+    pub calibration_note: Option<String>,
+    /// Focal length along x of the depth image in use, pixels.
+    pub fx: f32,
+    /// Focal length along y, pixels.
+    pub fy: f32,
+    /// Principal point x, pixels.
+    pub cx: f32,
+    /// Principal point y, pixels.
+    pub cy: f32,
+}
+
 /// An opened device. See the crate doc for the contract of each method.
 pub trait ScannerDevice: Send {
     /// Identity of the device.
@@ -282,6 +348,11 @@ pub trait ScannerDevice: Send {
     fn latency(&self) -> Duration {
         Duration::ZERO
     }
+    /// What the vendor layer of the device did ([`VendorStatus`]); `None`
+    /// for a device without one.
+    fn vendor_status(&self) -> Option<VendorStatus> {
+        None
+    }
 }
 
 /// A kind of scanner: enumerates and opens its devices.
@@ -301,7 +372,7 @@ pub trait ScannerBackend: Send + Sync {
 
 /// The registered backends. The simulated backend `sim` is always present;
 /// `revopoint-sdk` lists no device until the Revopoint SDK is installed;
-/// `revopoint-usb` (Linux, Windows) lists the Revopoint scanners on USB.
+/// `revopoint-usb` (Linux, Windows, macOS) lists the Revopoint scanners on USB.
 pub fn backends() -> Vec<Box<dyn ScannerBackend>> {
     vec![
         Box::new(revopoint_sdk::RevopointSdkBackend::default()),
@@ -342,7 +413,11 @@ mod tests {
             ScanError::from(dc_geom::GeomError::Cancelled),
             ScanError::from(dc_geom::GeomError::InvalidInput("x".into())),
             ScanError::PlatformUnsupported("x".into()),
+            ScanError::PlatformCaptureDenied("x".into()),
             ScanError::DeviceLost("x".into()),
+            ScanError::CameraAccessDenied("x".into()),
+            ScanError::ProgramLocation("x".into()),
+            ScanError::CalibrationOutdated("x".into()),
             ScanError::NoStops,
         ];
         let codes: Vec<&str> = errors.iter().map(ScanError::code).collect();
@@ -355,7 +430,11 @@ mod tests {
                 "cancelled",
                 "geometry",
                 "platform-unsupported",
+                "platform-capture-denied",
                 "device-lost",
+                "camera-access-denied",
+                "program-location",
+                "calibration-outdated",
                 "scan-no-stops"
             ]
         );
@@ -366,7 +445,7 @@ mod tests {
         let ids: Vec<&str> = backends().iter().map(|b| b.id()).collect();
         assert_eq!(ids, ["revopoint-sdk", "revopoint-usb", "sim"]);
         let usb = backend("revopoint-usb").unwrap();
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             usb.availability().unwrap();
         } else if cfg!(windows) {
             // Media Foundation may be missing (Windows N without the Media

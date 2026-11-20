@@ -17,7 +17,11 @@
 //!   rotation: move, settle, read the angle at rest, capture the median of
 //!   `frames` frames; the acquisition registers it from the turntable pose
 //!   and fuses it (a refused registration fuses the stop at the turntable
-//!   pose and flags it). After a full revolution the loop is closed.
+//!   pose and flags it). After a full revolution the loop is closed. The
+//!   first views of the first pass check the rig calibration
+//!   ([`CalibrationCheck`]): when they are not where it puts them, the
+//!   scanner or the turntable moved since it was measured and the job
+//!   fails at once with `calibration-outdated` (calibrate again).
 //! * *continuous*: tilt, settle, release the fusion and rotate by
 //!   `rotation_deg` at a speed of about [`CONTINUOUS_DEG_PER_FRAME`] per
 //!   frame unless given.
@@ -751,6 +755,79 @@ fn tilt_to(ctx: &Ctx, plan: &AutoPlan, tilt: f32) -> Result<()> {
     Ok(())
 }
 
+/// Views registered after the world view that the first pass of a
+/// stop-and-capture `scan.auto` judges against the rig calibration
+/// ([`CalibrationCheck`]).
+pub const CHECK_VIEWS: u32 = 6;
+/// When at least this many of those views contradict the calibration, the
+/// scan stops (`calibration-outdated`).
+pub const CHECK_MIN_CONTRADICTING: u32 = 5;
+/// A view whose registration was refused contradicts the calibration when
+/// less than this fraction of its samples lies on the model at the
+/// turntable pose (within the finest association gate, 0.5 mm).
+pub const CHECK_MIN_PRIOR_FIT: f32 = 0.1;
+
+/// Whether the rig calibration still fits the rig, judged on the first
+/// views of a stop-and-capture `scan.auto` (the first pass, the views
+/// registered after the world view). Each view is registered from the
+/// turntable pose that the calibration predicts; it contradicts the
+/// calibration when its registration was refused and almost none of it
+/// lies on the model at that pose: the view is millimetres away from where
+/// the calibration puts it. Measured on the user's rig:
+///
+/// * a calibration made before the turntable was turned on the desk and
+///   moved (2026-11-20: axis 16 mm away, tilt reversed): every view
+///   refused, 0.2-3% of each on the model at the turntable pose; the scan
+///   went on and rejected 241 of its 245 views at the end;
+/// * the same views with a calibration measured on the rig as it stood:
+///   none refused;
+/// * a fresh calibration with the field-of-view intrinsics (no factory
+///   calibration, a non-metric scanner): every view refused but 17-42% of
+///   each on the model, a usable scan;
+/// * a scan whose object slid on the platter at the start of the pass: 2
+///   of the first 6 contradict.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CalibrationCheck {
+    /// Views judged so far, at most [`CHECK_VIEWS`].
+    views: u32,
+    /// Of those, the views that contradict the calibration.
+    contradicting: u32,
+}
+
+impl CalibrationCheck {
+    /// Notes a view registered after the world view: `flagged` when its
+    /// registration was refused, `prior_fit` the fraction of its samples
+    /// on the model at the turntable pose (see `StopOutcome::prior_fit`).
+    /// Views beyond the first [`CHECK_VIEWS`] are not judged.
+    pub fn note(&mut self, flagged: bool, prior_fit: Option<f32>) {
+        if self.views >= CHECK_VIEWS {
+            return;
+        }
+        self.views += 1;
+        if flagged && prior_fit.is_some_and(|f| f < CHECK_MIN_PRIOR_FIT) {
+            self.contradicting += 1;
+        }
+    }
+
+    /// The first [`CHECK_VIEWS`] views are judged and at least
+    /// [`CHECK_MIN_CONTRADICTING`] of them contradict the calibration.
+    pub fn outdated(&self) -> bool {
+        self.views == CHECK_VIEWS && self.contradicting >= CHECK_MIN_CONTRADICTING
+    }
+
+    /// Technical detail of the verdict, for the pass at `tilt_deg`.
+    pub fn detail(&self, tilt_deg: f32) -> String {
+        format!(
+            "{} of the first {} views of the pass at {tilt_deg}° are not where the calibration \
+             puts them (registration refused, under {:.0}% of each on the model at the turntable \
+             pose): the scanner or the turntable moved since it was measured",
+            self.contradicting,
+            self.views,
+            CHECK_MIN_PRIOR_FIT * 100.0
+        )
+    }
+}
+
 fn auto_stops(ctx: &Ctx, plan: &AutoPlan, step_deg: f32, frames: usize) -> Result<ScanQuality> {
     ctx.set_speeds(plan.deg_per_s.unwrap_or(STOP_MOVE_DEG_PER_S), plan.has_tilt)?;
     let wait = settle(plan.settle, ctx.link.latency());
@@ -760,7 +837,8 @@ fn auto_stops(ctx: &Ctx, plan: &AutoPlan, step_deg: f32, frames: usize) -> Resul
     let n = plan.stops_per_pass() - 1;
     let mut quality = ScanQuality::default();
     let mut rms = Vec::new();
-    for &tilt in &plan.tilts_deg {
+    let mut check = CalibrationCheck::default();
+    for (pass, &tilt) in plan.tilts_deg.iter().enumerate() {
         ctx.link.set_hold(true);
         ctx.step(Some(tilt));
         tilt_to(ctx, plan, tilt)?;
@@ -779,6 +857,11 @@ fn auto_stops(ctx: &Ctx, plan: &AutoPlan, step_deg: f32, frames: usize) -> Resul
             quality.stops += 1;
             if let Some(k) = out.index {
                 quality.fused += 1;
+                // the first pass checks the calibration on the views
+                // registered after the world view (the first fused stop)
+                if pass == 0 && k > 0 {
+                    check.note(out.flagged, out.prior_fit);
+                }
                 first.get_or_insert(k);
             }
             if out.flagged {
@@ -786,6 +869,9 @@ fn auto_stops(ctx: &Ctx, plan: &AutoPlan, step_deg: f32, frames: usize) -> Resul
             }
             rms.extend(out.rms_mm);
             ctx.job.lock().quality = Some(quality.clone());
+            if check.outdated() {
+                return Err(ScanError::CalibrationOutdated(check.detail(tilt)));
+            }
         }
         if let Some(first) = first
             && plan.rotation_deg.abs() >= 359.0
@@ -1058,5 +1144,63 @@ mod tests {
             judge(&q, AutoMode::Continuous).unwrap_err().code(),
             "scan-quality-low"
         );
+    }
+
+    /// The check over `views` (flagged, fit at the turntable pose).
+    fn checked(views: &[(bool, Option<f32>)]) -> CalibrationCheck {
+        let mut c = CalibrationCheck::default();
+        for &(flagged, fit) in views {
+            c.note(flagged, fit);
+        }
+        c
+    }
+
+    #[test]
+    fn the_calibration_check_needs_its_first_views_far_from_the_turntable_pose() {
+        // the first views of the Windows scan of 2026-11-20 (calibration
+        // made before the turntable was turned and moved)
+        let moved = [0.03, 0.026, 0.013, 0.002, 0.003, 0.015].map(|f| (true, Some(f)));
+        let c = checked(&moved);
+        assert!(c.outdated(), "{c:?}");
+        assert!(
+            c.detail(-20.0).contains("6 of the first 6"),
+            "{}",
+            c.detail(-20.0)
+        );
+        // judged only once its window is full
+        assert!(!checked(&moved[..5]).outdated());
+        // a fitting calibration: views registered (not flagged)
+        assert!(!checked(&[(false, None); 6]).outdated());
+        // a fresh calibration on a non-metric scanner: views refused, yet
+        // well on the model at the turntable pose
+        let fov = [0.421, 0.302, 0.26, 0.224, 0.201, 0.174].map(|f| (true, Some(f)));
+        assert!(!checked(&fov).outdated());
+        // an object that slid at the start of the pass, then held
+        let slid = [
+            (true, Some(0.002)),
+            (true, Some(0.029)),
+            (true, Some(0.24)),
+            (false, None),
+            (false, None),
+            (false, None),
+        ];
+        assert!(!checked(&slid).outdated());
+        // four views far off are not enough, five are
+        let mut four = moved;
+        four[1] = (false, None);
+        four[4] = (true, Some(0.5));
+        assert!(!checked(&four).outdated());
+        let mut five = moved;
+        five[2] = (false, None);
+        assert!(checked(&five).outdated());
+        // a refused view with no samples is no evidence
+        let mut empty = moved;
+        empty[0] = (true, None);
+        empty[3] = (true, None);
+        assert!(!checked(&empty).outdated());
+        // the views after the first ones are not judged
+        let mut late = vec![(false, None); 6];
+        late.extend(moved);
+        assert!(!checked(&late).outdated());
     }
 }

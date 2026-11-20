@@ -40,6 +40,7 @@ use serde_json::{Value, json};
 use crate::{Result, ScanError};
 
 pub use control::turntable_devices;
+pub use jobs::{CHECK_MIN_CONTRADICTING, CHECK_MIN_PRIOR_FIT, CHECK_VIEWS, CalibrationCheck};
 
 /// Default radius of the region of interest around the axis (mm).
 pub const DEFAULT_ROI_RADIUS_MM: f32 = 45.0;
@@ -309,6 +310,12 @@ pub struct TurntableStatus {
     /// A calibration matching the scanner and the table is in use (region
     /// of interest and motion prior).
     pub calibrated: bool,
+    /// The latest `scan.auto` stopped with `calibration-outdated`: its
+    /// first views were not where the stored calibration puts them, so the
+    /// scanner or the turntable moved since it was measured. Calibrate
+    /// again; a new calibration (measured, or a changed calibration file)
+    /// clears it.
+    pub calibration_outdated: bool,
     /// The latest `turntable.calibrate` job.
     pub calibration_job: Option<RigJobStatus>,
 }

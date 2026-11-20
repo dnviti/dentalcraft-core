@@ -26,16 +26,24 @@ thiserror.workspace = true
 nusb.workspace = true
 rustix.workspace = true
 
-# Media Foundation capture (entry points loaded at run time) and the device
-# tree (cfgmgr32)
+# Media Foundation capture (entry points loaded at run time), the device
+# tree (cfgmgr32) and the kernel-streaming properties of the vendor
+# extension unit
 [target.'cfg(windows)'.dependencies]
 nusb.workspace = true
 windows = { workspace = true, features = [
     "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Media_KernelStreaming",
     "Win32_Media_MediaFoundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_Com",
 ] }
 windows-core.workspace = true
+
+# the USB video reader of `revopoint_usb::uvc_bulk` (IOKit through nusb, plus
+# a few direct IOKit calls in `revopoint_usb::macos`)
+[target.'cfg(target_os = "macos")'.dependencies]
+nusb.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
