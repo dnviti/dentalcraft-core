@@ -6,15 +6,12 @@
 use std::time::{Duration, Instant};
 
 use super::calib::{Calibration, CalibrationSource, load_calibration};
-#[cfg(target_os = "linux")]
 use super::exposure::ExposureProfile;
 use super::factory;
 use super::frame::{self, StreamMode};
-#[cfg(target_os = "linux")]
 use super::light::FillLight;
 use super::platform::{self, Address, Capture, PIX_FMT_Y16, find_devices, open_capture};
-#[cfg(target_os = "linux")]
-use super::xu;
+use super::xu::{self, ShellLine};
 use super::{BACKEND_ID, REENUMERATION_GRACE, UsbOptions};
 use crate::{
     DepthFrame, DeviceInfo, Result, RevopointUsbBackend, ScanError, ScannerBackend, ScannerDevice,
@@ -51,25 +48,19 @@ impl ScannerBackend for RevopointUsbBackend {
         let (mut calibration, mut calibration_source) = load_calibration()?;
         // the node must open; it is closed again until `start`
         let idle = open_capture(&node).map_err(|(_, e)| e)?;
-        #[cfg(target_os = "linux")]
-        let shell_unit = found.has_shell_unit();
+        // the vendor unit, checked before any request reaches it
+        let unit = platform::vendor_unit(&found, &idle);
         let mut calibration_note = None;
         // no user file: the factory calibration, cached or read now (the
         // stream is idle, as the file channel requires)
         if calibration_source == CalibrationSource::Defaults {
             match found.info.serial.as_deref().and_then(factory::cache_dir) {
                 Some(dir) => {
-                    let read = |file| {
-                        #[cfg(target_os = "linux")]
-                        if shell_unit {
-                            return xu::read_file(&idle, file);
-                        }
-                        let _ = file;
-                        Err(ScanError::Device(
-                            "the factory calibration is read on Linux, from a device with \
-                             the vendor extension unit"
-                                .into(),
-                        ))
+                    let read = |file| match &unit {
+                        Ok(()) => xu::read_file(&idle, file),
+                        Err(why) => Err(ScanError::Device(format!(
+                            "{why}: the factory calibration is not read"
+                        ))),
                     };
                     match factory::load_or_read(&dir, read) {
                         Ok((c, path)) => {
@@ -86,8 +77,7 @@ impl ScannerBackend for RevopointUsbBackend {
             }
         }
         // idle, the device blinks its LEDs: off until a stream turns them on
-        #[cfg(target_os = "linux")]
-        if shell_unit {
+        if unit.is_ok() {
             let _ = xu::send_lines(&idle, FillLight::Off.lines(), "light command");
         }
         drop(idle);
@@ -106,7 +96,7 @@ impl ScannerBackend for RevopointUsbBackend {
             spare: Vec::new(),
             latest_ir: None,
             fill_light: true,
-            shell_unit: false,
+            unit,
             light_on: false,
             light_note: None,
             fast_exposure: false,
@@ -151,8 +141,9 @@ pub struct RevopointUsbDevice {
     latest_ir: Option<Vec<u8>>,
     /// Turn the fill light on while streaming (see [`super::light`]).
     fill_light: bool,
-    /// The current enumeration has the vendor shell extension unit.
-    shell_unit: bool,
+    /// The current enumeration has the vendor extension unit (checked by
+    /// the platform, see [`super::xu`]); why not, when it has not.
+    unit: std::result::Result<(), String>,
     /// The fill light was turned on for the current stream.
     light_on: bool,
     /// Why the fill light was not driven, once.
@@ -203,7 +194,7 @@ impl std::fmt::Debug for RevopointUsbDevice {
             .field("mode", &self.mode)
             .field("fill_light", &self.fill_light)
             .field("fast_exposure", &self.fast_exposure)
-            .field("shell_unit", &self.shell_unit)
+            .field("vendor_unit", &self.unit.is_ok())
             .field("light_on", &self.light_on)
             .finish_non_exhaustive()
     }
@@ -275,45 +266,45 @@ impl RevopointUsbDevice {
             .set_fps(self.options.fps)
             .and_then(|()| capture.start(self.options.buffers.max(2)))
             .map_err(NotYet::Fail)?;
+        let unit = platform::vendor_unit(&found, &capture);
         self.mode = mode;
         self.address = found.address;
         self.capture = Some(capture);
         self.restart = None;
         self.reconnect_deadline = None;
-        #[cfg(target_os = "linux")]
+        self.unit = unit;
+        let light = if self.fill_light {
+            FillLight::On
+        } else {
+            FillLight::Off
+        };
+        self.light_on = self.send_light(light) && self.fill_light;
+        if self.fast_exposure
+            && let Err(e) = self.send_lines(ExposureProfile::Fast.lines(), "exposure command")
         {
-            self.shell_unit = found.has_shell_unit();
-            let light = if self.fill_light {
-                FillLight::On
-            } else {
-                FillLight::Off
-            };
-            self.light_on = self.send_light(light) && self.fill_light;
-            if self.fast_exposure && self.shell_unit {
-                let sent = self
-                    .capture
-                    .as_ref()
-                    .map(|c| xu::send_lines(c, ExposureProfile::Fast.lines(), "exposure command"));
-                if let Some(Err(e)) = sent {
-                    self.exposure_note.get_or_insert_with(|| e.to_string());
-                }
-            }
+            self.exposure_note.get_or_insert_with(|| e.to_string());
         }
         Ok(())
     }
 
-    /// Sends `light` on the open stream when the device has the vendor
-    /// shell unit; a refusal is noted once.
-    #[cfg(target_os = "linux")]
-    fn send_light(&mut self, light: FillLight) -> bool {
-        let result = match (&self.capture, self.shell_unit) {
-            (Some(capture), true) => xu::send_lines(capture, light.lines(), "light command"),
-            (Some(_), false) => Err(ScanError::Device(
-                "no extension unit 4 with the expected GUID: fill light left alone".into(),
-            )),
-            (None, _) => return false,
+    /// Sends `lines` on the open stream when the device has the vendor unit
+    /// (`what` names them in the errors).
+    fn send_lines(&self, lines: &[ShellLine], what: &str) -> Result<()> {
+        let Some(capture) = &self.capture else {
+            return Err(ScanError::Device("the depth stream is not started".into()));
         };
-        match result {
+        match &self.unit {
+            Ok(()) => xu::send_lines(capture, lines, what),
+            Err(why) => Err(ScanError::Device(format!("{why}: no {what} sent"))),
+        }
+    }
+
+    /// Sends `light` on the open stream; a refusal is noted once.
+    fn send_light(&mut self, light: FillLight) -> bool {
+        if self.capture.is_none() {
+            return false;
+        }
+        match self.send_lines(light.lines(), "light command") {
             Ok(()) => true,
             Err(e) => {
                 self.light_note.get_or_insert_with(|| e.to_string());
@@ -352,8 +343,7 @@ impl RevopointUsbDevice {
     /// The stream ended (stopped or lost): forget it, the fill light off
     /// first (left on, or blinking, it would stay so after the scan).
     fn end_stream(&mut self) {
-        #[cfg(target_os = "linux")]
-        if self.capture.is_some() && self.shell_unit {
+        if self.capture.is_some() && self.unit.is_ok() {
             // a device that left the bus refuses it: nothing to do then
             self.send_light(FillLight::Off);
         }
@@ -448,7 +438,6 @@ impl ScannerDevice for RevopointUsbDevice {
 
     fn set_fill_light(&mut self, on: bool) -> Result<()> {
         self.fill_light = on;
-        #[cfg(target_os = "linux")]
         if self.capture.is_some() && on != self.light_on {
             let sent = self.send_light(if on { FillLight::On } else { FillLight::Off });
             self.light_on = on && sent;

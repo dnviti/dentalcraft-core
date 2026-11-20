@@ -1,13 +1,20 @@
 //! Minimal Media Foundation video capture (Windows): the counterpart of
 //! [`super::v4l2`]. Only standard capture calls of the inbox UVC driver:
 //! enumerate the video capture sources, open one, pick one of its native
-//! formats (subtype, size, frame rate), read samples, stop. Nothing
-//! vendor-specific is sent.
+//! formats (subtype, size, frame rate), read samples, stop; plus, through
+//! the kernel-streaming properties of the source ([`super::ks`]), the
+//! transport of the vendor extension-unit requests of [`super::xu`] (its
+//! closed list, nothing else).
 //!
-//! The source reader runs in asynchronous mode: one `ReadSample` request is
-//! outstanding at a time and its callback, on a Media Foundation thread,
-//! copies the frame into an inbox that [`Capture::next`] waits on with a
-//! timeout (a synchronous `ReadSample` cannot time out).
+//! The source reader runs in asynchronous mode. While streaming, one
+//! `ReadSample` request is always outstanding: its callback, on a Media
+//! Foundation thread, copies the frame into an inbox and asks for the next
+//! one. The inbox keeps the newest frames, at most as many as the driver
+//! buffers of V4L2 ([`Capture::start`]): the oldest one makes room for a
+//! new one. [`Capture::next`] takes the oldest frame kept, waiting with a
+//! timeout when there is none (a synchronous `ReadSample` cannot time out),
+//! so the caller drains the inbox down to the newest frame as it drains the
+//! V4L2 queue.
 //!
 //! The Media Foundation entry points are resolved at run time from the
 //! system directory: on Windows N editions (no Media Feature Pack) and
@@ -37,6 +44,9 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::{CoIncrementMTAUsage, CoTaskMemFree};
 use windows::core::{GUID, HRESULT, Interface, PWSTR, Ref, implement};
 
+use super::ks::VendorUnit;
+use super::ring::FrameRing;
+use super::xu::{Selector, XuRequest, XuTransport};
 use crate::{Result, ScanError};
 
 /// FOURCC of `Y16 `: 16-bit greyscale (the subtype is the FOURCC in the
@@ -49,7 +59,7 @@ const FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 // ----- errors --------------------------------------------------------------
 
 /// `HRESULT_FROM_WIN32` of a Win32 error code.
-const fn win32(code: u32) -> HRESULT {
+pub(super) const fn win32(code: u32) -> HRESULT {
     HRESULT((code | 0x8007_0000) as i32)
 }
 
@@ -77,7 +87,7 @@ const ACCESS_DENIED: HRESULT = win32(5);
 const NOT_READY: HRESULT = win32(21);
 
 /// A failed call as a scanner error: a vanished device is `device-lost`.
-fn hr_error(call: &str, hr: HRESULT) -> ScanError {
+pub(super) fn hr_error(call: &str, hr: HRESULT) -> ScanError {
     let detail = format!("{call}: {} ({:#010x})", hr.message(), hr.0 as u32);
     if GONE.contains(&hr) {
         ScanError::DeviceLost(detail)
@@ -259,23 +269,29 @@ pub(super) struct Dequeued {
     pub timestamp_us: u64,
 }
 
-/// What a `ReadSample` request produced.
-enum Ready {
-    /// A frame of `bytes` in [`State::data`].
-    Frame { bytes: usize, timestamp_us: u64 },
-    /// No sample (a gap in the stream, or a flush).
-    Nothing,
-    /// The stream failed.
-    Failed(ScanError),
-}
+/// The source reader, shared with the reader callback.
+#[derive(Clone)]
+struct SharedReader(IMFSourceReader);
+
+// SAFETY: the asynchronous source reader is a free-threaded Media
+// Foundation object living in the process MTA; Media Foundation calls it
+// from its own work-queue threads, as the callback does.
+unsafe impl Send for SharedReader {}
 
 #[derive(Default)]
 struct State {
-    /// Bytes of the latest frame.
-    data: Vec<u8>,
-    ready: Option<Ready>,
+    /// The frames not taken yet: the newest ones, at most the capacity set
+    /// by [`Capture::start`].
+    frames: FrameRing,
+    /// The failure of the latest request, reported after the frames that
+    /// came before it; no request is made until it is reported.
+    failed: Option<ScanError>,
     /// A `ReadSample` request is outstanding.
     pending: bool,
+    /// The reader, while streaming: each completed request is followed by
+    /// the next one. Cleared on stop (it also ends the reference cycle
+    /// reader, callback, inbox).
+    reader: Option<SharedReader>,
     /// The last flush completed.
     flushed: bool,
 }
@@ -291,9 +307,34 @@ impl Inbox {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// Issues a sample request, unless one is outstanding, the stream is
+    /// stopped or a failure waits to be reported. The lock is not held
+    /// across the call into Media Foundation.
+    fn request(&self) -> Result<()> {
+        let reader = {
+            let mut state = self.lock();
+            if state.pending || state.failed.is_some() {
+                return Ok(());
+            }
+            let Some(reader) = state.reader.clone() else {
+                return Ok(());
+            };
+            state.pending = true;
+            reader
+        };
+        // SAFETY: plain COM call on a live asynchronous reader (all out
+        // parameters null, as asynchronous mode requires).
+        if let Err(e) = unsafe { reader.0.ReadSample(VIDEO_STREAM, 0, None, None, None, None) } {
+            self.lock().pending = false;
+            return Err(hr_error("ReadSample", e.code()));
+        }
+        Ok(())
+    }
 }
 
-/// The source reader callback: hands each result over to the inbox.
+/// The source reader callback: hands each result over to the inbox and asks
+/// for the next sample.
 #[implement(IMFSourceReaderCallback)]
 struct Callback {
     inbox: Arc<Inbox>,
@@ -308,33 +349,46 @@ impl IMFSourceReaderCallback_Impl for Callback_Impl {
         timestamp: i64,
         sample: Ref<IMFSample>,
     ) -> windows::core::Result<()> {
-        let mut state = self.inbox.lock();
-        let ready = if hrstatus.is_err() {
-            Ready::Failed(hr_error("ReadSample", hrstatus))
-        } else if flags & MF_SOURCE_READERF_ERROR.0 as u32 != 0 {
-            Ready::Failed(ScanError::DeviceLost("the video stream failed".into()))
-        } else if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
-            Ready::Failed(ScanError::DeviceLost("the video stream ended".into()))
-        } else if let Some(sample) = sample.as_ref() {
-            match copy_sample(sample, &mut state.data) {
-                Ok(bytes) => Ready::Frame {
-                    bytes,
-                    // 100 ns units
-                    timestamp_us: u64::try_from(timestamp).unwrap_or(0) / 10,
-                },
-                Err(e) => Ready::Failed(e),
+        {
+            let mut state = self.inbox.lock();
+            state.pending = false;
+            let failed = if hrstatus.is_err() {
+                Some(hr_error("ReadSample", hrstatus))
+            } else if flags & MF_SOURCE_READERF_ERROR.0 as u32 != 0 {
+                Some(ScanError::DeviceLost("the video stream failed".into()))
+            } else if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                Some(ScanError::DeviceLost("the video stream ended".into()))
+            } else if let Some(sample) = sample.as_ref() {
+                // 100 ns units
+                let timestamp_us = u64::try_from(timestamp).unwrap_or(0) / 10;
+                state
+                    .frames
+                    .push_with(timestamp_us, |buf| copy_sample(sample, buf))
+                    .err()
+            } else {
+                // no sample: a gap in the stream, or a flush
+                None
+            };
+            if let Some(e) = failed {
+                state.failed.get_or_insert(e);
             }
-        } else {
-            Ready::Nothing
-        };
-        state.pending = false;
-        state.ready = Some(ready);
+        }
         self.inbox.changed.notify_all();
+        // the next frame, while streaming
+        if let Err(e) = self.inbox.request() {
+            self.inbox.lock().failed.get_or_insert(e);
+            self.inbox.changed.notify_all();
+        }
         Ok(())
     }
 
     fn OnFlush(&self, _stream: u32) -> windows::core::Result<()> {
-        self.inbox.lock().flushed = true;
+        {
+            let mut state = self.inbox.lock();
+            state.flushed = true;
+            // the flush ended the outstanding request
+            state.pending = false;
+        }
         self.inbox.changed.notify_all();
         Ok(())
     }
@@ -344,8 +398,8 @@ impl IMFSourceReaderCallback_Impl for Callback_Impl {
     }
 }
 
-/// Copies the bytes of `sample` into `out`; returns their count.
-fn copy_sample(sample: &IMFSample, out: &mut Vec<u8>) -> Result<usize> {
+/// Copies the bytes of `sample` into `out` (resized to them).
+fn copy_sample(sample: &IMFSample, out: &mut Vec<u8>) -> Result<()> {
     // SAFETY: plain COM calls on a live sample.
     let buffer = unsafe { sample.ConvertToContiguousBuffer() }
         .map_err(|e| hr_error("ConvertToContiguousBuffer", e.code()))?;
@@ -360,8 +414,7 @@ fn copy_sample(sample: &IMFSample, out: &mut Vec<u8>) -> Result<usize> {
         out.extend_from_slice(unsafe { std::slice::from_raw_parts(data, len as usize) });
     }
     // SAFETY: the buffer was locked above.
-    unsafe { buffer.Unlock() }.map_err(|e| hr_error("IMFMediaBuffer::Unlock", e.code()))?;
-    Ok(out.len())
+    unsafe { buffer.Unlock() }.map_err(|e| hr_error("IMFMediaBuffer::Unlock", e.code()))
 }
 
 /// A native format of the source.
@@ -398,11 +451,14 @@ pub(super) struct Capture {
     /// Subtype and size set by [`Capture::set_format`].
     format: Option<(GUID, u32, u32)>,
     streaming: bool,
+    /// The vendor extension unit of the source, or why there is none.
+    unit: std::result::Result<VendorUnit, String>,
 }
 
-// SAFETY: the media source and the asynchronous source reader are
-// free-threaded Media Foundation objects living in the process MTA; they
-// are only used through `&mut self`.
+// SAFETY: the media source, the asynchronous source reader and the
+// kernel-streaming controls of the source are free-threaded objects living
+// in the process MTA; they are only used through `&self` / `&mut self` of
+// the one thread that owns the capture.
 unsafe impl Send for Capture {}
 
 impl Capture {
@@ -468,13 +524,22 @@ impl Capture {
                 .and_then(|()| reader.SetStreamSelection(VIDEO_STREAM, true))
         }
         .map_err(|e| shutdown(fail("IMFSourceReader::SetStreamSelection", e)))?;
+        // the vendor unit, looked up once (no request reaches the device)
+        let unit = VendorUnit::find(&source);
         Ok(Self {
             source,
             reader,
             inbox,
             format: None,
             streaming: false,
+            unit,
         })
+    }
+
+    /// Whether the source has the vendor extension unit; the reason when
+    /// not.
+    pub fn vendor_unit(&self) -> std::result::Result<(), String> {
+        self.unit.as_ref().map(|_| ()).map_err(Clone::clone)
     }
 
     /// The native formats of the video stream.
@@ -567,79 +632,71 @@ impl Capture {
         Ok(())
     }
 
-    /// Starts streaming (the first sample request). Media Foundation
-    /// manages the driver buffers itself: `_buffers` is not used.
-    pub fn start(&mut self, _buffers: u32) -> Result<()> {
+    /// Starts streaming: keeps at most `buffers` frames (the oldest one
+    /// makes room for a new one, see the module doc) and asks for the first
+    /// sample; each completed request asks for the next one.
+    pub fn start(&mut self, buffers: u32) -> Result<()> {
         if self.streaming {
             return Ok(());
         }
-        self.request()?;
+        {
+            let mut state = self.inbox.lock();
+            state.frames.set_capacity(buffers as usize);
+            state.reader = Some(SharedReader(self.reader.clone()));
+        }
+        if let Err(e) = self.inbox.request() {
+            self.inbox.lock().reader = None;
+            return Err(e);
+        }
         self.streaming = true;
         Ok(())
     }
 
-    /// Issues a sample request unless one is outstanding or unread.
-    fn request(&self) -> Result<()> {
-        {
-            let mut state = self.inbox.lock();
-            if state.pending || state.ready.is_some() {
-                return Ok(());
-            }
-            state.pending = true;
-        }
-        // SAFETY: plain COM call on a live asynchronous reader (all out
-        // parameters null, as asynchronous mode requires).
-        if let Err(e) = unsafe {
-            self.reader
-                .ReadSample(VIDEO_STREAM, 0, None, None, None, None)
-        } {
-            self.inbox.lock().pending = false;
-            return Err(hr_error("ReadSample", e.code()));
-        }
-        Ok(())
-    }
-
-    /// Waits at most `timeout` for a frame and moves it into `out`.
-    /// `Ok(None)` when no frame came in time.
+    /// Waits at most `timeout` for a frame and moves the oldest one kept
+    /// into `out`. `Ok(None)` when no frame came in time.
     ///
     /// # Errors
     /// `device-lost` when the device is gone, [`ScanError::Device`] for
-    /// other failures.
+    /// other failures, after the frames that came before it.
     pub fn next(&mut self, timeout: Duration, out: &mut Vec<u8>) -> Result<Option<Dequeued>> {
         if !self.streaming {
             return Err(ScanError::Device("the video stream is not started".into()));
         }
-        self.request()?;
+        if self.inbox.lock().frames.is_empty() {
+            // none waiting: make sure one is on its way (after a reported
+            // failure the callback asked for none)
+            self.inbox.request()?;
+        }
         let state = self.inbox.lock();
         let (mut state, _) = self
             .inbox
             .changed
-            .wait_timeout_while(state, timeout, |s| s.ready.is_none())
+            .wait_timeout_while(state, timeout, |s| {
+                s.frames.is_empty() && s.failed.is_none()
+            })
             .unwrap_or_else(|e| e.into_inner());
-        match state.ready.take() {
-            None | Some(Ready::Nothing) => Ok(None),
-            Some(Ready::Failed(e)) => Err(e),
-            Some(Ready::Frame {
-                bytes,
+        if let Some(timestamp_us) = state.frames.pop_into(out) {
+            return Ok(Some(Dequeued {
+                bytes: out.len(),
                 timestamp_us,
-            }) => {
-                std::mem::swap(out, &mut state.data);
-                Ok(Some(Dequeued {
-                    bytes,
-                    timestamp_us,
-                }))
-            }
+            }));
         }
+        state.failed.take().map_or(Ok(None), Err)
     }
 
-    /// Stops streaming: drains the reader (errors ignored: the device may
-    /// already be gone). The source is shut down on drop.
+    /// Stops streaming: no further request, then drains the reader (errors
+    /// ignored: the device may already be gone). The source is shut down on
+    /// drop.
     pub fn stop(&mut self) {
         if !self.streaming {
             return;
         }
         self.streaming = false;
-        self.inbox.lock().flushed = false;
+        {
+            let mut state = self.inbox.lock();
+            state.reader = None;
+            state.flushed = false;
+        }
         // SAFETY: plain COM call on a live asynchronous reader.
         if unsafe { self.reader.Flush(ALL_STREAMS) }.is_ok() {
             let state = self.inbox.lock();
@@ -647,6 +704,18 @@ impl Capture {
                 .inbox
                 .changed
                 .wait_timeout_while(state, FLUSH_TIMEOUT, |s| !s.flushed);
+        }
+        let mut state = self.inbox.lock();
+        state.frames.clear();
+        state.failed = None;
+    }
+}
+
+impl XuTransport for Capture {
+    fn query(&self, selector: Selector, request: XuRequest<'_>) -> Result<()> {
+        match &self.unit {
+            Ok(unit) => unit.query(selector, request),
+            Err(why) => Err(ScanError::Device(why.clone())),
         }
     }
 }

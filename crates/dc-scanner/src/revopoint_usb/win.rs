@@ -57,6 +57,14 @@ impl Found {
     }
 }
 
+/// Whether the open video source `capture` has the vendor extension unit
+/// (the topology node whose property set is its GUID, see
+/// [`super::ks`]); the reason when not. The unit is reached by its GUID
+/// there, so `_found` is not needed.
+pub(super) fn vendor_unit(_found: &Found, capture: &Capture) -> std::result::Result<(), String> {
+    capture.vendor_unit()
+}
+
 /// The `2207:110c` devices on the bus, with the video source of their
 /// depth interface.
 pub(super) fn find_devices() -> Result<Vec<Found>> {

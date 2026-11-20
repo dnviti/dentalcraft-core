@@ -7,13 +7,15 @@
 //! reads the depth node with the standard capture API of the system, plain
 //! V4L2 calls on Linux (`v4l2`) and Media Foundation on Windows (`mf`, on
 //! the inbox UVC driver `usbvideo`), and needs no vendor SDK. Its vendor
-//! commands are closed lists the user authorised on 2026-11-18, Linux only:
-//! the fill light ([`light`]: on while streaming, off after), the fast
-//! exposure profile ([`exposure`]) and the read-only factory calibration
-//! file read ([`factory`]). It sends no other extension-unit request, no
-//! HID report and no firmware. The colour stream is not read (it is not
-//! registered to the depth image, and stopping it also resets the depth
-//! stream).
+//! commands are closed lists the user authorised on 2026-11-18, the same on
+//! every platform ([`xu`]: one protocol layer, carried by `uvcvideo` on
+//! Linux and by the kernel-streaming properties of the video source on
+//! Windows): the fill light ([`light`]: on while streaming, off after), the
+//! fast exposure profile ([`exposure`]) and the read-only factory
+//! calibration file read ([`factory`]). It sends no other extension-unit
+//! request, no HID report and no firmware. The colour stream is not read
+//! (it is not registered to the depth image, and stopping it also resets
+//! the depth stream).
 //!
 //! * **Discovery.** [`ScannerBackend::list`] enumerates the USB devices with
 //!   `nusb` and keeps the `2207:110c` devices. On Linux their V4L2 nodes are
@@ -30,7 +32,9 @@
 //! * **Frames.** [`frame`] describes the layout: row 0 of the depth image is
 //!   a header (device time, IMU orientation), the rest is depth as `u16`
 //!   times the depth scale; `0` is no depth. Frames are copied out of the
-//!   driver buffers before these are queued again.
+//!   driver buffers before these are queued again; frames queued behind the
+//!   one read are newer, and the backend keeps the newest (V4L2 driver
+//!   queue on Linux, the same bounded queue on Windows).
 //! * **Calibration.** Intrinsics and depth scale come from a user file, else
 //!   the factory calibration read from the scanner and cached, else the
 //!   alpha defaults, see [`calib`] and [`factory`]. The depth scale is an
@@ -73,11 +77,15 @@ mod device;
 pub mod exposure;
 pub mod factory;
 pub mod frame;
+#[cfg(windows)]
+mod ks;
 pub mod light;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(windows)]
 mod mf;
+#[cfg(any(windows, test))]
+mod ring;
 #[cfg(target_os = "linux")]
 mod v4l2;
 #[cfg(windows)]

@@ -40,11 +40,18 @@ impl Found {
     pub(super) fn no_node(&self) -> String {
         no_node(&self.sysfs)
     }
+}
 
-    /// The device has the vendor extension unit (see [`super::xu`]), read
-    /// from its sysfs USB descriptors.
-    pub(super) fn has_shell_unit(&self) -> bool {
-        std::fs::read(self.sysfs.join("descriptors")).is_ok_and(|d| super::xu::has_unit(&d))
+/// Whether the device of `found` has the vendor extension unit (see
+/// [`super::xu`]), read from its sysfs USB descriptors (no device I/O);
+/// the reason when not. `_capture` is its open depth node, the transport.
+pub(super) fn vendor_unit(found: &Found, _capture: &Capture) -> std::result::Result<(), String> {
+    let path = found.sysfs.join("descriptors");
+    let descriptors = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if super::xu::has_unit(&descriptors) {
+        Ok(())
+    } else {
+        Err(super::xu::missing_unit("the USB descriptors"))
     }
 }
 

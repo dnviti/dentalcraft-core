@@ -58,6 +58,28 @@ pub const CONTROL_INTERFACE: u8 = 0;
 /// Bytes of every request of the selectors the backend uses.
 pub const PAYLOAD_LEN: usize = 60;
 
+/// [`UNIT_GUID`] as text: `c2211a6d-787e-3c4a-ac06-7e434b676f9a`.
+pub fn unit_guid_text() -> String {
+    let g = UNIT_GUID;
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        g >> 96,
+        (g >> 80) & 0xffff,
+        (g >> 64) & 0xffff,
+        (g >> 48) & 0xffff,
+        g & 0xffff_ffff_ffff
+    )
+}
+
+/// Why a device gets no request: no unit [`UNIT`] with [`UNIT_GUID`] in
+/// `place` (where the platform looked for it).
+pub fn missing_unit(place: &str) -> String {
+    format!(
+        "no extension unit {UNIT} with GUID {{{}}} in {place}",
+        unit_guid_text()
+    )
+}
+
 /// `GET_INFO` bit: the control takes `GET_CUR` (UVC 1.5, 4.1.2).
 pub const INFO_GET: u8 = 0x01;
 /// `GET_INFO` bit: the control takes `SET_CUR`.
@@ -503,6 +525,12 @@ mod tests {
             ]
         );
         assert_eq!((UNIT, CONTROL_INTERFACE, PAYLOAD_LEN), (4, 0, 60));
+        assert_eq!(unit_guid_text(), "c2211a6d-787e-3c4a-ac06-7e434b676f9a");
+        assert_eq!(
+            missing_unit("the USB descriptors"),
+            "no extension unit 4 with GUID {c2211a6d-787e-3c4a-ac06-7e434b676f9a} in the USB \
+             descriptors"
+        );
         let ids = [Selector::FileOpen, Selector::FileRead, Selector::Shell].map(Selector::id);
         assert_eq!(ids, [1, 2, 7]);
         let (p, mut reply, mut len, mut info) = (Payload::CLOSE, [0; PAYLOAD_LEN], 0, 0);
