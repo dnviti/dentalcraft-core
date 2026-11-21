@@ -7,7 +7,7 @@ version = "0.3.0-alpha.7"
 edition = "2024"
 rust-version = "1.99"
 license = "PolyForm-Noncommercial-1.0.0"
-repository = "https://github.com/dnviti-personal-org/dentalcraft-core"
+repository = "https://github.com/dnviti/dentalcraft-core"
 authors = ["Daniele Viti"]
 publish = false
 
