@@ -130,6 +130,26 @@ pub fn is_import_scans_command(command_id: &str) -> bool {
 /// i18n key of the toast shown for placeholder commands.
 pub const NOT_AVAILABLE_KEY: &str = "module-command-not-available";
 
+/// Key of the "advanced options and parameters" preference in egui memory.
+fn advanced_ui_id() -> egui::Id {
+    egui::Id::unique("dc-module-api::advanced-ui")
+}
+
+/// Whether the user turned on "Advanced options and parameters" in the
+/// application settings. Off by default: inspectors then show only the
+/// automatic runs and the most useful manual corrections, and hide tuning
+/// parameters and technical readouts. The shell sets it every frame with
+/// [`set_advanced_ui`]; modules and widgets read it here.
+pub fn advanced_ui(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(advanced_ui_id()))
+        .unwrap_or(false)
+}
+
+/// Sets the preference read by [`advanced_ui`]. Called by the shell.
+pub fn set_advanced_ui(ctx: &egui::Context, on: bool) {
+    ctx.data_mut(|d| d.insert_temp(advanced_ui_id(), on));
+}
+
 /// What a module can reach while handling UI or a command invocation.
 pub struct ModuleCtx<'a> {
     state: &'a Arc<CaseState>,
@@ -356,6 +376,16 @@ mod tests {
         assert!(!is_import_scans_command("case.import"));
         assert!(!is_import_scans_command("aligners.case.import-scans-x"));
         assert!(!is_import_scans_command("aligners.import-scans.run"));
+    }
+
+    #[test]
+    fn advanced_ui_is_off_until_the_shell_turns_it_on() {
+        let ctx = egui::Context::default();
+        assert!(!advanced_ui(&ctx));
+        set_advanced_ui(&ctx, true);
+        assert!(advanced_ui(&ctx));
+        set_advanced_ui(&ctx, false);
+        assert!(!advanced_ui(&ctx));
     }
 
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
