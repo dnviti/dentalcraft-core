@@ -41,7 +41,7 @@ pub const CALIB_FILES: [&str; 2] = ["calib.yaml", "calib.json"];
 /// Alpha estimate, not a calibration.
 pub const DEFAULT_FOCAL_PX: f32 = 1190.0;
 /// Default millimetres per raw depth unit: 1/200 mm. **Alpha estimate**,
-/// measured on one MINI 2 (serial `A26307475A6H01AB8`, 2026-11-16), not a
+/// measured on one MINI 2 (2026-11-16), not a
 /// factory value; a calibration file overrides it. Evidence:
 ///
 /// * the raw value is linear depth along the optical axis, not disparity:

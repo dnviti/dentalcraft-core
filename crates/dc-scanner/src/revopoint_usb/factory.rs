@@ -9,8 +9,8 @@
 //!
 //! The user authorised reading, and only reading, the files of the closed
 //! list [`FactoryFile`]: no path can be built from outside, no other opcode
-//! is sent. Measured on the rig the same evening (serial
-//! `A26307475A6H01AB8`, firmware `v4.1.54.20260203|v31.7.1.0203`):
+//! is sent. Measured on the rig the same evening (firmware
+//! `v4.1.54.20260203|v31.7.1.0203`):
 //! `camparam.yaml` (2059 bytes, OpenCV matrices at 800x600) and `Pl.bin`
 //! (40 bytes) read in well under a second with the stream idle, and the
 //! stream started normally afterwards.
@@ -146,8 +146,8 @@ mod tests {
     fn cache_dir_needs_a_plain_serial() {
         let d = Path::new("/x");
         assert_eq!(
-            cache_dir_in(d, "A26307475A6H01AB8"),
-            Some(PathBuf::from("/x/factory/A26307475A6H01AB8"))
+            cache_dir_in(d, "A0000000000000000"),
+            Some(PathBuf::from("/x/factory/A0000000000000000"))
         );
         for bad in ["", "..", "a/b", "a b"] {
             assert_eq!(cache_dir_in(d, bad), None, "{bad}");

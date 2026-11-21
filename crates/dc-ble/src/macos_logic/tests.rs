@@ -94,7 +94,7 @@ fn peripheral_ids_round_trip_and_reject_mac_addresses() {
         parse_peripheral_id(" 8C1F4A9E-0B7D-4E21-9F3A-55AA10C0FFEE "),
         Some(ID)
     );
-    assert_eq!(parse_peripheral_id("DE:B6:85:06:68:79"), None);
+    assert_eq!(parse_peripheral_id("00:11:22:33:44:55"), None);
     assert_eq!(parse_peripheral_id(""), None);
 }
 

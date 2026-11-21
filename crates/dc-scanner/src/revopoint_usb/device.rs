@@ -633,9 +633,9 @@ mod tests {
         RevopointUsbDevice {
             info: DeviceInfo {
                 backend: BACKEND_ID.into(),
-                id: "A26307475A6H01AB8".into(),
+                id: "A0000000000000000".into(),
                 name: "Revopoint MINI 2 (USB)".into(),
-                serial: Some("A26307475A6H01AB8".into()),
+                serial: Some("A0000000000000000".into()),
             },
             options: UsbOptions::default(),
             calibration,
