@@ -219,8 +219,8 @@ pub fn depth_to_mm(depth: &[u8], scale_mm: f32) -> Vec<f32> {
 mod tests {
     use super::*;
 
-    /// Row 0 of a real 2400x600 frame of the MINI 2 (serial
-    /// `A26307475A6H01AB8`, `bcdDevice` 0x0419), scanner at rest on a desk.
+    /// Row 0 of a real 2400x600 frame of the MINI 2 (`bcdDevice`
+    /// 0x0419), scanner at rest on a desk.
     const ROW0: &[u8] = include_bytes!("../../tests/data/mini2_header_row0.bin");
     /// Row 0 of a real 800x600 depth-only frame of the same unit
     /// (2026-11-19), the scanner on the turntable rig looking down.
