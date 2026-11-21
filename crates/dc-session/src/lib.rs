@@ -4,7 +4,8 @@
 //! current [`CaseState`] inside an [`UndoStack`], the [`StepHistory`], the
 //! registered modules and the registry of every agent-drivable command: the
 //! built-in ones of the session ([`builtins`]: `project.*`, `case.import`,
-//! `case.set-role`, `edit.undo` / `edit.redo`, `steps.*`, `view.set`) plus the
+//! `case.set-role`, `edit.undo` / `edit.redo`, `steps.*`, `view.set`, and
+//! the `scan.*`, `turntable.*` and `print.*` commands) plus the
 //! [`CommandSpec`]s of the modules. The CLI and the MCP server drive it
 //! through [`Session::execute`], [`Session::batch`], [`Session::describe`]
 //! and [`Session::inspect`].
@@ -168,6 +169,7 @@ impl Session {
             specs: builtins::specs()
                 .into_iter()
                 .chain(builtins::scan_specs())
+                .chain(builtins::print_specs())
                 .map(|s| (SESSION_SOURCE, s))
                 .collect(),
             undo: UndoStack::new(state.clone(), UndoStack::DEFAULT_BUDGET),
@@ -387,6 +389,15 @@ impl Session {
         };
         if dc_scanner::is_scan_command(id) {
             return self.run_scan_command(id, params, ctx);
+        }
+        if dc_print::commands::is_print_command(id) {
+            return dc_print::commands::execute(id, params, &|| ctx.is_cancelled(), &mut |f| {
+                ctx.set_fraction(f)
+            })
+            .map_err(|e| SessionError::Command {
+                id: id.to_owned(),
+                source: builtins::print_error(e),
+            });
         }
         match id {
             builtins::PROJECT_NEW => {

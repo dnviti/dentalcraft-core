@@ -287,10 +287,41 @@ pub(crate) fn scan_error(e: dc_scanner::ScanError) -> CommandError {
     }
 }
 
+/// The `print.*` commands (resin printing), as specs for the registry. Like
+/// [`scan_specs`], they are not part of [`specs`]: a [`Session`](crate::Session)
+/// registers them and runs them through [`dc_print::commands::execute`].
+pub fn print_specs() -> Vec<CommandSpec> {
+    crate::loader();
+    dc_print::commands::command_infos()
+        .into_iter()
+        .map(|i| CommandSpec {
+            id: i.id,
+            label_key: i.label_key,
+            doc_key: i.doc_key,
+            params_schema: i.params_schema,
+            run: handled_by_session,
+        })
+        .collect()
+}
+
+/// The command error of a failed print command: a call to change (missing
+/// resin values, bad parameters) is invalid, the others failed; the stable
+/// code leads the message either way.
+pub(crate) fn print_error(e: dc_print::commands::PrintCommandError) -> CommandError {
+    if e.is_cancelled() {
+        CommandError::Cancelled
+    } else if e.is_invalid_call() {
+        CommandError::Invalid(e.to_string())
+    } else {
+        CommandError::Failed(e.to_string())
+    }
+}
+
 /// `true` for the built-ins that act on the session rather than on the case
-/// state, including the `scan.*` and `turntable.*` commands.
+/// state, including the `scan.*`, `turntable.*` and `print.*` commands.
 pub(crate) fn is_session_command(id: &str) -> bool {
     dc_scanner::is_scan_command(id)
+        || dc_print::commands::is_print_command(id)
         || matches!(
             id,
             PROJECT_NEW

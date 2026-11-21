@@ -496,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "dc-ble"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "dispatch2",
  "objc2",
@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "dc-case"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "blake3",
  "dc-i18n",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "dc-command"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "dc-case",
  "dc-jobs",
@@ -541,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "dc-geom"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "dc-mesh",
  "glam 0.34.1",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "dc-i18n"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "fluent-syntax",
  "i18n-embed",
@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "dc-jobs"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "rayon",
  "thiserror 2.0.21",
@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "dc-mcp"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "dc-mesh",
  "dc-module-api",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "dc-mesh"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "glam 0.34.1",
  "serde",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "dc-module-api"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "dc-case",
  "dc-command",
@@ -612,8 +612,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dc-print"
+version = "0.3.0-alpha.7"
+dependencies = [
+ "dc-mesh",
+ "glam 0.34.1",
+ "rayon",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "dc-project"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "blake3",
  "dc-case",
@@ -630,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "dc-raster"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "dc-case",
  "dc-mesh",
@@ -644,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "dc-scanner"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "dc-geom",
  "dc-mesh",
@@ -666,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "dc-scene"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "dc-case",
  "dc-mesh",
@@ -676,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "dc-session"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "dc-case",
  "dc-command",
@@ -684,6 +697,7 @@ dependencies = [
  "dc-jobs",
  "dc-mesh",
  "dc-module-api",
+ "dc-print",
  "dc-project",
  "dc-scanner",
  "dc-scene",
@@ -699,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "dc-theme"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "egui",
  "serde",
@@ -708,7 +722,7 @@ dependencies = [
 
 [[package]]
 name = "dc-turntable"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "dc-ble",
  "schemars",

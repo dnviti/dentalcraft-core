@@ -16,6 +16,7 @@ dc-i18n.workspace = true
 dc-jobs.workspace = true
 dc-mesh.workspace = true
 dc-module-api.workspace = true
+dc-print.workspace = true
 dc-project.workspace = true
 dc-scanner.workspace = true
 schemars.workspace = true

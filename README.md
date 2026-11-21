@@ -26,6 +26,7 @@ This workspace has no window and needs no GPU. It holds everything that does not
 | `dc-scanner` | 3D scanner acquisition (alpha): device backends, live tracking and TSDF fusion, point-cloud and mesh editing, turntable rig scans. |
 | `dc-turntable` | Motorised turntables for scanning rigs (alpha): generic device trait, simulated table, Revopoint Dual-axis Turntable over Bluetooth LE. |
 | `dc-ble` | Blocking Bluetooth LE serial links: BlueZ on Linux, WinRT on Windows, CoreBluetooth on macOS. |
+| `dc-print` | Resin printing (alpha): printer profiles (Elegoo Saturn 4 Ultra 16K with the DENTAL 45 machine parameters), automatic orientation, outer-side supports, plate nesting, slicing and the Elegoo GOO V3 file format. |
 | `dc-i18n` | Fluent localisation (English, Italian) with a runtime language switch. |
 | `dc-theme` | Design tokens and their application to egui. |
 

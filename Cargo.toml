@@ -29,6 +29,7 @@ dc-raster = { path = "crates/dc-raster" }
 dc-scanner = { path = "crates/dc-scanner" }
 dc-ble = { path = "crates/dc-ble" }
 dc-turntable = { path = "crates/dc-turntable" }
+dc-print = { path = "crates/dc-print" }
 
 # GUI: egui, eframe and egui-wgpu must always share the same version
 egui = { version = "=0.37.0", default-features = false, features = ["default_fonts"] }
