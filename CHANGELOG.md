@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0-alpha.8](https://github.com/dnviti/dentalcraft-core/compare/v0.3.0-alpha.7...v0.3.0-alpha.8) (2026-11-21)
+
+
+### Features
+
+* **module-api:** advanced_ui flag for the simple and the advanced interface ([#25](https://github.com/dnviti/dentalcraft-core/issues/25)) ([3ca0bc7](https://github.com/dnviti/dentalcraft-core/commit/3ca0bc71553465e26148b0a2e250371d3dda8511))
+* **print:** resin printing of aligners on the Elegoo Saturn 4 Ultra 16K ([#26](https://github.com/dnviti/dentalcraft-core/issues/26)) ([9e07693](https://github.com/dnviti/dentalcraft-core/commit/9e076932cd981fa7ab6c72991672e3704b8edb1f))
+
 ## [0.3.0-alpha.7](https://github.com/dnviti-personal-org/dentalcraft-core/compare/v0.3.0-alpha.6...v0.3.0-alpha.7) (2026-11-20)
 
 
