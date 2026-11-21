@@ -617,6 +617,7 @@ version = "0.3.0-alpha.7"
 dependencies = [
  "dc-mesh",
  "glam 0.34.1",
+ "proptest",
  "rayon",
  "schemars",
  "serde",
