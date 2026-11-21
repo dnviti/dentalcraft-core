@@ -281,22 +281,17 @@ mod tests {
         assert!(matches!(decode(&bad), Err(GooError::BadImageMagic(0x54))));
         assert!(matches!(decode(&[]), Err(GooError::Truncated)));
     }
-}
 
-#[cfg(kani)]
-mod kani_proofs {
-    use super::*;
-
-    /// One run of any length and colour decodes to itself.
-    #[kani::proof]
-    #[kani::unwind(8)]
-    fn run_length_round_trips() {
-        let len: u32 = kani::any();
-        kani::assume((1..=MAX_RUN).contains(&len));
-        let value: u8 = kani::any();
-        let mut buf = Vec::with_capacity(8);
-        encode([Run::new(value, len)], &mut buf);
-        let back = decode(&buf).unwrap();
-        assert!(back.len() == 1 && back[0] == Run::new(value, len));
+    proptest::proptest! {
+        /// One run of any length (1..=MAX_RUN) and any value decodes to
+        /// itself. Kani does not finish this law (the encoder's loops grow
+        /// a buffer of symbolic length, as the DCM1 decode does; see
+        /// `docs/kani.md`), so it is sampled here, and
+        /// `every_length_class_uses_the_fewest_bytes` covers the edges of
+        /// every length class.
+        #[test]
+        fn any_run_round_trips(value: u8, len in 1..=MAX_RUN) {
+            proptest::prop_assert_eq!(round_trip(&[Run::new(value, len)]), vec![Run::new(value, len)]);
+        }
     }
 }
