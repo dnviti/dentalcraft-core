@@ -34,7 +34,16 @@ pub(super) fn read(bytes: &[u8], options: &ReadOptions) -> Result<TriMesh> {
     let soup = if is_binary(bytes) {
         read_binary(bytes)?
     } else if starts_with_solid(bytes) {
-        read_ascii(bytes)?
+        // A binary file whose header starts with "solid" and that has
+        // trailing bytes: when the text does not parse, the binary reading
+        // decides if its triangles fit the size.
+        match read_ascii(bytes) {
+            Ok(soup) => soup,
+            Err(ascii) => match binary_fallback(bytes) {
+                Some(soup) => soup,
+                None => return Err(ascii),
+            },
+        }
     } else if bytes.len() >= HEADER + 4 {
         // binary with trailing bytes is tolerated, truncation is not
         read_binary(bytes)?
@@ -42,6 +51,15 @@ pub(super) fn read(bytes: &[u8], options: &ReadOptions) -> Result<TriMesh> {
         return Err(bad(FMT, "file too short to be an STL"));
     };
     Ok(weld::weld_soup(&soup, options.weld_tolerance))
+}
+
+/// The binary reading of a file that failed as ASCII: only when it holds
+/// at least one triangle and they all fit its size.
+fn binary_fallback(bytes: &[u8]) -> Option<Vec<Vec3>> {
+    if bytes.len() < HEADER + 4 {
+        return None;
+    }
+    read_binary(bytes).ok().filter(|soup| !soup.is_empty())
 }
 
 fn read_binary(bytes: &[u8]) -> Result<Vec<Vec3>> {

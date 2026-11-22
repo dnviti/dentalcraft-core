@@ -38,11 +38,19 @@ pub use request::{DEFAULT_HEIGHT, DEFAULT_SUPERSAMPLE, DEFAULT_WIDTH, RenderRequ
 /// Largest image side accepted, in pixels (after supersampling).
 pub const MAX_SIDE: u32 = 16_384;
 
+/// Largest pixel count accepted (width × height after supersampling):
+/// 64 Mpx, at most 256 MiB of colour plus 256 MiB of depth buffer.
+pub const MAX_PIXELS: u64 = 64 * 1024 * 1024;
+
 /// Errors of the rasteriser.
 #[derive(Debug, thiserror::Error)]
 pub enum RasterError {
     /// Width or height is zero or too large.
-    #[error("invalid image size {width}x{height} (each side 1..={max})", max = MAX_SIDE)]
+    #[error(
+        "invalid image size {width}x{height} (each side 1..={max} and at most {max_px} pixels, supersampling included)",
+        max = MAX_SIDE,
+        max_px = MAX_PIXELS
+    )]
     InvalidSize {
         /// Requested width.
         width: u32,
@@ -216,7 +224,8 @@ pub fn render(items: &[Item<'_>], opts: &RenderOptions) -> Result<Image, RasterE
     let ss = opts.supersample.max(1);
     let (w, h) = (opts.width, opts.height);
     let valid = |s: u32| s >= 1 && s.checked_mul(ss).is_some_and(|v| v <= MAX_SIDE);
-    if !valid(w) || !valid(h) {
+    let pixels = u64::from(w) * u64::from(ss) * u64::from(h) * u64::from(ss);
+    if !valid(w) || !valid(h) || pixels > MAX_PIXELS {
         return Err(RasterError::InvalidSize {
             width: w,
             height: h,
@@ -499,6 +508,13 @@ mod tests {
         let mut o = RenderOptions::new(MAX_SIDE, 4, View::Frontal);
         o.supersample = 2;
         assert!(render(&[], &o).is_err());
+        // each side fits, the pixel count does not
+        let mut o = RenderOptions::new(MAX_SIDE / 2, MAX_SIDE / 2, View::Frontal);
+        o.supersample = 2;
+        assert!(u64::from(MAX_SIDE) * u64::from(MAX_SIDE) > MAX_PIXELS);
+        assert!(render(&[], &o).is_err());
+        let e = render(&[], &RenderOptions::new(MAX_SIDE, MAX_SIDE, View::Frontal)).unwrap_err();
+        assert!(e.to_string().contains("pixels"), "{e}");
     }
 
     #[test]

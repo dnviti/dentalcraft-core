@@ -511,13 +511,18 @@ impl Session {
             id: id.to_owned(),
             source: CommandError::Failed(e.to_string()),
         };
-        let dir = std::env::temp_dir().join(format!("dentalcraft-scan-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).map_err(io_error)?;
+        // owner-only (0700 on unix, per-user temp folder ACL on Windows),
+        // like the app's scan popup: the patient scan is not readable by
+        // other local users while it is there
+        let dir = tempfile::Builder::new()
+            .prefix("dentalcraft-scan-")
+            .tempdir()
+            .map_err(io_error)?;
         let result = (|| {
             let path = {
                 let controller = self.scan_controller();
                 let c = controller.lock().unwrap_or_else(PoisonError::into_inner);
-                c.export_mesh_for_import(&dir, role).map_err(fail)?
+                c.export_mesh_for_import(dir.path(), role).map_err(fail)?
             };
             let mut p = json!({ "path": path.display().to_string() });
             if let Some(role) = role {
@@ -526,7 +531,7 @@ impl Session {
             self.execute_with(import_id, p, ctx)
         })();
         // best effort: the import already copied the mesh into the case
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = dir.close();
         result
     }
 
@@ -567,13 +572,25 @@ impl Session {
             issues,
         } = dc_project::load(path, &self.codecs())?;
         let discarded = self.is_dirty();
-        let history = serde_json::from_value::<StepHistory>(project.history).unwrap_or_default();
+        // A history that does not decode is never replaced by an empty one
+        // and saved over: the file stays read-only, like a module state
+        // that cannot be decoded.
+        let (history, history_issue) = match serde_json::from_value::<StepHistory>(project.history)
+        {
+            Ok(h) => (h, None),
+            Err(e) => (
+                StepHistory::new(),
+                Some(format!("cannot read {}: {e}", dc_project::HISTORY_PATH)),
+            ),
+        };
+        let read_only = read_only || history_issue.is_some();
         self.reset(project.case_state, history);
         self.manifest = Some(project.manifest);
         self.thumbnail = project.thumbnail;
         self.path = Some(path.to_owned());
         self.read_only = read_only;
         self.load_issues = issues.iter().map(ToString::to_string).collect();
+        self.load_issues.extend(history_issue);
         let state = self.undo.current();
         Ok(json!({
             "path": path.display().to_string(),
@@ -612,7 +629,11 @@ impl Session {
             history: serde_json::to_value(&self.history)?,
             thumbnail: self.thumbnail.clone(),
         };
-        dc_project::save(&target, &project)?;
+        // a backup or folder sync problem does not fail the save: reported
+        let warnings: Vec<String> = dc_project::save(&target, &project)?
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         let bytes = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
         let project_id = project.manifest.project_id;
         self.manifest = Some(project.manifest);
@@ -624,6 +645,7 @@ impl Session {
             "path": target.display().to_string(),
             "bytes": bytes,
             "project_id": project_id,
+            "warnings": warnings,
         }))
     }
 

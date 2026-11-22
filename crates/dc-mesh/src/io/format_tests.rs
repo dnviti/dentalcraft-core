@@ -167,6 +167,54 @@ fn binary_stl_with_solid_header_is_detected_as_binary() {
 }
 
 #[test]
+fn binary_stl_with_solid_header_and_trailing_bytes_falls_back_to_binary() {
+    let mesh = quad();
+    let mut buf = Vec::new();
+    write_to(&mut buf, &mesh, MeshFormat::Stl).unwrap();
+    buf[..80].fill(b' ');
+    buf[..16].copy_from_slice(b"solid exporter v");
+    // some exporters pad the file: the size no longer matches exactly
+    buf.extend_from_slice(b"\0\0\0\0padding");
+    let back = read_bytes(&buf, MeshFormat::Stl, &ReadOptions::default()).unwrap();
+    assert_eq!(back.face_count(), 2);
+    assert_eq!(back.vertex_count(), 4);
+    // a broken ASCII file stays an error (its text, not a binary guess)
+    let mut text =
+        b"solid x\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\n".to_vec();
+    text.resize(200, b' ');
+    text.extend_from_slice(b"\nbroken 1 2 3\n");
+    assert!(read_bytes(&text, MeshFormat::Stl, &ReadOptions::default()).is_err());
+}
+
+#[test]
+fn ply_counts_the_body_cannot_hold_are_refused() {
+    let o = ReadOptions::default();
+    // binary: a billion float vertices announced, 12 bytes of data
+    let mut bin = b"ply\nformat binary_little_endian 1.0\nelement vertex 1000000000\n\
+        property float x\nproperty float y\nproperty float z\nend_header\n"
+        .to_vec();
+    bin.extend_from_slice(&[0; 12]);
+    let e = read_bytes(&bin, MeshFormat::Ply, &o).unwrap_err();
+    assert!(e.to_string().contains("element counts"), "{e}");
+    // counts that overflow usize when multiplied by the element size
+    let huge = format!(
+        "ply\nformat binary_little_endian 1.0\nelement vertex {}\n\
+        property double x\nproperty double y\nproperty double z\nend_header\n",
+        usize::MAX / 2
+    );
+    assert!(read_bytes(huge.as_bytes(), MeshFormat::Ply, &o).is_err());
+    // an element without properties and a huge count holds no data: it is
+    // skipped at once, not looped over
+    let empty = format!(
+        "ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\n\
+        property float z\nelement junk {}\nend_header\n1 2 3\n",
+        usize::MAX
+    );
+    let m = read_bytes(empty.as_bytes(), MeshFormat::Ply, &o).unwrap();
+    assert_eq!(m.vertex_count(), 1);
+}
+
+#[test]
 fn ascii_stl_with_odd_formatting() {
     let text = "SOLID  my part\r\n facet normal 0 0 1\r\n  outer loop\r\n\
         vertex 0 0 0\r\n vertex 1E0 0 0\r\n  vertex 0 1.0e0 0\r\n endloop\r\n endfacet\r\n\

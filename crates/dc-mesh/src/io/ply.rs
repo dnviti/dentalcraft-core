@@ -67,6 +67,42 @@ struct Element {
     props: Vec<Prop>,
 }
 
+impl Element {
+    /// Fewest body bytes one element takes: the size of each scalar and of
+    /// each list's count in binary, one character per property in ASCII.
+    fn min_bytes(&self, encoding: Encoding) -> usize {
+        self.props
+            .iter()
+            .map(|p| match (encoding, p.kind) {
+                (Encoding::Ascii, _) => 1,
+                (_, Kind::Scalar(t)) => t.size(),
+                (_, Kind::List { count, .. }) => count.size(),
+            })
+            .sum()
+    }
+}
+
+/// Refuses element counts the body cannot hold, so a hostile header can
+/// neither loop for ever nor size a large allocation.
+fn check_counts(header: &Header, body_len: usize) -> Result<()> {
+    let mut need = 0usize;
+    for el in &header.elements {
+        let min = el.min_bytes(header.encoding);
+        need = el
+            .count
+            .checked_mul(min)
+            .and_then(|n| need.checked_add(n))
+            .filter(|&n| n <= body_len)
+            .ok_or_else(|| {
+                bad(
+                    FMT,
+                    format!("element counts need more data than the {body_len} bytes of the body"),
+                )
+            })?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Encoding {
     Ascii,
@@ -272,8 +308,12 @@ pub(super) fn read(bytes: &[u8]) -> Result<TriMesh> {
             be: enc == Encoding::Be,
         },
     };
-    // Upper bound for pre-allocation so a hostile element count cannot OOM.
-    let cap = |n: usize| n.min(body.len());
+    check_counts(&header, body.len())?;
+    // Upper bound for pre-allocation: no more entries than the body holds.
+    let cap = |el: &Element| {
+        el.count
+            .min(body.len() / el.min_bytes(header.encoding).max(1))
+    };
 
     let mut mesh = TriMesh::default();
     let mut saw_vertex = false;
@@ -281,9 +321,11 @@ pub(super) fn read(bytes: &[u8]) -> Result<TriMesh> {
         match el.name.as_str() {
             "vertex" => {
                 saw_vertex = true;
-                read_vertices(&mut src, el, &mut mesh, cap(el.count))?;
+                read_vertices(&mut src, el, &mut mesh, cap(el))?;
             }
-            "face" => read_faces(&mut src, el, &mut mesh, cap(el.count))?,
+            "face" => read_faces(&mut src, el, &mut mesh, cap(el))?,
+            // an element without properties holds no data: nothing to skip
+            _ if el.props.is_empty() => {}
             _ => {
                 for _ in 0..el.count {
                     for p in &el.props {

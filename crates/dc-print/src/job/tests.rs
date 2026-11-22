@@ -198,6 +198,7 @@ fn small_profile() -> PrinterProfile {
         mirror_x: false,
         mirror_y: false,
         machine: Some(MachineParams::dental_45()),
+        validated: false,
     }
 }
 
@@ -416,12 +417,78 @@ fn plate_stl_holds_parts_and_supports() {
 fn preview_shows_the_parts_from_above() {
     let p = small_profile();
     let img = preview(&hand_plate(), &p, 120);
-    // 60 × 40 mm on 120 px: 2 px per mm, letterboxed 20 px from the top
-    let at = |x: f32, y: f32| img[((20.0 + (40.0 - y) * 2.0) as usize) * 120 + (x * 2.0) as usize];
+    // 60 × 40 mm on 120 px: 2 px per mm, letterboxed 20 px from the top;
+    // row 0 is the file's row 0, plate y = 0 without mirroring
+    let at = |x: f32, y: f32| img[((20.0 + y * 2.0) as usize) * 120 + (x * 2.0) as usize];
     assert_eq!(at(20.0, 15.0), PREVIEW_PART);
     assert_eq!(at(31.0, 15.0), PREVIEW_SUPPORT);
     assert_eq!(at(50.0, 30.0), PREVIEW_PLATE);
     assert_eq!(img[0], 0);
+}
+
+/// The preview and the layer images use one mapping: the plate pixel under
+/// a part, sent through `map_pixel`, lands on the part in the preview, for
+/// every mirror flag.
+#[test]
+fn preview_follows_the_layer_pixel_map() {
+    for (mirror_x, mirror_y) in [(false, false), (true, false), (false, true), (true, true)] {
+        let p = PrinterProfile {
+            mirror_x,
+            mirror_y,
+            ..small_profile()
+        };
+        let img = preview(&hand_plate(), &p, 120);
+        // the preview pixel holding the centre of file pixel (col, row)
+        let at_file = |col: u32, row: u32| {
+            let x = (f64::from(col) + 0.5) * 0.05 * 2.0;
+            let y = 20.0 + (f64::from(row) + 0.5) * 0.05 * 2.0;
+            img[y as usize * 120 + x as usize]
+        };
+        // plate (20, 15) mm: the box; plate (40, 25) mm: empty plate
+        for ((x_mm, y_mm), colour) in [((20.0, 15.0), PREVIEW_PART), ((40.0, 25.0), PREVIEW_PLATE)]
+        {
+            let (col, row) = ((x_mm / 0.05) as u32, (y_mm / 0.05) as u32);
+            let (fc, fr) = p.map_pixel(col, row).unwrap();
+            assert_eq!(at_file(fc, fr), colour, "{mirror_x} {mirror_y}");
+        }
+    }
+}
+
+#[test]
+fn only_closed_outward_solids_are_accepted() {
+    let cube = cuboid(Vec3::ZERO, Vec3::new(5.0, 5.0, 5.0));
+    assert_eq!(solid_defect(&cube), None);
+    let refused = |mesh: TriMesh| {
+        let part = PrintPart {
+            id: "bad".into(),
+            mesh,
+            fitting: None,
+        };
+        let e = prepare(&[part], &print_job(small_profile())).unwrap_err();
+        assert_eq!(e.code(), "print-invalid-part", "{e}");
+        e.to_string()
+    };
+    // open: one triangle removed
+    let mut open = cube.clone();
+    open.tris.pop();
+    assert!(refused(open).contains("open (boundary) edges"));
+    // inward: every triangle reversed
+    let mut inward = cube.clone();
+    for t in &mut inward.tris {
+        t.swap(1, 2);
+    }
+    assert!(refused(inward).contains("not positive"));
+    // one triangle flipped
+    let mut flipped = cube.clone();
+    flipped.tris[0].swap(1, 2);
+    assert!(refused(flipped).contains("consistently oriented"));
+    // a fin: a third triangle on an edge of the cube
+    let mut fin = cube.clone();
+    let [a, b, _] = fin.tris[0];
+    fin.positions.push(Vec3::new(-3.0, -3.0, -3.0));
+    let tip = (fin.positions.len() - 1) as u32;
+    fin.tris.push([b, a, tip]);
+    assert!(refused(fin).contains("open (boundary) edges"));
 }
 
 #[test]

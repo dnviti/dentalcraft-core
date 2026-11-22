@@ -26,6 +26,15 @@ pub trait ModuleData: Any + Send + Sync + fmt::Debug {
     /// JSON form written to `modules/<id>/state.json`.
     fn to_json(&self) -> Result<serde_json::Value, serde_json::Error>;
 
+    /// Path of the first NaN or infinite number in the data, `None` when all
+    /// are finite. JSON cannot store them (they would be written as `null`),
+    /// so saving refuses data that has one. [`impl_module_data!`] checks
+    /// every serialized field; manual implementations should return
+    /// `dc_case::find_non_finite(self)`.
+    fn find_non_finite(&self) -> Option<String> {
+        None
+    }
+
     /// Approximate memory footprint (for undo budgets). Override when the
     /// data holds large buffers.
     fn approx_bytes(&self) -> usize {
@@ -88,6 +97,9 @@ macro_rules! impl_module_data {
             {
                 $crate::__serde_json::to_value(self)
             }
+            fn find_non_finite(&self) -> ::std::option::Option<::std::string::String> {
+                $crate::find_non_finite(self)
+            }
         }
     };
 }
@@ -121,6 +133,11 @@ impl ModuleData for OpaqueModuleData {
 
     fn to_json(&self) -> Result<serde_json::Value, serde_json::Error> {
         Ok(self.value.clone())
+    }
+
+    /// A `serde_json::Value` cannot hold a non-finite number.
+    fn find_non_finite(&self) -> Option<String> {
+        None
     }
 
     fn approx_bytes(&self) -> usize {

@@ -1,8 +1,8 @@
 //! Deterministic, atomic `.dcprj` writer.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use dc_case::BlobRef;
@@ -12,8 +12,8 @@ use zip::{CompressionMethod, DateTime, ZipWriter};
 
 use crate::{
     CASE_PATH, DcprjError, EntryInfo, FORMAT, FORMAT_VERSION, HISTORY_PATH, MANIFEST_PATH,
-    MIME_TYPE, MIMETYPE_PATH, Manifest, ModuleEntry, Project, THUMBNAIL_PATH, blob_path,
-    module_state_path, valid_module_id,
+    MIME_TYPE, MIMETYPE_PATH, Manifest, ModuleEntry, Project, SaveWarning, THUMBNAIL_PATH,
+    blob_path, module_state_path, valid_module_id,
 };
 
 const JSON_LEVEL: i64 = 6;
@@ -47,17 +47,53 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
-pub(crate) fn save(path: &Path, project: &Project) -> Result<(), DcprjError> {
-    let tmp = sibling(path, ".tmp");
-    let result = write_tmp(&tmp, project).and_then(|()| replace(path, &tmp));
+pub(crate) fn save(path: &Path, project: &Project) -> Result<Vec<SaveWarning>, DcprjError> {
+    // Refused before any file is touched: the previous file and its backup
+    // stay as they are.
+    check_finite(project)?;
+    let (tmp, file) = create_tmp(path)?;
+    // `replace` only fails before its rename: on error `tmp` is still ours.
+    let result = write_tmp(file, project).and_then(|()| replace(path, &tmp));
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     result
 }
 
-/// Writes the archive to `tmp` and fsyncs it.
-fn write_tmp(tmp: &Path, project: &Project) -> Result<(), DcprjError> {
+/// JSON cannot store NaN or ±infinity (serde_json writes `null`, which
+/// then fails to decode or reads back as `None`): such data is refused.
+fn check_finite(project: &Project) -> Result<(), DcprjError> {
+    let refuse = |entry: String, path: String| DcprjError::NonFinite { entry, path };
+    let state = &project.case_state;
+    if let Some(path) = dc_case::find_non_finite(&state.case) {
+        return Err(refuse(CASE_PATH.to_owned(), path));
+    }
+    for (id, module) in &state.modules {
+        if let Some(path) = module.data().find_non_finite() {
+            return Err(refuse(module_state_path(id), path));
+        }
+    }
+    // `history` and opaque module states are `serde_json::Value`s, which
+    // cannot hold a non-finite number.
+    Ok(())
+}
+
+/// Creates a new, uniquely named temporary file next to `path`. Two
+/// writers saving the same project never share (or truncate) it.
+fn create_tmp(path: &Path) -> Result<(PathBuf, File), DcprjError> {
+    let mut attempts = 0;
+    loop {
+        let tmp = sibling(path, &format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists && attempts < 8 => attempts += 1,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Writes the archive to `file` and fsyncs it.
+fn write_tmp(file: File, project: &Project) -> Result<(), DcprjError> {
     let state = &project.case_state;
 
     // Small JSON entries are kept in memory; blobs are encoded one at a time.
@@ -127,7 +163,6 @@ fn write_tmp(tmp: &Path, project: &Project) -> Result<(), DcprjError> {
         ..project.manifest.clone()
     };
 
-    let file = File::create(tmp)?;
     let mut zw = ZipWriter::new(BufWriter::new(file));
     let deflate = CompressionMethod::Deflated;
 
@@ -166,22 +201,43 @@ fn write_tmp(tmp: &Path, project: &Project) -> Result<(), DcprjError> {
 }
 
 /// Keeps the previous file as `<path>.bak` and moves `tmp` into place.
-fn replace(path: &Path, tmp: &Path) -> Result<(), DcprjError> {
+///
+/// Only the rename can fail the save. A backup that cannot be refreshed
+/// (locked, read-only, disk full) or a directory that cannot be synced after
+/// the rename are warnings: the new file is in place.
+fn replace(path: &Path, tmp: &Path) -> Result<Vec<SaveWarning>, DcprjError> {
+    let mut warnings = Vec::new();
     if path.exists() {
         let bak = sibling(path, ".bak");
-        match fs::remove_file(&bak) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        // A hard link keeps `path` in place until the final rename; fall back
-        // to a copy where links are unsupported.
-        if fs::hard_link(path, &bak).is_err() {
-            fs::copy(path, &bak)?;
+        if let Err(e) = keep_backup(path, &bak) {
+            warnings.push(SaveWarning::Backup {
+                path: bak,
+                reason: e.to_string(),
+            });
         }
     }
     fs::rename(tmp, path)?;
-    sync_dir(path)?;
+    if let Err(e) = sync_dir(path) {
+        warnings.push(SaveWarning::DirSync(e.to_string()));
+    }
+    Ok(warnings)
+}
+
+fn keep_backup(path: &Path, bak: &Path) -> std::io::Result<()> {
+    match fs::remove_file(bak) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    // A hard link keeps `path` in place until the final rename; fall back
+    // to a copy where links are unsupported.
+    if fs::hard_link(path, bak).is_err()
+        && let Err(e) = fs::copy(path, bak)
+    {
+        // never leave a truncated copy behind as the backup
+        let _ = fs::remove_file(bak);
+        return Err(e);
+    }
     Ok(())
 }
 

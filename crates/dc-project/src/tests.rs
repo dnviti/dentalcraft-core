@@ -801,3 +801,214 @@ proptest! {
         prop_assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
     }
 }
+
+/// File names in `dir`, sorted.
+fn listing(dir: &Path) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn save_refuses_non_finite_case_and_leaves_files_untouched() {
+    let d = dir();
+    let a = d.path().join("case.dcprj");
+    let mut p = sample_project();
+    save(&a, &p).unwrap();
+    p.history = json!([]);
+    save(&a, &p).unwrap(); // now there is a backup too
+    let before = std::fs::read(&a).unwrap();
+    let bak = std::fs::read(d.path().join("case.dcprj.bak")).unwrap();
+    let names = listing(d.path());
+    // what `Pose::new` used to produce from a zero quaternion
+    p.case_state.case.world_frame.from_case.q = glam::DQuat::from_xyzw(f64::NAN, 0.0, 0.0, 1.0);
+    match save(&a, &p) {
+        Err(DcprjError::NonFinite { entry, path }) => {
+            assert_eq!(entry, CASE_PATH);
+            assert_eq!(path, "world_frame.from_case.q[0]");
+        }
+        other => panic!("expected NonFinite, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&a).unwrap(), before);
+    assert_eq!(std::fs::read(d.path().join("case.dcprj.bak")).unwrap(), bak);
+    assert_eq!(listing(d.path()), names, "no temporary file is left");
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Measure {
+    gap: Option<f64>,
+}
+dc_case::impl_module_data!(Measure, 1);
+
+#[test]
+fn save_refuses_non_finite_option_instead_of_writing_none() {
+    let d = dir();
+    let a = d.path().join("case.dcprj");
+    let mut p = sample_project();
+    p.case_state.set_module(
+        "measure",
+        ModuleState::new(Measure {
+            gap: Some(f64::INFINITY),
+        }),
+    );
+    match save(&a, &p) {
+        Err(DcprjError::NonFinite { entry, path }) => {
+            assert_eq!(entry, module_state_path("measure"));
+            assert_eq!(path, "gap");
+        }
+        other => panic!("expected NonFinite, got {other:?}"),
+    }
+    assert!(listing(d.path()).is_empty());
+    p.case_state
+        .set_module("measure", ModuleState::new(Measure { gap: Some(0.5) }));
+    assert!(save(&a, &p).unwrap().is_empty());
+}
+
+#[test]
+fn temporary_file_name_is_unique() {
+    let d = dir();
+    let a = d.path().join("case.dcprj");
+    // another writer's (or a stale) fixed-name temporary file is not touched
+    std::fs::create_dir(d.path().join("case.dcprj.tmp")).unwrap();
+    std::fs::write(d.path().join("case.dcprj.tmp/keep"), b"x").unwrap();
+    save(&a, &sample_project()).unwrap();
+    save(&a, &sample_project()).unwrap();
+    assert_eq!(
+        std::fs::read(d.path().join("case.dcprj.tmp/keep")).unwrap(),
+        b"x"
+    );
+    assert_eq!(
+        listing(d.path()),
+        ["case.dcprj", "case.dcprj.bak", "case.dcprj.tmp"]
+    );
+    assert!(!load(&a, &codecs()).unwrap().read_only);
+}
+
+#[test]
+fn backup_failure_is_a_warning_not_a_failed_save() {
+    let d = dir();
+    let a = d.path().join("case.dcprj");
+    let mut p = sample_project();
+    save(&a, &p).unwrap();
+    // a `.bak` that cannot be removed (a non-empty directory, on every OS)
+    let bak = d.path().join("case.dcprj.bak");
+    std::fs::create_dir(&bak).unwrap();
+    std::fs::write(bak.join("x"), b"x").unwrap();
+    p.history = json!([{"step": 9}]);
+    let warnings = save(&a, &p).unwrap();
+    assert!(
+        matches!(&warnings[..], [SaveWarning::Backup { path, .. }] if *path == bak),
+        "{warnings:?}"
+    );
+    let out = load(&a, &codecs()).unwrap();
+    assert!(!out.read_only);
+    assert_eq!(out.project.history, json!([{"step": 9}]));
+    assert_eq!(
+        listing(d.path()),
+        ["case.dcprj", "case.dcprj.bak"],
+        "no temporary file is left"
+    );
+}
+
+/// Archive with `case.json` and `history/steps.json`, whose manifest
+/// declares `declared` bytes for the history.
+fn lying_history(path: &Path, declared: u64) {
+    let case = case_json();
+    let history = b"[]".to_vec();
+    let mut manifest = base_manifest(1);
+    manifest["entries"] = json!({
+        CASE_PATH: {"blake3": BlobRef::of_bytes(&case).to_hex(), "bytes": case.len()},
+        HISTORY_PATH: {"blake3": BlobRef::of_bytes(&history).to_hex(), "bytes": declared},
+    });
+    write_zip(
+        path,
+        &[
+            (
+                MANIFEST_PATH.to_owned(),
+                serde_json::to_vec(&manifest).unwrap(),
+            ),
+            (CASE_PATH.to_owned(), case),
+            (HISTORY_PATH.to_owned(), history),
+        ],
+    );
+}
+
+#[test]
+fn hostile_declared_sizes_are_load_errors_not_aborts() {
+    let d = dir();
+    let a = d.path().join("bomb.dcprj");
+    // 1 TiB for one entry: above the per-entry limit
+    lying_history(&a, 1 << 40);
+    assert!(matches!(load(&a, &codecs()), Err(DcprjError::Corrupt(_))));
+    // under the per-entry limit, but far more than the file can expand to
+    lying_history(&a, MAX_ENTRY_BYTES);
+    match load(&a, &codecs()) {
+        Err(DcprjError::Corrupt(m)) => assert!(m.contains("in total"), "{m}"),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+    // a size that differs from the ZIP entry by one byte
+    lying_history(&a, 3);
+    let out = load(&a, &codecs()).unwrap();
+    assert!(out.read_only);
+    assert!(
+        out.issues.iter().any(|i| matches!(
+            i,
+            LoadIssue::UnreadableEntry { path, reason }
+                if path == HISTORY_PATH && reason.contains("differs from the manifest")
+        )),
+        "{:?}",
+        out.issues
+    );
+}
+
+#[test]
+fn duplicate_entry_names_are_refused() {
+    let d = dir();
+    let a = d.path().join("dup.dcprj");
+    // the zip writer refuses duplicates: forge the second name in the bytes
+    build_zip(
+        &a,
+        base_manifest(1),
+        &[(CASE_PATH, case_json()), ("case.jsoX", case_json())],
+    );
+    let mut bytes = std::fs::read(&a).unwrap();
+    let mut forged = 0;
+    for i in 0..bytes.len() - 9 {
+        if &bytes[i..i + 9] == b"case.jsoX" {
+            bytes[i + 8] = b'n';
+            forged += 1;
+        }
+    }
+    assert!(forged >= 2, "local and central headers");
+    std::fs::write(&a, bytes).unwrap();
+    match load(&a, &codecs()) {
+        Err(DcprjError::Corrupt(m)) => assert!(m.contains("duplicate"), "{m}"),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[test]
+fn blob_referenced_only_by_a_module_must_be_present() {
+    let d = dir();
+    let a = d.path().join("case.dcprj");
+    let mut p = sample_project();
+    let missing = BlobRef::of_bytes(b"a mesh that is not in the store");
+    p.case_state.set_module(
+        "extra",
+        ModuleState::new(OpaqueModuleData {
+            schema_version: 1,
+            value: json!({"mesh": missing.to_hex()}),
+        }),
+    );
+    save(&a, &p).unwrap();
+    let out = load(&a, &codecs()).unwrap();
+    assert!(out.read_only);
+    assert!(
+        out.issues.contains(&LoadIssue::MissingBlob(missing)),
+        "{:?}",
+        out.issues
+    );
+}

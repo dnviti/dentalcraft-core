@@ -601,3 +601,36 @@ fn import_scan_prefers_the_module_import_scans_command() {
         json!({ "path": "a.stl", "role": "auto" })
     );
 }
+
+/// `batch` and `import_scan` refuse lists longer than the schema's
+/// `maxItems` before the host runs anything.
+#[test]
+fn long_lists_are_refused() {
+    let tools = dc_mcp::tool_definitions();
+    let batch = tools.iter().find(|t| t["name"] == "batch").unwrap();
+    let max = batch["inputSchema"]["properties"]["commands"]["maxItems"]
+        .as_u64()
+        .unwrap() as usize;
+    let mut server = Server::new(Painter);
+    let commands = vec![json!({ "id": "steps.list" }); max + 1];
+    let r = tool_result(&mut server, 1, "batch", json!({ "commands": commands }));
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(
+        r["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("at most")
+    );
+    let commands = vec![json!({ "id": "steps.list" }); max];
+    let r = tool_result(&mut server, 2, "batch", json!({ "commands": commands }));
+    assert!(r.get("isError").is_none(), "{r}");
+    let paths = vec![json!("a.stl"); max + 1];
+    let r = tool_result(&mut server, 3, "import_scan", json!({ "paths": paths }));
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(
+        r["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("at most")
+    );
+}

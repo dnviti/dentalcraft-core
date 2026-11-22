@@ -14,6 +14,7 @@ fn tiny_profile() -> PrinterProfile {
         mirror_x: false,
         mirror_y: false,
         machine: None,
+        validated: false,
     }
 }
 

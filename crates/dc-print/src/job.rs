@@ -407,6 +407,53 @@ impl Supported {
     }
 }
 
+/// Why `mesh` is not a closed, consistently oriented solid with a positive
+/// volume (the slicer's winding rule needs one), `None` when it is.
+fn solid_defect(mesh: &TriMesh) -> Option<String> {
+    let adj = mesh.edge_adjacency();
+    let boundary = adj.boundary_edge_count();
+    if boundary > 0 {
+        return Some(format!(
+            "not a closed solid: {boundary} open (boundary) edges"
+        ));
+    }
+    let non_manifold = adj.non_manifold_edge_count();
+    if non_manifold > 0 {
+        return Some(format!(
+            "not a closed solid: {non_manifold} edges shared by more than two triangles"
+        ));
+    }
+    // Two triangles on one edge are oriented alike when they run it in
+    // opposite directions.
+    let flipped = adj
+        .iter()
+        .filter(|(e, faces)| {
+            let runs_ab = |f: u32| {
+                let t = mesh.tris[f as usize];
+                (0..3).any(|k| t[k] == e.0 && t[(k + 1) % 3] == e.1)
+            };
+            faces.len() == 2 && runs_ab(faces[0]) == runs_ab(faces[1])
+        })
+        .count();
+    if flipped > 0 {
+        return Some(format!(
+            "triangles not consistently oriented: {flipped} edges between flipped triangles"
+        ));
+    }
+    let volume: f64 = (0..mesh.face_count())
+        .map(|f| {
+            let [a, b, c] = mesh.triangle(f).map(|p| p.as_dvec3());
+            a.dot(b.cross(c)) / 6.0
+        })
+        .sum();
+    if volume.is_nan() || volume <= 0.0 {
+        return Some(format!(
+            "volume {volume:.3} mm³ is not positive (triangles facing inward)"
+        ));
+    }
+    None
+}
+
 /// Orients, supports and checks one part; `cancel` is polled before the
 /// work starts.
 fn support_part(
@@ -427,6 +474,9 @@ fn support_part(
     part.mesh.check().map_err(|e| invalid(e.to_string()))?;
     if part.mesh.positions.iter().any(|p| !p.is_finite()) {
         return Err(invalid("the mesh has a non-finite vertex".into()));
+    }
+    if let Some(defect) = solid_defect(&part.mesh) {
+        return Err(invalid(defect));
     }
     let fitting = match &part.fitting {
         Some(f) => f.clone(),
@@ -518,6 +568,7 @@ fn union_volume_mm3(mesh: &TriMesh) -> Result<f64, JobError> {
         mirror_x: false,
         mirror_y: false,
         machine: None,
+        validated: true,
     };
     Ok(slice::slice_plate(
         &[&shifted],
@@ -791,12 +842,12 @@ fn preview(plate: &PreparedPlate, profile: &PrinterProfile, side: usize) -> Vec<
     let s = side as f64;
     let scale = s / w.max(h);
     let (ox, oy) = ((s - w * scale) / 2.0, (s - h * scale) / 2.0);
-    // image row 0 is the far edge of the plate (+Y up in the picture)
+    // Image row 0 is the file's row 0 and column 0 its column 0: the plate
+    // goes through the profile's mirror flags as the layer images do
+    // (`map_point_mm`, `map_pixel` extended to points).
     let to_px = |p: Vec3| {
-        DVec2::new(
-            ox + f64::from(p.x) * scale,
-            oy + (h - f64::from(p.y)) * scale,
-        )
+        let (fx, fy) = profile.map_point_mm(f64::from(p.x), f64::from(p.y));
+        DVec2::new(ox + fx * scale, oy + fy * scale)
     };
     let (x0, x1) = (
         ox.round() as usize,

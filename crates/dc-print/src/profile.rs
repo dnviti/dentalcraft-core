@@ -38,7 +38,17 @@ pub struct PrinterProfile {
     /// times, vat temperature and volume (see [`crate::machine`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<MachineParams>,
+    /// `true` once the dimensional scale (pixel pitch) and the left/right
+    /// orientation (mirror flags) have been checked against the printer: a
+    /// vendor file and a measured test print (plan §9.3, Q2). While `false`,
+    /// every `print.prepare` result carries [`PROFILE_NOT_VALIDATED`].
+    #[serde(default)]
+    pub validated: bool,
 }
+
+/// Warning code of a result prepared with a profile whose scale and
+/// orientation are not yet checked against the printer.
+pub const PROFILE_NOT_VALIDATED: &str = "print-profile-not-validated";
 
 impl PrinterProfile {
     /// Profile id of the built-in Saturn 4 Ultra 16K.
@@ -57,6 +67,10 @@ impl PrinterProfile {
     /// Mirror flags are `false` until the golden SatelLite file says
     /// otherwise (plan Q2).
     ///
+    /// Neither the pitch nor the mirror flags are checked against the
+    /// printer yet, so the profile is not `validated`: printing is allowed
+    /// and every result says so.
+    ///
     /// Machine parameters: the DENTAL 45 set prepared with Elegoo
     /// ([`MachineParams::dental_45`]). Its Z travel is 230 mm; the print
     /// limit stays the 220 mm build height of Elegoo's spec.
@@ -74,6 +88,7 @@ impl PrinterProfile {
             mirror_x: false,
             mirror_y: false,
             machine: Some(MachineParams::dental_45()),
+            validated: false,
         }
     }
 
@@ -118,6 +133,30 @@ impl PrinterProfile {
         };
         Some((c, r))
     }
+
+    /// [`Self::map_pixel`] extended to plate points: the plate point
+    /// (`x`, `y`) in mm goes to the file frame (mm from the file's first
+    /// column and row) with the same mirror flags. The pixel centre of
+    /// (`col`, `row`) maps to the pixel centre of `map_pixel(col, row)`, so
+    /// the previews follow the layer images.
+    pub fn map_point_mm(&self, x: f64, y: f64) -> (f64, f64) {
+        let w = f64::from(self.resolution_x) * self.pixel_pitch_x_um / 1000.0;
+        let h = f64::from(self.resolution_y) * self.pixel_pitch_y_um / 1000.0;
+        (
+            if self.mirror_x { w - x } else { x },
+            if self.mirror_y { h - y } else { y },
+        )
+    }
+
+    /// Codes of the warnings every job prepared with this profile carries:
+    /// [`PROFILE_NOT_VALIDATED`] until the profile is validated.
+    pub fn warnings(&self) -> Vec<&'static str> {
+        if self.validated {
+            Vec::new()
+        } else {
+            vec![PROFILE_NOT_VALIDATED]
+        }
+    }
 }
 
 /// Z of layer `index` (0-based) for a layer height of `layer_um` µm, in mm:
@@ -153,6 +192,37 @@ mod tests {
         }
         assert_eq!(p.map_pixel(0, 0), Some((15_119, 6_229)));
         assert_eq!(p.map_pixel(15_120, 0), None);
+    }
+
+    #[test]
+    fn point_map_follows_the_pixel_map() {
+        let mut p = PrinterProfile::saturn_4_ultra_16k();
+        let centre = |p: &PrinterProfile, c: u32, r: u32| {
+            (
+                (f64::from(c) + 0.5) * p.pixel_pitch_x_um / 1000.0,
+                (f64::from(r) + 0.5) * p.pixel_pitch_y_um / 1000.0,
+            )
+        };
+        for (mx, my) in [(false, false), (true, false), (false, true), (true, true)] {
+            p.mirror_x = mx;
+            p.mirror_y = my;
+            for (c, r) in [(0, 0), (15_119, 6_229), (7, 4000), (9000, 3)] {
+                let (x, y) = centre(&p, c, r);
+                let (fx, fy) = p.map_point_mm(x, y);
+                let (fc, fr) = p.map_pixel(c, r).unwrap();
+                let (ex, ey) = centre(&p, fc, fr);
+                assert!((fx - ex).abs() < 1e-6 && (fy - ey).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn unvalidated_profiles_warn() {
+        let mut p = PrinterProfile::saturn_4_ultra_16k();
+        assert!(!p.validated);
+        assert_eq!(p.warnings(), [PROFILE_NOT_VALIDATED]);
+        p.validated = true;
+        assert!(p.warnings().is_empty());
     }
 
     #[test]

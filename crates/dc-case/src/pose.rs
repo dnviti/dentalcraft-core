@@ -5,6 +5,8 @@ use std::ops::Mul;
 use glam::{DMat4, DQuat, DVec3};
 use serde::{Deserialize, Serialize};
 
+use crate::{CaseError, Result};
+
 /// Rigid transform `p ↦ q·p + t` (millimetres).
 ///
 /// Serialized as `{"t": [x, y, z], "q": [x, y, z, w]}`.
@@ -30,11 +32,25 @@ impl Pose {
     };
 
     /// Pose from translation and rotation (the rotation is normalised).
+    ///
+    /// A rotation that cannot be normalised (zero length or non-finite
+    /// components) gives the identity rotation instead of NaN; callers that
+    /// must reject such input use [`Pose::try_new`].
     pub fn new(t: DVec3, q: DQuat) -> Self {
-        Self {
+        Self::try_new(t, q).unwrap_or(Self {
             t,
-            q: q.normalize(),
+            q: DQuat::IDENTITY,
+        })
+    }
+
+    /// Like [`Pose::new`], but a rotation that cannot be normalised is an
+    /// error ([`CaseError::InvalidRotation`]).
+    pub fn try_new(t: DVec3, q: DQuat) -> Result<Self> {
+        let n = q.normalize();
+        if !q.is_finite() || !n.is_finite() {
+            return Err(CaseError::InvalidRotation(q.to_array()));
         }
+        Ok(Self { t, q: n })
     }
 
     /// Pure translation.
@@ -127,6 +143,26 @@ mod tests {
         assert!((ab.to_mat4().transform_point3(p) - ab.apply_point(p)).length() < 1e-12);
         assert!(Pose::from_mat4(&a.to_mat4()).approx_eq(&a, 1e-12, 1e-9));
         assert!((a.apply_vector(DVec3::Z).length() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn zero_or_non_finite_rotation_is_never_nan() {
+        let t = DVec3::new(1.0, 2.0, 3.0);
+        for q in [
+            DQuat::from_xyzw(0.0, 0.0, 0.0, 0.0),
+            DQuat::from_xyzw(f64::NAN, 0.0, 0.0, 1.0),
+            DQuat::from_xyzw(f64::INFINITY, 0.0, 0.0, 1.0),
+        ] {
+            assert!(matches!(
+                Pose::try_new(t, q),
+                Err(CaseError::InvalidRotation(_))
+            ));
+            let p = Pose::new(t, q);
+            assert_eq!((p.t, p.q), (t, DQuat::IDENTITY));
+        }
+        let q = DQuat::from_xyzw(0.0, 0.0, 0.0, 2.0);
+        assert_eq!(Pose::try_new(t, q).unwrap(), Pose::new(t, q));
+        assert_eq!(Pose::new(t, q).q, DQuat::IDENTITY);
     }
 
     #[test]

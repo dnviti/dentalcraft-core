@@ -22,6 +22,7 @@ dc-scanner.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 
@@ -29,7 +30,6 @@ uuid.workspace = true
 dc-scene.workspace = true
 egui.workspace = true
 glam.workspace = true
-tempfile.workspace = true
 
 [lints]
 workspace = true
