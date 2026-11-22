@@ -3,7 +3,7 @@
 use std::any::Any;
 use std::fmt;
 
-use crate::{BlobRef, ScanRole};
+use crate::{BlobRef, Scan, ScanRole};
 
 /// Data owned by one module inside a [`crate::CaseState`].
 ///
@@ -45,6 +45,16 @@ pub trait ModuleData: Any + Send + Sync + fmt::Debug {
     /// by the import. Runs on the state alone, with no module registry.
     fn scan_replaced(&mut self, _role: ScanRole) -> Vec<&'static str> {
         Vec::new()
+    }
+
+    /// The scan was removed from the case (`case.remove-scan`): drop what
+    /// was computed from it or entered about it and return ids of what was
+    /// cleared. The blobs no longer referenced afterwards are dropped by the
+    /// removal. Runs on the state alone, with no module registry. By default
+    /// it is a replacement of the scan's role
+    /// ([`ModuleData::scan_replaced`]).
+    fn scan_removed(&mut self, scan: &Scan) -> Vec<&'static str> {
+        self.scan_replaced(scan.role)
     }
 }
 

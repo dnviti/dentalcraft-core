@@ -1041,6 +1041,13 @@ fn settle_roles(
             cleared.extend(module.data_mut().scan_replaced(role));
         }
     }
+    drop_unreferenced(state, before);
+    cleared.into_iter().collect()
+}
+
+/// Drops the blobs that were in `before` (taken before a change) and are no
+/// longer referenced; blobs added since stay.
+fn drop_unreferenced(state: &mut CaseState, before: &HashSet<BlobRef>) {
     let after = state.referenced_blobs();
     let keep = state
         .blobs
@@ -1049,7 +1056,53 @@ fn settle_roles(
         .filter(|r| after.contains(r) || !before.contains(r))
         .collect();
     state.blobs.retain_only(&keep);
-    cleared.into_iter().collect()
+}
+
+/// What [`remove_scan`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Removed {
+    /// The scan that left the case.
+    pub scan: Scan,
+    /// The world frame was reset (an arch scan left).
+    pub world_frame_reset: bool,
+    /// What the modules cleared, sorted, without repeats.
+    pub module_cleared: Vec<&'static str>,
+}
+
+/// Removes the scan `id` from the case as one state transition, as a
+/// replacement does with the scan it replaces: resets the world frame when
+/// it was an arch scan, calls
+/// [`ModuleData::scan_removed`](crate::ModuleData::scan_removed) on every
+/// module, then drops the blobs that became unreferenced (its mesh, unless
+/// another scan or a module still refers to the same blob).
+///
+/// `Ok(None)` with `state` unchanged when the case has no scan `id`.
+/// Removing an arch scan is refused, as replacing one is, while a module
+/// state is opaque ([`ImportError::ArchesLocked`]), before `state` changes;
+/// a bite scan stays free.
+pub fn remove_scan(state: &mut CaseState, id: Uuid) -> Result<Option<Removed>, ImportError> {
+    let Some(pos) = state.case.scans.iter().position(|s| s.id == id) else {
+        return Ok(None);
+    };
+    let world_frame_reset = state.case.scans[pos].role != ScanRole::Bite;
+    if world_frame_reset {
+        check_arches(state)?;
+    }
+    let before = state.referenced_blobs();
+    let scan = state.case.scans.remove(pos);
+    if world_frame_reset {
+        state.case.world_frame = Default::default();
+    }
+    let mut cleared = BTreeSet::new();
+    for module in state.modules.values_mut() {
+        cleared.extend(module.data_mut().scan_removed(&scan));
+    }
+    drop_unreferenced(state, &before);
+    Ok(Some(Removed {
+        scan,
+        world_frame_reset,
+        module_cleared: cleared.into_iter().collect(),
+    }))
 }
 
 /// One file to import.

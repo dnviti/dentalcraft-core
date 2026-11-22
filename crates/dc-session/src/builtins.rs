@@ -1,8 +1,9 @@
 //! Built-in commands of the session, as [`CommandSpec`]s.
 //!
-//! `case.import` and `case.set-role` are ordinary state commands (they return
-//! the new case state), so they run through the generic path and are
-//! undoable. `case.import` is a thin wrapper of [`dc_case::import::import_files`]:
+//! `case.import`, `case.set-role` and `case.remove-scan` are ordinary state
+//! commands (they return the new case state), so they run through the
+//! generic path and are undoable. `case.import` is a thin wrapper of
+//! [`dc_case::import::import_files`]:
 //! the core stays module-agnostic, so a file without a hint stays
 //! provisional. The others act on the session itself (project file, undo
 //! stack, step history, view): their spec carries the id, the i18n keys and
@@ -11,7 +12,9 @@
 
 use std::collections::BTreeSet;
 
-use dc_case::import::{ImportFile, ImportReport, ImportRequest, import_files, roles_changed};
+use dc_case::import::{
+    ImportFile, ImportReport, ImportRequest, import_files, remove_scan, roles_changed,
+};
 use dc_case::{CaseState, MAX_BITE_SCANS, RoleSource, Scan, ScanRole};
 use dc_command::{CommandError, JobCtx};
 use dc_module_api::{CommandOutput, CommandSpec};
@@ -31,6 +34,8 @@ pub const PROJECT_SAVE: &str = "project.save";
 pub const CASE_IMPORT: &str = "case.import";
 /// `case.set-role`.
 pub const CASE_SET_ROLE: &str = "case.set-role";
+/// `case.remove-scan`.
+pub const CASE_REMOVE_SCAN: &str = "case.remove-scan";
 /// `edit.undo`.
 pub const EDIT_UNDO: &str = "edit.undo";
 /// `edit.redo`.
@@ -168,6 +173,14 @@ pub(crate) struct SetRoleParams {
     pub scan_id: Option<String>,
 }
 
+/// Parameters of `case.remove-scan`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemoveScanParams {
+    /// Id of the scan to remove (any role).
+    pub scan_id: String,
+}
+
 /// Parameters of `steps.rewind`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -243,6 +256,13 @@ pub fn specs() -> Vec<CommandSpec> {
             doc_key: "session-cmd-case-set-role-doc",
             params_schema: || schemars::schema_for!(SetRoleParams).to_value(),
             run: run_set_role,
+        },
+        CommandSpec {
+            id: CASE_REMOVE_SCAN,
+            label_key: "session-cmd-case-remove-scan",
+            doc_key: "session-cmd-case-remove-scan-doc",
+            params_schema: || schemars::schema_for!(RemoveScanParams).to_value(),
+            run: run_remove_scan,
         },
         session_spec!(EDIT_UNDO, "edit-undo", NoParams),
         session_spec!(EDIT_REDO, "edit-redo", NoParams),
@@ -541,6 +561,31 @@ fn run_set_role(
     ))
 }
 
+fn run_remove_scan(
+    state: &CaseState,
+    params: &Value,
+    _: &JobCtx,
+) -> Result<CommandOutput, CommandError> {
+    let p: RemoveScanParams = parse_params(params)?;
+    let text = p.scan_id.as_str();
+    let id = Uuid::parse_str(text.trim())
+        .map_err(|_| invalid("session-remove-scan-error-bad-id", &[("id", text)]))?;
+    let mut next = state.clone();
+    let removed = remove_scan(&mut next, id)
+        .map_err(|e| CommandError::Invalid(e.to_string()))?
+        .ok_or_else(|| invalid("session-remove-scan-error-no-scan", &[("id", text)]))?;
+    Ok((
+        next,
+        json!({
+            "scan_id": removed.scan.id,
+            "source_name": removed.scan.source_name,
+            "role": role_str(removed.scan.role),
+            "world_frame_reset": removed.world_frame_reset,
+            "module_cleared": removed.module_cleared,
+        }),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,7 +601,7 @@ mod tests {
             assert_eq!(s.schema()["type"], "object", "{}", s.id);
             assert_eq!(
                 is_session_command(s.id),
-                s.id != CASE_IMPORT && s.id != CASE_SET_ROLE
+                !matches!(s.id, CASE_IMPORT | CASE_SET_ROLE | CASE_REMOVE_SCAN)
             );
         }
     }
@@ -586,6 +631,8 @@ mod tests {
         assert!(parse_params::<ImportParams>(&json!({"path": "a.stl", "role": "x"})).is_err());
         assert!(parse_params::<ImportParams>(&json!({"files": [{"path": "a", "x": 1}]})).is_err());
         assert!(parse_params::<SetRoleParams>(&json!({"from": "upper"})).is_err());
+        assert!(parse_params::<RemoveScanParams>(&json!({})).is_err());
+        assert!(parse_params::<RemoveScanParams>(&json!({"scan_id": "a", "x": 1})).is_err());
     }
 
     #[test]

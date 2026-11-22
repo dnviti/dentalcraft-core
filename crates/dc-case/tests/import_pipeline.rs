@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use dc_case::import::{
     Allocation, Decision, Detection, FileClaim, ImportError, ImportFile, ImportReport,
     ImportRequest, ImportWarning, Placement, PrepareOptions, Resolver, WarningCode, allocate,
-    allocate_with, commit, import_files, prepare, prepare_with, roles_changed,
+    allocate_with, commit, import_files, prepare, prepare_with, remove_scan, roles_changed,
 };
 use dc_case::{
     BlobRef, Case, CaseState, ModuleData, ModuleState, OpaqueModuleData, Pose, RoleSource, Scan,
@@ -1115,6 +1115,96 @@ fn moving_a_provisional_scan_counts_as_a_change_of_both_arches() {
     assert_eq!(hook_calls(&state), [Upper, Lower]);
 }
 
+#[test]
+fn removing_an_arch_resets_the_frame_clears_the_module_and_drops_blobs() {
+    let d = Dir::new();
+    let (mut state, labels, loose) = labelled_case(&d);
+    let gone = state.case.scan(Upper).unwrap().clone();
+    let snapshot = state.clone();
+
+    let removed = remove_scan(&mut state, gone.id).unwrap().unwrap();
+    assert_eq!(removed.scan, gone);
+    assert!(removed.world_frame_reset);
+    // the default hook is a replacement of the scan's role
+    assert_eq!(removed.module_cleared, ["labels"]);
+    assert_eq!(hook_calls(&state), [Upper]);
+    assert_eq!(state.case.world_frame, WorldFrame::default());
+    assert_eq!(roles(&state), [(Lower, "lower.stl")]);
+    assert!(!state.blobs.contains(&gone.mesh));
+    assert!(!state.blobs.contains(&labels));
+    // a blob nothing referred to before is not the removal's business
+    assert!(state.blobs.contains(&loose));
+    // the state before is untouched: an undo gives everything back
+    assert_eq!(snapshot.case.scans.len(), 2);
+    assert!(snapshot.blobs.contains(&gone.mesh) && snapshot.blobs.contains(&labels));
+}
+
+#[test]
+fn removing_a_bite_scan_keeps_the_frame_and_a_shared_blob() {
+    let d = Dir::new();
+    let (mut state, _, _) = labelled_case(&d);
+    import(
+        &mut state,
+        &[
+            d.stl("bite1.stl", &arch(30.0)),
+            d.stl("bite2.stl", &arch(31.0)),
+        ],
+    );
+    let frame = state.case.world_frame;
+    let bite = state.case.scans_of(Bite).next().unwrap().clone();
+    // the module also holds the blob of the bite scan: it stays
+    state
+        .modules
+        .get_mut("m")
+        .unwrap()
+        .downcast_mut::<Labels>()
+        .unwrap()
+        .labels
+        .push((Lower, bite.mesh));
+
+    let removed = remove_scan(&mut state, bite.id).unwrap().unwrap();
+    assert!(!removed.world_frame_reset);
+    assert_eq!(state.case.world_frame, frame);
+    assert_eq!(hook_calls(&state), [Bite]);
+    assert_eq!(state.case.scans_of(Bite).count(), 1);
+    assert!(state.case.scan_by_id(bite.id).is_none());
+    assert!(state.blobs.contains(&bite.mesh));
+}
+
+#[test]
+fn removing_an_unknown_scan_changes_nothing() {
+    let d = Dir::new();
+    let (mut state, _, _) = labelled_case(&d);
+    let (case, blobs) = (state.case.clone(), state.blobs.len());
+    assert_eq!(remove_scan(&mut state, Uuid::new_v4()).unwrap(), None);
+    assert_eq!(state.case, case);
+    assert_eq!(state.blobs.len(), blobs);
+    assert!(hook_calls(&state).is_empty());
+}
+
+#[test]
+fn an_opaque_module_refuses_removing_an_arch_but_not_a_bite_scan() {
+    let d = Dir::new();
+    let mut state = CaseState::new(Case::new("T"));
+    import(
+        &mut state,
+        &[
+            d.stl("upper.stl", &arch(60.0)),
+            d.stl("bite.stl", &arch(30.0)),
+        ],
+    );
+    lock(&mut state);
+    let (case, blobs) = (state.case.clone(), state.blobs.len());
+    let upper = state.case.scan(Upper).unwrap().id;
+    let err = remove_scan(&mut state, upper).unwrap_err();
+    assert!(matches!(&err, ImportError::ArchesLocked { module } if module == "future"));
+    assert_eq!(state.case, case);
+    assert_eq!(state.blobs.len(), blobs);
+    let bite = state.case.scan(Bite).unwrap().id;
+    assert!(remove_scan(&mut state, bite).unwrap().is_some());
+    assert_eq!(roles(&state), [(Upper, "upper.stl")]);
+}
+
 /// A detector that always answers `arch`.
 fn import_detected(state: &mut CaseState, paths: &[PathBuf], arch: ScanRole) -> ImportReport {
     let mut detect = |_: &dc_case::import::PreparedScan| {
@@ -1560,8 +1650,8 @@ fn warnings_and_errors_read_well_in_both_languages() {
             ImportError::ArchesLocked {
                 module: "aligners".into(),
             },
-            "This project holds data of the aligners module that this version cannot read, so the arches cannot be replaced or moved: update DentalCraft. A scan can still go on a free arch, and the bite scans can change.",
-            "Questo progetto contiene dati del modulo aligners che questa versione non sa leggere, quindi le arcate non si possono sostituire né spostare: aggiorna DentalCraft. Una scansione può comunque andare su un'arcata libera e le scansioni del morso possono cambiare.",
+            "This project holds data of the aligners module that this version cannot read, so the arches cannot be replaced, moved or removed: update DentalCraft. A scan can still go on a free arch, and the bite scans can change.",
+            "Questo progetto contiene dati del modulo aligners che questa versione non sa leggere, quindi le arcate non si possono sostituire, spostare né rimuovere: aggiorna DentalCraft. Una scansione può comunque andare su un'arcata libera e le scansioni del morso possono cambiare.",
         ),
         (
             ImportError::Invalid {

@@ -30,4 +30,4 @@ case-import-error-invalid = { $name }: the file is damaged or is not a valid sca
 case-import-error-empty = { $name }: the file contains no usable faces.
 case-import-error-needs-role = { $name }: both arches are already taken. Choose its role in the Import scans panel, under Role of the next scans, and import it again (a command takes it in the role parameter).
 case-import-error-role-clash = { $name }: more than one file of this import is meant as { case-import-role }. Say which file goes there.
-case-import-error-arches-locked = This project holds data of the { $module } module that this version cannot read, so the arches cannot be replaced or moved: update DentalCraft. A scan can still go on a free arch, and the bite scans can change.
+case-import-error-arches-locked = This project holds data of the { $module } module that this version cannot read, so the arches cannot be replaced, moved or removed: update DentalCraft. A scan can still go on a free arch, and the bite scans can change.
