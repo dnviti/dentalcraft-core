@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0-alpha.9](https://github.com/dnviti/dentalcraft-core/compare/v0.3.0-alpha.8...v0.3.0-alpha.9) (2026-11-22)
+
+
+### Features
+
+* **case:** remove scans from the case ([#29](https://github.com/dnviti/dentalcraft-core/issues/29)) ([6264543](https://github.com/dnviti/dentalcraft-core/commit/6264543b4313ff46b2176cda6f56f68a470e624c))
+
 ## [0.3.0-alpha.8](https://github.com/dnviti/dentalcraft-core/compare/v0.3.0-alpha.7...v0.3.0-alpha.8) (2026-11-21)
 
 
