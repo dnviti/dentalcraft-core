@@ -46,4 +46,11 @@ fn session_keys_resolve_without_a_session() {
         matches!(&err, CommandError::Invalid(m) if m == "The case has no scan with the role upper arch."),
         "{err}"
     );
+    let err = spec("case.remove-scan")
+        .execute(&state, &json!({"scan_id": "nope"}), &ctx)
+        .unwrap_err();
+    assert!(
+        matches!(&err, CommandError::Invalid(m) if m == "nope is not a valid scan id."),
+        "{err}"
+    );
 }

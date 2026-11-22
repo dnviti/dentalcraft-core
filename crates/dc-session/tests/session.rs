@@ -167,6 +167,7 @@ fn lists_and_describes_builtins_and_module_commands() {
         "project.save",
         "case.import",
         "case.set-role",
+        "case.remove-scan",
         "edit.undo",
         "edit.redo",
         "steps.list",
@@ -195,6 +196,9 @@ fn lists_and_describes_builtins_and_module_commands() {
     assert_eq!(d.label, "Set scan role");
     assert_eq!(d.params_schema["required"], json!(["from", "to"]));
     assert!(d.params_schema["properties"]["scan_id"].is_object());
+    let d = s.describe("case.remove-scan").unwrap();
+    assert_eq!(d.label, "Remove scan");
+    assert_eq!(d.params_schema["required"], json!(["scan_id"]));
     let d = s.describe("dummy.increment").unwrap();
     assert_eq!(d.source, "dummy");
     // no bundle for the dummy keys: the key itself
@@ -1162,4 +1166,191 @@ fn set_role_rejects_bad_parameters() {
     ] {
         assert!(set_role(&mut s, params.clone()).is_err(), "{params}");
     }
+}
+
+// ------------------------------------------------------------ remove-scan
+
+/// A closed tetrahedron `size` wide, written as binary STL: a mesh (and so
+/// a blob) of its own for every size.
+fn sized_tetra(dir: &Path, name: &str, size: f32) -> String {
+    let mesh = TriMesh::new(
+        vec![
+            Vec3::ZERO,
+            Vec3::new(size, 0.0, 0.0),
+            Vec3::new(0.0, size, 0.0),
+            Vec3::new(0.0, 0.0, size),
+        ],
+        vec![[0, 2, 1], [0, 1, 3], [1, 2, 3], [0, 3, 2]],
+    );
+    let path = dir.join(name);
+    dc_mesh::io::write(&path, &mesh, dc_mesh::MeshFormat::Stl).unwrap();
+    path.to_str().unwrap().to_owned()
+}
+
+fn remove(s: &mut Session, id: &str) -> Result<Value, SessionError> {
+    s.execute("case.remove-scan", json!({ "scan_id": id }))
+}
+
+/// Upper, lower and two bite scans, each with its own mesh, a module result
+/// and a world frame moved away from the identity.
+fn four_scans(dir: &Path) -> Session {
+    let mut s = session();
+    import(
+        &mut s,
+        json!({"files": [
+            {"path": sized_tetra(dir, "upper.stl", 10.0)},
+            {"path": sized_tetra(dir, "lower.stl", 11.0)},
+            {"path": sized_tetra(dir, "a.stl", 12.0), "role": "bite"},
+            {"path": sized_tetra(dir, "b.stl", 13.0), "role": "bite"},
+        ]}),
+    )
+    .unwrap();
+    s.execute("dummy.increment", json!({"by": 3})).unwrap();
+    s.execute("dummy.shift-frame", json!({})).unwrap();
+    assert_eq!(s.state().blobs.len(), 4);
+    s
+}
+
+fn bite_ids(s: &Session) -> Vec<String> {
+    let bites = s.state().case.scans_of(ScanRole::Bite);
+    bites.map(|x| x.id.to_string()).collect()
+}
+
+#[test]
+fn remove_scan_takes_a_bite_scan_out_and_undo_brings_it_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = four_scans(dir.path());
+    let before = s.inspect(None).unwrap();
+    let depth = s.undo_stack().undo_depth();
+    let bites = bite_ids(&s);
+    let mesh = s.state().case.scans_of(ScanRole::Bite).nth(1).unwrap().mesh;
+
+    let out = remove(&mut s, &bites[1]).unwrap();
+    assert_eq!(s.undo_stack().undo_depth(), depth + 1);
+    assert_eq!(out["scan_id"], bites[1]);
+    assert_eq!(out["source_name"], "b.stl");
+    assert_eq!(out["role"], "bite");
+    // a bite scan leaves the world frame; the module says what it cleared
+    assert_eq!(out["world_frame_reset"], false);
+    assert_eq!(out["module_cleared"], json!(["dummy.count"]));
+    assert!(!frame_is_default(&s));
+    assert_eq!(bite_ids(&s), [bites[0].clone()]);
+    assert_eq!(s.state().case.scans.len(), 3);
+    // its mesh left the case with it
+    assert!(!s.state().blobs.contains(&mesh));
+    assert_eq!(s.state().blobs.len(), 3);
+
+    assert!(s.undo());
+    assert_eq!(s.inspect(None).unwrap()["scans"], before["scans"]);
+    assert_eq!(s.inspect(None).unwrap()["meshes"], before["meshes"]);
+    assert_eq!(count(&s), 3);
+    assert!(s.redo());
+    assert_eq!(bite_ids(&s), [bites[0].clone()]);
+}
+
+#[test]
+fn remove_scan_of_an_arch_resets_the_frame_and_clears_the_modules() {
+    let dir = tempfile::tempdir().unwrap();
+    for role in ["upper", "lower"] {
+        let mut s = four_scans(dir.path());
+        let id = scan_id(&s, role);
+        let out = remove(&mut s, &id).unwrap();
+        assert_eq!(out["role"], role);
+        assert_eq!(out["world_frame_reset"], true);
+        assert_eq!(out["module_cleared"], json!(["dummy.count"]));
+        assert!(frame_is_default(&s));
+        assert_eq!(count(&s), 0);
+        assert!(s.state().case.scans.iter().all(|x| x.id.to_string() != id));
+        assert_eq!(s.state().case.scans.len(), 3);
+        assert_eq!(s.state().blobs.len(), 3);
+        // undo: the scan, the frame and the module result come back
+        assert!(s.undo());
+        assert_eq!(scan_id(&s, role), id);
+        assert!(!frame_is_default(&s));
+        assert_eq!(count(&s), 3);
+    }
+}
+
+#[test]
+fn remove_scan_refuses_unknown_and_malformed_ids() {
+    let _g = lang(Lang::En);
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = four_scans(dir.path());
+    let before = s.inspect(None).unwrap();
+    let depth = s.undo_stack().undo_depth();
+    let unknown = uuid::Uuid::new_v4().to_string();
+    let err = remove(&mut s, &unknown).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains(&format!("no scan with the id {unknown}")),
+        "{err}"
+    );
+    let err = remove(&mut s, "x").unwrap_err();
+    assert!(
+        err.to_string().contains("x is not a valid scan id"),
+        "{err}"
+    );
+    for params in [json!({}), json!({"scan_id": unknown, "extra": 1})] {
+        assert!(
+            s.execute("case.remove-scan", params.clone()).is_err(),
+            "{params}"
+        );
+    }
+    assert_eq!(s.undo_stack().undo_depth(), depth);
+    assert_eq!(s.inspect(None).unwrap(), before);
+}
+
+#[test]
+fn an_opaque_module_stops_removing_an_arch_but_not_a_bite_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, import, _) = locked_state(dir.path());
+    let specs = dc_session::builtins::specs();
+    let remove = *specs.iter().find(|s| s.id == "case.remove-scan").unwrap();
+    let ctx = JobCtx::detached();
+    let upper = state.case.scan(ScanRole::Upper).unwrap().id.to_string();
+    let err = remove
+        .execute(&state, &json!({ "scan_id": upper }), &ctx)
+        .unwrap_err();
+    assert!(
+        matches!(&err, CommandError::Invalid(m) if m.contains("future")),
+        "{err}"
+    );
+    let params = json!({"path": tetra(dir.path(), "morso.stl")});
+    let (state, _) = import.execute(&state, &params, &ctx).unwrap();
+    let bite = state.case.scan(ScanRole::Bite).unwrap().id.to_string();
+    let (next, out) = remove
+        .execute(&state, &json!({ "scan_id": bite }), &ctx)
+        .unwrap();
+    assert_eq!(out["role"], "bite");
+    assert_eq!(next.case.scans.len(), 2);
+}
+
+/// The `blobs/` entries of a saved project.
+fn saved_blobs(path: &Path) -> usize {
+    let out = dc_project::load(path, &dc_project::ModuleCodecs::new()).unwrap();
+    let names = out.project.manifest.entries.keys();
+    names.filter(|k| k.starts_with("blobs/")).count()
+}
+
+#[test]
+fn a_removed_scan_leaves_no_blob_in_the_saved_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = four_scans(dir.path());
+    let before = dir.path().join("before.dcprj");
+    s.execute("project.save", json!({ "path": before }))
+        .unwrap();
+    let bites = bite_ids(&s);
+    remove(&mut s, &bites[0]).unwrap();
+    let after = dir.path().join("after.dcprj");
+    s.execute("project.save", json!({ "path": after })).unwrap();
+
+    assert_eq!(saved_blobs(&before), 4);
+    assert_eq!(saved_blobs(&after), 3);
+    let size = |p: &Path| std::fs::metadata(p).unwrap().len();
+    assert!(size(&after) < size(&before));
+    let mut t = session();
+    let out = t.execute("project.open", json!({ "path": after })).unwrap();
+    assert_eq!(out["scans"], 3);
+    assert_eq!(out["issues"], json!([]));
+    assert_eq!(bite_ids(&t), [bites[1].clone()]);
 }
