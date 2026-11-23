@@ -485,6 +485,69 @@ fn an_unreadable_history_keeps_the_file_read_only() {
     assert_eq!(std::fs::read(&saved).unwrap(), before);
 }
 
+/// Copies the `.dcprj` at `from` to `to` without its `history/steps.json`
+/// entry, in the archive and in the manifest: a file with no history.
+fn without_history(from: &Path, to: &Path) {
+    use std::io::Write;
+    let mut ar = zip::ZipArchive::new(std::fs::File::open(from).unwrap()).unwrap();
+    let mut zw = zip::ZipWriter::new(std::fs::File::create(to).unwrap());
+    for i in 0..ar.len() {
+        let name = ar.by_index_raw(i).unwrap().name().unwrap().into_owned();
+        if name == dc_project::HISTORY_PATH {
+            continue;
+        }
+        if name == dc_project::MANIFEST_PATH {
+            let mut manifest: Value = serde_json::from_reader(ar.by_index(i).unwrap()).unwrap();
+            manifest["entries"]
+                .as_object_mut()
+                .unwrap()
+                .remove(dc_project::HISTORY_PATH)
+                .unwrap();
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&serde_json::to_vec(&manifest).unwrap())
+                .unwrap();
+        } else {
+            zw.raw_copy_file(ar.by_index_raw(i).unwrap()).unwrap();
+        }
+    }
+    zw.finish().unwrap();
+}
+
+#[test]
+fn an_empty_history_opens_writable() {
+    let dir = tempfile::tempdir().unwrap();
+    // a project as `Project::new` writes it: the history is `[]`
+    let fresh = dir.path().join("fresh.dcprj");
+    let project = dc_project::Project::new(
+        dc_project::AppInfo {
+            version: "0.0.1".into(),
+            commit: "test".into(),
+        },
+        "2026-11-23T00:00:00Z",
+        CaseState::new(Case::new("PZ-0003")),
+    );
+    assert_eq!(project.history, json!([]));
+    dc_project::save(&fresh, &project).unwrap();
+    // the same project in a file without a history entry
+    let bare = dir.path().join("bare.dcprj");
+    without_history(&fresh, &bare);
+    let loaded = dc_project::load(&bare, &session().codecs()).unwrap();
+    assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
+
+    for path in [&fresh, &bare] {
+        let mut s = session();
+        let out = s
+            .execute("project.open", json!({"path": path.to_str().unwrap()}))
+            .unwrap();
+        assert_eq!(out["read_only"], false, "{out}");
+        assert_eq!(out["issues"], json!([]), "{out}");
+        assert_eq!(s.history().rev(), 0);
+        assert!(s.history().records().is_empty());
+        s.execute("project.save", Value::Null).unwrap();
+    }
+}
+
 // ---------------------------------------------------------------- import
 
 fn tetra(dir: &Path, name: &str) -> String {

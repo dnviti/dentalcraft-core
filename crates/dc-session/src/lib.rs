@@ -572,11 +572,15 @@ impl Session {
             issues,
         } = dc_project::load(path, &self.codecs())?;
         let discarded = self.is_dirty();
-        // A history that does not decode is never replaced by an empty one
-        // and saved over: the file stays read-only, like a module state
-        // that cannot be decoded.
-        let (history, history_issue) = match serde_json::from_value::<StepHistory>(project.history)
-        {
+        // `[]` is the empty history of dc-project (`Project::new`, and a
+        // file without a history entry). A history that does not decode is
+        // never replaced by an empty one and saved over: the file stays
+        // read-only, like a module state that cannot be decoded.
+        let decoded = match project.history {
+            Value::Array(a) if a.is_empty() => Ok(StepHistory::new()),
+            v => serde_json::from_value::<StepHistory>(v),
+        };
+        let (history, history_issue) = match decoded {
             Ok(h) => (h, None),
             Err(e) => (
                 StepHistory::new(),
