@@ -72,6 +72,11 @@ pub enum WarningCode {
     Provisional,
     /// The bite role is full.
     BiteLimit,
+    /// An arch scan that had to be closed into a solid (a module closes an
+    /// open scan with a base) still has open or non-manifold edges: it is
+    /// not a clean solid. Raised by the module that closes the scan, never
+    /// by [`import_files`].
+    NotClosed,
 }
 
 /// A structured import warning. Serializes to `code`, `key`, `args` and the
@@ -1286,4 +1291,31 @@ pub fn import_files(
     report.moved = allocation.moves;
     ctx.set_progress(1.0, None);
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_scan_left_open_has_a_stable_code_of_its_own() {
+        let codes = [
+            WarningCode::Rescaled,
+            WarningCode::UnitsSuspect,
+            WarningCode::Tiny,
+            WarningCode::LowPolygons,
+            WarningCode::ObjObjectsMerged,
+            WarningCode::BadFacesRemoved,
+            WarningCode::Replaced,
+            WarningCode::ArchConflict,
+            WarningCode::Provisional,
+            WarningCode::BiteLimit,
+            WarningCode::NotClosed,
+        ]
+        .map(|c| serde_json::to_value(c).unwrap());
+        assert_eq!(codes[10], "not_closed");
+        // snake case like the others, and no other code has its name
+        assert_eq!(codes[9], "bite_limit");
+        assert_eq!(codes.iter().filter(|c| **c == codes[10]).count(), 1);
+    }
 }
