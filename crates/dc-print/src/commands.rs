@@ -20,10 +20,12 @@
 //! removed and the new files renamed into place. A failed or cancelled run
 //! leaves `out_dir` as it was; nothing but those plate files is ever
 //! removed. A missing resin value is refused before anything is read
-//! (`print-no-resin-preset`): no value is ever guessed. A part that is not
-//! a closed, consistently oriented solid with a positive volume (open or
-//! non-manifold edges, flipped or inward triangles) is refused
-//! (`print-invalid-part`) before it is sliced.
+//! (`print-no-resin-preset`): no value is ever guessed. Parts are read
+//! with vertices identified by exact position ([`crate::part::read_mesh`]).
+//! A part that is not a closed, consistently oriented solid with a positive
+//! volume and no hole through its wall (open or non-manifold edges, flipped
+//! or inward triangles, a tunnel: the criteria of the aligners' export
+//! print check) is refused (`print-invalid-part`) before it is sliced.
 //!
 //! The summary's `profile_validated` is the profile's
 //! [`PrinterProfile::validated`]; `warnings` lists `{code, message}`
@@ -494,7 +496,7 @@ fn read_parts(paths: &[PathBuf]) -> Result<Vec<(PrintPart, FittingSource)>, Prin
 /// model.
 fn read_part(path: &Path) -> Result<(PrintPart, FittingSource), PrintCommandError> {
     let read = |p: &Path| {
-        dc_mesh::io::read(p).map_err(|source| PrintCommandError::Read {
+        crate::part::read_mesh(p).map_err(|source| PrintCommandError::Read {
             path: p.display().to_string(),
             source,
         })
@@ -1108,6 +1110,63 @@ mod tests {
         assert!(e.to_string().contains("SUP_allineatore_01"), "{e}");
         assert_eq!(fs::read(out.join("plate_02.goo")).unwrap(), b"old");
         assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
+    }
+
+    /// A cup with the edge `(a, b)` of one triangle split a fifth of the
+    /// STL reader's weld tolerance from `a`, on both of its triangles: a
+    /// closed solid with an edge far shorter than that tolerance, as the
+    /// shell mesher makes them. Written to `path`; the first edge whose
+    /// split the tolerance weld folds.
+    fn cup_with_a_tiny_edge(path: &Path) -> dc_mesh::TriMesh {
+        let (cup, _) = crate::job::tests::cup(glam::Vec3::new(20.0, 12.0, 8.0), 1.0);
+        let cell = 1e-6 * cup.aabb().unwrap().diagonal();
+        for (f, &[a, b, c]) in cup.tris.iter().enumerate() {
+            // the neighbour runs (b, a)
+            let Some((g, d)) = cup.tris.iter().enumerate().find_map(|(g, t)| {
+                (0..3)
+                    .find(|&k| t[k] == b && t[(k + 1) % 3] == a)
+                    .map(|k| (g, t[(k + 2) % 3]))
+            }) else {
+                continue;
+            };
+            let (pa, pb) = (cup.positions[a as usize], cup.positions[b as usize]);
+            let m = pa + (pb - pa).normalize() * (0.2 * cell);
+            let mut split = cup.clone();
+            split.positions.push(m);
+            let s = (split.positions.len() - 1) as u32;
+            split.tris[f] = [a, s, c];
+            split.tris[g] = [b, s, d];
+            split.tris.extend([[s, b, c], [s, a, d]]);
+            dc_mesh::io::write(path, &split, dc_mesh::MeshFormat::Stl).unwrap();
+            if dc_mesh::io::read(path).unwrap().positions.len() < split.positions.len() {
+                return split;
+            }
+        }
+        panic!("no split edge is folded by the weld");
+    }
+
+    /// An edge shorter than the reader's weld tolerance is no defect: the
+    /// part is read with exact vertex identity and prepared, and even a
+    /// mesh read with the tolerance weld (its two triangles folded) passes
+    /// the solid check. It was refused as "edges shared by more than two
+    /// triangles" (export SUP 01 and 05 of 2026-11-23).
+    #[test]
+    fn tiny_edges_are_not_folded_into_non_manifold_ones() {
+        let dir = TempDir::new("tiny-edge");
+        let path = dir.0.join("SUP_allineatore_01.stl");
+        let split = cup_with_a_tiny_edge(&path);
+        let exact = crate::part::read_mesh(&path).unwrap();
+        assert_eq!(exact.positions.len(), split.positions.len());
+        assert_eq!(crate::job::solid_defect(&exact), None);
+        let welded = dc_mesh::io::read(&path).unwrap();
+        assert_eq!(crate::job::solid_defect(&welded), None);
+        let out = dir.0.join("out");
+        let v = run(
+            PRINT_PREPARE,
+            with(resin(), json!({"inputs": [path], "out_dir": out})),
+        )
+        .unwrap();
+        assert_eq!(v["total"]["parts"], 1, "{v}");
     }
 
     /// The whole command on two cups (needs orientation, supports and the

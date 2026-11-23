@@ -22,7 +22,22 @@
 //!    first that starts no island on the fitting side wins. Such an island
 //!    (the counter of an engraved letter facing down, for one) could never
 //!    get a strut. With none free, the one with the fewest is kept and the
-//!    hard island check names the part.
+//!    hard island check names the part. Only the layers where a fitting
+//!    vertex starts the solid are sliced: an island starts at such a vertex
+//!    or not at all.
+//! 6. **Wide search** ([`wide_poses`]). When the chosen pose fails the
+//!    job's hard checks, the whole sphere of directions is searched:
+//!    every direction of the opening on a [`WIDE_STEP_DEG`] grid (the
+//!    tilts of step 2 and the flipped poses included). A direction
+//!    qualifies when it starts no island on the fitting side (counted
+//!    before the turn of step 4, which changes no height); with none on
+//!    the grid, the [`REFINE_SEEDS`] directions with the fewest such
+//!    islands are refined on grids of half and a quarter of the step. The
+//!    qualifying directions are turned as in step 4 and ranked as step 3
+//!    ranks, the poses whose islands all start away from the fitting side
+//!    (farther than [`crate::support::PLACEMENT_CLEARANCE_MM`], where a
+//!    strut may stand) first; the job tries at most [`WIDE_POSES`] of them
+//!    in turn. A part whose first pose passes costs nothing more.
 //!
 //! The fitting side of an exported shell comes from its stage model
 //! ([`fitting_from_model`]); [`fitting_faces`] guesses it from the geometry
@@ -31,7 +46,7 @@
 //! The orientation must not change from one platform to another. Trigonometry
 //! therefore goes through [`sin_cos`] (basic IEEE operations only) or
 //! through vectors. Candidates are scored in parallel and collected in
-//! order.
+//! order, and every ranking breaks ties by candidate order.
 
 mod fitting;
 mod hull;
@@ -124,17 +139,7 @@ pub fn orient_with(mesh: &TriMesh, fitting: &[bool], params: &OrientParams) -> O
     let on_fitting = islands::vertex_touches(mesh, fitting);
     let mut fallback: Option<(usize, Orientation)> = None;
     for &i in &order {
-        let rotation = (tilts[i] * base).normalize();
-        let footprint: Vec<Vec2> = mesh
-            .positions
-            .iter()
-            .map(|p| (rotation * *p).truncate())
-            .collect();
-        let turn = hull::long_side_turn(&footprint);
-        let o = Orientation {
-            rotation: (turn * rotation).normalize(),
-            lift_mm,
-        };
+        let o = pose(mesh, (tilts[i] * base).normalize(), lift_mm);
         let n = fitting_islands(&oriented_mesh(mesh, &o), &on_fitting, params.layer_um);
         if n == 0 {
             return o;
@@ -152,20 +157,200 @@ pub fn orient_with(mesh: &TriMesh, fitting: &[bool], params: &OrientParams) -> O
     )
 }
 
+/// Grid step of the wide search ([`wide_poses`]), degrees.
+pub const WIDE_STEP_DEG: f64 = 5.0;
+/// Directions refined when no direction of the grid qualifies.
+pub const REFINE_SEEDS: usize = 4;
+/// Refinement grids: half the step, then a quarter.
+const REFINE_LEVELS: u32 = 2;
+/// Poses of the wide search the job tries at most.
+pub const WIDE_POSES: usize = 16;
+
+/// A direction of the opening: its tilt from straight up and the azimuth
+/// of the horizontal axis it is tilted about, degrees.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Dir {
+    tilt_deg: f64,
+    axis_deg: f64,
+}
+
+impl Dir {
+    fn quat(self) -> Quat {
+        tilt_quat(self.tilt_deg.to_radians(), self.axis_deg.to_radians())
+    }
+}
+
+/// Islands of the oriented part alone, by where they start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Starts {
+    /// On a vertex of a fitting face: never a strut.
+    fitting: usize,
+    /// On another vertex within [`crate::support::PLACEMENT_CLEARANCE_MM`]
+    /// of a fitting face: a strut only beside the start, if at all.
+    near: usize,
+}
+
+/// The poses the job tries when the pose of [`orient_with`] fails its hard
+/// checks (module documentation, step 6), best first, at most
+/// [`WIDE_POSES`], none of `tried`. Empty when no direction, refined or
+/// not, starts no island on the fitting side.
+pub fn wide_poses(
+    mesh: &TriMesh,
+    fitting: &[bool],
+    params: &OrientParams,
+    tried: &[Orientation],
+) -> Vec<Orientation> {
+    if mesh.is_empty() {
+        return Vec::new();
+    }
+    let base = opening_up(mesh, fitting);
+    let on_fitting = islands::vertex_touches(mesh, fitting);
+    let near = near_fitting(mesh, fitting, &on_fitting);
+    // The turn of step 4 changes no height: the islands are counted before
+    // it, and only the qualifying poses are turned.
+    let eval = |d: &Dir| {
+        let rotation = (d.quat() * base).normalize();
+        let o = Orientation {
+            rotation,
+            lift_mm: params.lift_mm,
+        };
+        let starts = island_starts(
+            &oriented_mesh(mesh, &o),
+            &on_fitting,
+            Some(&near),
+            params.layer_um,
+        );
+        (rotation, starts)
+    };
+
+    // the tilts of step 2, then the grid over the whole sphere
+    let mut dirs = tilt_dirs(params);
+    dirs.extend(sphere(WIDE_STEP_DEG));
+    let mut found: Vec<(Quat, Starts)> = dirs.par_iter().map(eval).collect();
+    for level in 1..=REFINE_LEVELS {
+        if found.iter().any(|(_, s)| s.fitting == 0) {
+            break;
+        }
+        // the best directions so far, and the grid of the level around them
+        let mut best: Vec<usize> = (0..found.len()).collect();
+        best.sort_by_key(|&i| (found[i].1, i));
+        let step = WIDE_STEP_DEG / f64::from(1u32 << level);
+        let around: Vec<Dir> = best
+            .iter()
+            .take(REFINE_SEEDS)
+            .flat_map(|&i| neighbours(dirs[i], step))
+            .collect();
+        found.extend(around.par_iter().map(eval).collect::<Vec<_>>());
+        dirs.extend(around);
+    }
+
+    // the qualifying poses, turned, each once, ranked
+    let qualifying: Vec<usize> = (0..found.len())
+        .filter(|&i| found[i].1.fitting == 0)
+        .collect();
+    let turned: Vec<Orientation> = qualifying
+        .par_iter()
+        .map(|&i| pose(mesh, found[i].0, params.lift_mm))
+        .collect();
+    let mut keep: Vec<(Orientation, bool)> = Vec::new();
+    for (o, &i) in turned.iter().zip(&qualifying) {
+        if !tried.contains(o) && !keep.iter().any(|(k, _)| k == o) {
+            keep.push((*o, found[i].1.near > 0));
+        }
+    }
+    let down_z = score::down_z(params.overhang_deg);
+    let scores: Vec<f64> = keep
+        .par_iter()
+        .map(|(o, _)| score::score(mesh, fitting, o.rotation, down_z).total)
+        .collect();
+    let mut order: Vec<usize> = (0..keep.len()).collect();
+    order.sort_by(|&a, &b| {
+        keep[a]
+            .1
+            .cmp(&keep[b].1)
+            .then(scores[a].total_cmp(&scores[b]))
+            .then(a.cmp(&b))
+    });
+    order
+        .into_iter()
+        .take(WIDE_POSES)
+        .map(|k| keep[k].0)
+        .collect()
+}
+
+/// The pose of `rotation` (module documentation, step 4): turned about Z
+/// so that the footprint's long side runs along X.
+fn pose(mesh: &TriMesh, rotation: Quat, lift_mm: f32) -> Orientation {
+    let footprint: Vec<Vec2> = mesh
+        .positions
+        .iter()
+        .map(|p| (rotation * *p).truncate())
+        .collect();
+    let turn = hull::long_side_turn(&footprint);
+    Orientation {
+        rotation: (turn * rotation).normalize(),
+        lift_mm,
+    }
+}
+
 /// Islands of the oriented part alone that start on a vertex of a fitting
 /// face (`on_fitting`, per vertex).
 fn fitting_islands(oriented: &TriMesh, on_fitting: &[bool], layer_um: u32) -> usize {
+    island_starts(oriented, on_fitting, None, layer_um).fitting
+}
+
+/// The islands of the oriented part alone that start on a vertex of a
+/// fitting face (`on_fitting`) or, when `near` is given, on another vertex
+/// it flags. Only the layers where such a vertex starts the solid are
+/// sliced: an island starts at a vertex where the solid starts
+/// ([`islands::island_bottom`]).
+fn island_starts(
+    oriented: &TriMesh,
+    on_fitting: &[bool],
+    near: Option<&[bool]>,
+    layer_um: u32,
+) -> Starts {
+    let watched = near.unwrap_or(on_fitting);
     let minima = islands::material_minima(oriented);
-    if !minima.iter().any(|&v| on_fitting[v as usize]) {
-        return 0;
-    }
-    islands::islands(&[oriented], layer_um)
+    let starts: Vec<u32> = minima
         .iter()
-        .filter(|i| {
-            islands::island_bottom(oriented, &minima, i, layer_um)
-                .is_some_and(|v| on_fitting[v as usize])
+        .copied()
+        .filter(|&v| watched[v as usize])
+        .collect();
+    let mut out = Starts::default();
+    if starts.is_empty() {
+        return out;
+    }
+    let layers = islands::layers_of(oriented, &starts, layer_um);
+    for island in islands::islands_at(&[oriented], layer_um, &layers) {
+        match islands::island_bottom(oriented, &minima, &island, layer_um) {
+            Some(v) if on_fitting[v as usize] => out.fitting += 1,
+            Some(v) if watched[v as usize] => out.near += 1,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Per vertex: on a fitting face, or within
+/// [`crate::support::PLACEMENT_CLEARANCE_MM`] of one (no strut stands
+/// there). The same in every pose.
+fn near_fitting(mesh: &TriMesh, fitting: &[bool], on_fitting: &[bool]) -> Vec<bool> {
+    let fit = raycast::Bvh::with_faces(
+        mesh,
+        (0..mesh.face_count().min(fitting.len()))
+            .filter(|&f| fitting[f])
+            .map(|f| f as u32),
+    );
+    mesh.positions
+        .par_iter()
+        .zip(on_fitting)
+        .map(|(p, &on)| {
+            on || fit
+                .nearest(*p, crate::support::PLACEMENT_CLEARANCE_MM)
+                .is_some()
         })
-        .count()
+        .collect()
 }
 
 /// The part in plate space: rotated by `o.rotation` about the model
@@ -198,6 +383,14 @@ fn opening_up(mesh: &TriMesh, fitting: &[bool]) -> Quat {
     Quat::from_rotation_arc(sum.normalize().as_vec3(), Vec3::Z)
 }
 
+/// A tilt of `tilt` radians about the horizontal axis at azimuth `axis`
+/// radians.
+fn tilt_quat(tilt: f64, axis: f64) -> Quat {
+    let (sh, ch) = sin_cos(tilt / 2.0);
+    let (sa, ca) = sin_cos(axis);
+    Quat::from_xyzw((ca * sh) as f32, (sa * sh) as f32, 0.0, ch as f32)
+}
+
 /// The candidate tilts: none, then each step up to the largest tilt about
 /// eight horizontal axes (X, the diagonals, Y and so on, 45° apart).
 fn tilts(params: &OrientParams) -> Vec<Quat> {
@@ -209,15 +402,91 @@ fn tilts(params: &OrientParams) -> Vec<Quat> {
     let steps = ((max / step).ceil() as usize).min(90);
     for s in 1..=steps {
         let tilt = f64::from((s as f32 * step).min(max)).to_radians();
-        let (sh, ch) = sin_cos(tilt / 2.0);
         for k in 0..8 {
-            let (sa, ca) = sin_cos(f64::from(k) * std::f64::consts::FRAC_PI_4);
-            out.push(Quat::from_xyzw(
-                (ca * sh) as f32,
-                (sa * sh) as f32,
-                0.0,
-                ch as f32,
-            ));
+            out.push(tilt_quat(tilt, f64::from(k) * std::f64::consts::FRAC_PI_4));
+        }
+    }
+    out
+}
+
+/// The tilts of [`tilts`] as directions.
+fn tilt_dirs(params: &OrientParams) -> Vec<Dir> {
+    let mut out = vec![Dir {
+        tilt_deg: 0.0,
+        axis_deg: 0.0,
+    }];
+    let (step, max) = (params.tilt_step_deg, params.max_tilt_deg);
+    if !(step > 0.0 && max > 0.0) {
+        return out;
+    }
+    let steps = ((max / step).ceil() as usize).min(90);
+    for s in 1..=steps {
+        let tilt_deg = f64::from((s as f32 * step).min(max));
+        out.extend((0..8).map(|k| Dir {
+            tilt_deg,
+            axis_deg: 45.0 * f64::from(k),
+        }));
+    }
+    out
+}
+
+/// Directions over the whole sphere about `step` degrees apart: rings of
+/// tilt 0, `step`, … 180° (the opening straight down), each ring with as
+/// many axes as fit `step` apart along it.
+fn sphere(step: f64) -> Vec<Dir> {
+    let rings = (180.0 / step).round() as u32;
+    let mut out = Vec::new();
+    for r in 0..=rings {
+        let tilt_deg = 180.0 * f64::from(r) / f64::from(rings);
+        let along = 360.0 * sin_cos(tilt_deg.to_radians()).0;
+        let n = ((along / step).round() as u32).max(1);
+        out.extend((0..n).map(|k| Dir {
+            tilt_deg,
+            axis_deg: 360.0 * f64::from(k) / f64::from(n),
+        }));
+    }
+    out
+}
+
+/// The eight directions `step` degrees around `d`: tilts of ±`step`, axes
+/// turned by `step` along the ring, and the four diagonals.
+fn neighbours(d: Dir, step: f64) -> Vec<Dir> {
+    let ring = sin_cos(d.tilt_deg.to_radians()).0;
+    // near a pole the axis is free: eight axes on the first ring
+    if ring < 1e-6 {
+        let tilt_deg = if d.tilt_deg < 90.0 {
+            step
+        } else {
+            180.0 - step
+        };
+        return (0..8)
+            .map(|k| Dir {
+                tilt_deg,
+                axis_deg: 45.0 * f64::from(k),
+            })
+            .collect();
+    }
+    let turn = step / ring;
+    let mut out = Vec::with_capacity(8);
+    for dt in [-step, 0.0, step] {
+        for da in [-turn, 0.0, turn] {
+            if dt == 0.0 && da == 0.0 {
+                continue;
+            }
+            let mut tilt_deg = d.tilt_deg + dt;
+            let mut axis_deg = d.axis_deg + da;
+            // past a pole: the same direction about the opposite axis
+            if tilt_deg < 0.0 {
+                tilt_deg = -tilt_deg;
+                axis_deg += 180.0;
+            } else if tilt_deg > 180.0 {
+                tilt_deg = 360.0 - tilt_deg;
+                axis_deg += 180.0;
+            }
+            out.push(Dir {
+                tilt_deg,
+                axis_deg: axis_deg.rem_euclid(360.0),
+            });
         }
     }
     out
@@ -264,7 +533,7 @@ const FACT: [f64; 18] = {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{aligner_shell_with_faces, default_shell};
+    use crate::testutil::{aligner_shell_with_faces, default_shell, spiked_slab};
     use glam::EulerRot;
 
     #[test]
@@ -402,5 +671,69 @@ mod tests {
         let chosen = orient_with(&shell.mesh, &fitting, &params);
         assert_ne!(chosen, base);
         assert_eq!(count(&chosen), 0);
+    }
+
+    /// The pyramid of [`spiked_slab`] starts an island on the fitting side
+    /// in every tilt of up to 45°; the wide search finds the poses that
+    /// start none, and only those.
+    #[test]
+    fn the_wide_search_finds_poses_the_tilts_miss() {
+        let (mesh, fitting) = spiked_slab();
+        let params = OrientParams {
+            layer_um: 100,
+            ..OrientParams::default()
+        };
+        let touches = islands::vertex_touches(&mesh, &fitting);
+        let count =
+            |o: &Orientation| fitting_islands(&oriented_mesh(&mesh, o), &touches, params.layer_um);
+        let base = opening_up(&mesh, &fitting);
+        for t in tilts(&params) {
+            let o = pose(&mesh, (t * base).normalize(), params.lift_mm);
+            assert!(count(&o) > 0, "{o:?}");
+        }
+        let first = orient_with(&mesh, &fitting, &params);
+        let wide = wide_poses(&mesh, &fitting, &params, &[first]);
+        assert!(!wide.is_empty());
+        for o in &wide {
+            assert_ne!(*o, first);
+            assert_eq!(count(o), 0, "{o:?}");
+            // the opening turned well past the old 45°
+            assert!((o.rotation * Vec3::Z).z < 0.5, "{o:?}");
+        }
+        assert!(wide.len() <= WIDE_POSES);
+    }
+
+    /// The same poses, in the same order, whatever the thread count.
+    #[test]
+    fn the_wide_search_is_deterministic() {
+        let (mesh, fitting) = spiked_slab();
+        let params = OrientParams::default();
+        let a = wide_poses(&mesh, &fitting, &params, &[]);
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let b = one.install(|| wide_poses(&mesh, &fitting, &params, &[]));
+        assert!(!a.is_empty());
+        assert_eq!(a, b);
+        assert_eq!(a, wide_poses(&mesh, &fitting, &params, &[]));
+    }
+
+    /// Every direction of the sphere grid once, the poles included.
+    #[test]
+    fn the_sphere_grid_covers_every_direction() {
+        let dirs = sphere(WIDE_STEP_DEG);
+        let ups: Vec<Vec3> = dirs.iter().map(|d| d.quat().inverse() * Vec3::Z).collect();
+        // any direction is within the step of one of the grid
+        for i in 0..200 {
+            let (s, c) = sin_cos(f64::from(i) * 0.731);
+            let z = f64::from(i) / 100.0 - 1.0;
+            let r = (1.0 - z * z).sqrt();
+            let d = Vec3::new((r * c) as f32, (r * s) as f32, z as f32);
+            let near = ups.iter().map(|u| u.dot(d)).fold(f32::MIN, f32::max);
+            assert!(near > (WIDE_STEP_DEG as f32).to_radians().cos(), "{d:?}");
+        }
+        assert_eq!(dirs.first().map(|d| d.tilt_deg), Some(0.0));
+        assert_eq!(dirs.last().map(|d| d.tilt_deg), Some(180.0));
     }
 }

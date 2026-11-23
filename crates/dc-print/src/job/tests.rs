@@ -454,6 +454,74 @@ fn preview_follows_the_layer_pixel_map() {
     }
 }
 
+/// A part whose every tilt of up to 45° starts an island on the fitting
+/// side (it was refused, `print-island-unsupported`) is prepared in a pose
+/// of the wide search, its opening turned to the side, every hard check
+/// passed.
+#[test]
+fn a_part_the_tilts_cannot_hold_is_prepared_in_another_pose() {
+    let (mesh, fitting) = crate::testutil::spiked_slab();
+    let part = PrintPart {
+        id: "spike".into(),
+        mesh,
+        fitting: Some(fitting),
+    };
+    let job = print_job(small_profile());
+    let first = orient::orient_with(
+        &part.mesh,
+        part.fitting.as_ref().unwrap(),
+        &OrientParams {
+            layer_um: job.job.layer_um,
+            ..job.orient.clone()
+        },
+    );
+    let prepared = prepare(std::slice::from_ref(&part), &job).unwrap();
+    let chosen = prepared.parts[0].orientation;
+    assert_ne!(chosen, first);
+    assert!((chosen.rotation * Vec3::Z).z < 0.5, "{chosen:?}");
+    // the same pose every time
+    let again = prepare(&[part], &job).unwrap();
+    assert_eq!(again.parts[0].orientation, chosen);
+}
+
+/// When no pose holds a part, the refusal says how many islands are left,
+/// how many poses were tried and where the lowest island starts on the
+/// part.
+#[test]
+fn a_part_no_pose_holds_is_refused_with_its_islands() {
+    // a box all of whose faces are fitting: wherever it stands, it starts
+    // in mid-air on the fitting side
+    let mesh = cuboid(Vec3::new(1.0, 2.0, 3.0), Vec3::new(5.0, 6.0, 7.0));
+    let part = PrintPart {
+        id: "box".into(),
+        fitting: Some(vec![true; mesh.face_count()]),
+        mesh,
+    };
+    let e = prepare(&[part], &print_job(small_profile())).unwrap_err();
+    assert_eq!(e.code(), "print-island-unsupported", "{e}");
+    let JobError::Support {
+        source: SupportError::IslandUnsupported { count, .. },
+        poses,
+        at_mm: Some(at),
+        ..
+    } = &e
+    else {
+        panic!("{e:?}");
+    };
+    assert!(*count >= 1 && *poses >= 1, "{e}");
+    // the island starts on the box, in its own coordinates
+    let inside = |v: f32, lo: f32, hi: f32| (lo - 0.2..=hi + 0.2).contains(&v);
+    assert!(
+        inside(at[0], 1.0, 5.0) && inside(at[1], 2.0, 6.0) && inside(at[2], 3.0, 7.0),
+        "{e}"
+    );
+    let text = e.to_string();
+    assert!(
+        text.contains("regions start in mid-air") && text.contains("poses tried"),
+        "{text}"
+    );
+}
+
 #[test]
 fn only_closed_outward_solids_are_accepted() {
     let cube = cuboid(Vec3::ZERO, Vec3::new(5.0, 5.0, 5.0));
@@ -489,6 +557,68 @@ fn only_closed_outward_solids_are_accepted() {
     let tip = (fin.positions.len() - 1) as u32;
     fin.tris.push([b, a, tip]);
     assert!(refused(fin).contains("open (boundary) edges"));
+    // two boxes sharing one edge: four triangles on it
+    let other = cuboid(Vec3::new(5.0, 5.0, 0.0), Vec3::new(10.0, 10.0, 5.0));
+    let mut pair = cube.clone();
+    let n = pair.positions.len() as u32;
+    pair.positions.extend(&other.positions);
+    pair.tris
+        .extend(other.tris.iter().map(|t| t.map(|i| i + n)));
+    assert!(refused(pair).contains("shared by more than two triangles"));
+    // a hole through the wall: a square ring
+    assert!(refused(ring()).contains("1 holes through the wall (genus 1)"));
+}
+
+/// A square ring 10 × 10 × 2 mm around a 4 × 4 mm hole: a closed outward
+/// solid of genus 1.
+fn ring() -> TriMesh {
+    let mut m = TriMesh::default();
+    let (lo, hi, a, b, h) = (0.0, 10.0, 3.0, 7.0, 2.0);
+    let at = |x: f32, y: f32, z: f32| Vec3::new(x, y, z);
+    // outer and inner corners, counter-clockwise from above
+    let outer = [(lo, lo), (hi, lo), (hi, hi), (lo, hi)];
+    let inner = [(a, a), (b, a), (b, b), (a, b)];
+    // from the centre of the ring to the middle of a side
+    let side =
+        |p: (f32, f32), q: (f32, f32)| at((p.0 + q.0) / 2.0 - 5.0, (p.1 + q.1) / 2.0 - 5.0, 0.0);
+    for k in 0..4 {
+        let (o0, o1) = (outer[k], outer[(k + 1) % 4]);
+        let (i0, i1) = (inner[k], inner[(k + 1) % 4]);
+        for (z, up) in [(0.0, -Vec3::Z), (h, Vec3::Z)] {
+            quad(
+                &mut m,
+                [
+                    at(o0.0, o0.1, z),
+                    at(o1.0, o1.1, z),
+                    at(i1.0, i1.1, z),
+                    at(i0.0, i0.1, z),
+                ],
+                up,
+            );
+        }
+        // the outer side faces away from the centre, the inner one towards it
+        quad(
+            &mut m,
+            [
+                at(o0.0, o0.1, 0.0),
+                at(o1.0, o1.1, 0.0),
+                at(o1.0, o1.1, h),
+                at(o0.0, o0.1, h),
+            ],
+            side(o0, o1),
+        );
+        quad(
+            &mut m,
+            [
+                at(i0.0, i0.1, 0.0),
+                at(i1.0, i1.1, 0.0),
+                at(i1.0, i1.1, h),
+                at(i0.0, i0.1, h),
+            ],
+            -side(i0, i1),
+        );
+    }
+    m
 }
 
 #[test]

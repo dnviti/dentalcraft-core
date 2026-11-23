@@ -151,12 +151,45 @@ struct Region {
 
 /// The lowest island of `meshes` (closed, outward, plate space) sliced at
 /// `layer_um`, if any.
+#[cfg(test)]
 pub(crate) fn first_island(meshes: &[&TriMesh], layer_um: u32) -> Option<Island> {
     islands(meshes, layer_um).into_iter().next()
 }
 
 /// Every island of every layer, lowest layer first, then in row order.
 pub(crate) fn islands(meshes: &[&TriMesh], layer_um: u32) -> Vec<Island> {
+    islands_in(meshes, layer_um, None)
+}
+
+/// The islands of the layers `wanted` only (sorted, without repeats): the
+/// same as those of [`islands`] in these layers, at the cost of slicing
+/// them and the layer below each.
+pub(crate) fn islands_at(meshes: &[&TriMesh], layer_um: u32, wanted: &[u32]) -> Vec<Island> {
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    islands_in(meshes, layer_um, Some(wanted))
+}
+
+/// The layers whose island may start at one of `vertices` of `mesh` (see
+/// [`island_bottom`]), sorted, without repeats.
+pub(crate) fn layers_of(mesh: &TriMesh, vertices: &[u32], layer_um: u32) -> Vec<u32> {
+    let h = f64::from(layer_um.max(1)) / 1000.0;
+    let mut out: Vec<u32> = Vec::with_capacity(2 * vertices.len());
+    for &v in vertices {
+        // the windows of island_bottom, ((k − ½)h − 1e-4, (k + ½)h + 1e-4),
+        // widened against rounding: an extra layer only costs its slice
+        let z = f64::from(mesh.positions[v as usize].z);
+        let lo = ((z - 1e-3) / h - 0.5).ceil().max(1.0) as u32;
+        let hi = ((z + 1e-3) / h + 0.5).floor().max(0.0) as u32;
+        out.extend(lo..=hi);
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn islands_in(meshes: &[&TriMesh], layer_um: u32, wanted: Option<&[u32]>) -> Vec<Island> {
     let h = f64::from(layer_um.max(1)) / 1000.0;
     let (mut lo, mut hi) = (DVec3::splat(f64::MAX), DVec3::splat(f64::MIN));
     for p in meshes.iter().flat_map(|m| &m.positions) {
@@ -176,9 +209,29 @@ pub(crate) fn islands(meshes: &[&TriMesh], layer_um: u32) -> Vec<Island> {
     };
     let layers = (hi.z / h).ceil() as usize;
     let plane = |k: usize| (k as f64 + 0.5) * h;
+    // The layers checked, and the slot of each layer sliced (checked ones
+    // and the layer below each), `usize::MAX` for the others.
+    let checked: Vec<usize> = match wanted {
+        None => (1..layers).collect(),
+        Some(w) => w
+            .iter()
+            .map(|&k| k as usize)
+            .filter(|&k| k >= 1 && k < layers)
+            .collect(),
+    };
+    let mut slot = vec![usize::MAX; layers];
+    let mut sliced: Vec<usize> = Vec::new();
+    for &k in &checked {
+        for l in [k - 1, k] {
+            if slot[l] == usize::MAX {
+                slot[l] = sliced.len();
+                sliced.push(l);
+            }
+        }
+    }
 
-    // Faces per layer: the planes each face's z range spans.
-    let mut per_layer: Vec<Vec<(u32, u32)>> = vec![Vec::new(); layers];
+    // Faces per sliced layer: the planes each face's z range spans.
+    let mut per_layer: Vec<Vec<(u32, u32)>> = vec![Vec::new(); sliced.len()];
     for (m, mesh) in meshes.iter().enumerate() {
         for (f, t) in mesh.tris.iter().enumerate() {
             let z = t.map(|i| f64::from(mesh.positions[i as usize].z));
@@ -188,16 +241,18 @@ pub(crate) fn islands(meshes: &[&TriMesh], layer_um: u32) -> Vec<Island> {
             if last < 0.0 {
                 continue;
             }
-            for faces in per_layer.iter_mut().take(last as usize + 1).skip(first) {
-                faces.push((m as u32, f as u32));
+            for &s in slot.iter().take(last as usize + 1).skip(first) {
+                if s != usize::MAX {
+                    per_layer[s].push((m as u32, f as u32));
+                }
             }
         }
     }
 
     let spans: Vec<Vec<Span>> = per_layer
         .par_iter()
-        .enumerate()
-        .map(|(k, faces)| slice(meshes, faces, plane(k), &grid))
+        .zip(&sliced)
+        .map(|(faces, &k)| slice(meshes, faces, plane(k), &grid))
         .collect();
     let mm = |x: f64, y: f64| {
         Vec2::new(
@@ -205,10 +260,10 @@ pub(crate) fn islands(meshes: &[&TriMesh], layer_um: u32) -> Vec<Island> {
             (grid.y0 + y * PITCH_MM) as f32,
         )
     };
-    (1..layers)
+    checked
         .into_par_iter()
         .map(|k| {
-            unheld(&spans[k], &spans[k - 1])
+            unheld(&spans[slot[k]], &spans[slot[k - 1]])
                 .into_iter()
                 .map(|r| Island {
                     layer: k as u32,
@@ -480,5 +535,25 @@ mod tests {
             (island.centre - Vec2::new(4.5, 4.5)).length() < 0.1,
             "{island:?}"
         );
+    }
+
+    /// The islands of some layers are those the full check finds there.
+    #[test]
+    fn the_islands_of_some_layers_are_those_of_the_full_check() {
+        let column = cuboid(Vec3::new(0.0, 0.0, 0.0), Vec3::new(2.0, 2.0, 6.0));
+        let loose = cuboid(Vec3::new(4.0, 4.0, 2.0), Vec3::new(5.0, 5.0, 3.0));
+        let high = cuboid(Vec3::new(-4.0, 4.0, 4.0), Vec3::new(-3.0, 5.0, 5.0));
+        let meshes = [&column, &loose, &high];
+        let all = islands(&meshes, 100);
+        assert_eq!(all.iter().map(|i| i.layer).collect::<Vec<_>>(), [20, 40]);
+        assert_eq!(islands_at(&meshes, 100, &[20, 40]), all);
+        assert_eq!(islands_at(&meshes, 100, &[40]), all[1..]);
+        assert_eq!(islands_at(&meshes, 100, &[3, 41]), []);
+        assert_eq!(islands_at(&meshes, 100, &[]), []);
+        // the layers of the vertices where the loose box starts
+        let low: Vec<u32> = (0..loose.vertex_count() as u32)
+            .filter(|&v| loose.positions[v as usize].z == 2.0)
+            .collect();
+        assert!(layers_of(&loose, &low, 100).contains(&20));
     }
 }

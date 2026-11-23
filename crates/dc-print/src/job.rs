@@ -10,7 +10,11 @@
 //! 3. supports ([`crate::support::supports`]), on the outer side only;
 //! 4. the two hard checks of [`crate::support`]: no contact on the fitting
 //!    side ([`crate::support::check_no_fitting_contact`]) and no
-//!    unsupported island ([`crate::support::check_islands`]);
+//!    unsupported island ([`crate::support::check_islands`]). When they
+//!    fail, steps 2–4 run again for the poses of the wide search
+//!    ([`crate::orient::wide_poses`]) until one passes; when none does,
+//!    the failure with the fewest islands is reported, with the poses
+//!    tried and where its lowest island starts on the part;
 //! 5. its footprint (the convex hull of part and supports seen from above)
 //!    and height, which must fit under the build height.
 //!
@@ -156,7 +160,8 @@ pub enum JobError {
     #[error("print-no-parts: nothing to print")]
     NoParts,
     /// A part cannot be printed as given (empty, broken or non-finite mesh,
-    /// fitting flags of the wrong length).
+    /// not a closed outward solid, a hole through its wall, fitting flags
+    /// of the wrong length).
     #[error("print-invalid-part: {part}: {reason}")]
     InvalidPart {
         /// Part id.
@@ -167,14 +172,21 @@ pub enum JobError {
     /// A print setting is missing or out of range.
     #[error("print-invalid-settings: {0}")]
     InvalidSettings(String),
-    /// A hard check of the supports failed for a part: a contact on the
-    /// fitting side or an unsupported island (the code is the check's).
-    #[error("{source} (part {part})")]
+    /// A hard check of the supports failed for a part in every pose tried:
+    /// a contact on the fitting side or an unsupported island (the code is
+    /// the check's). The failure reported is the one with the fewest
+    /// unsupported islands.
+    #[error("{source} (part {part}, {poses} poses tried{})", at_text(at_mm))]
     Support {
         /// Part id.
         part: String,
         /// The failed check.
         source: SupportError,
+        /// Poses tried.
+        poses: usize,
+        /// Where the lowest unsupported island starts, in the part's own
+        /// coordinates (those of its file), mm.
+        at_mm: Option<[f32; 3]>,
     },
     /// Nesting failed.
     #[error(transparent)]
@@ -408,54 +420,50 @@ impl Supported {
 }
 
 /// Why `mesh` is not a closed, consistently oriented solid with a positive
-/// volume (the slicer's winding rule needs one), `None` when it is.
-fn solid_defect(mesh: &TriMesh) -> Option<String> {
-    let adj = mesh.edge_adjacency();
-    let boundary = adj.boundary_edge_count();
-    if boundary > 0 {
+/// volume and no hole through its wall (the slicer's winding rule needs a
+/// closed solid; an aligner shell or a model with a tunnel is broken),
+/// `None` when it is. The criteria are those of the aligners' export print
+/// check, on [`dc_mesh::solid_topology`]: vertices are identified by their
+/// exact position, as in the STL file, and triangles with no area are left
+/// out.
+pub(crate) fn solid_defect(mesh: &TriMesh) -> Option<String> {
+    let t = dc_mesh::solid_topology(mesh);
+    if t.boundary_edges > 0 {
         return Some(format!(
-            "not a closed solid: {boundary} open (boundary) edges"
+            "not a closed solid: {} open (boundary) edges",
+            t.boundary_edges
         ));
     }
-    let non_manifold = adj.non_manifold_edge_count();
-    if non_manifold > 0 {
+    if t.nonmanifold_edges > 0 {
         return Some(format!(
-            "not a closed solid: {non_manifold} edges shared by more than two triangles"
+            "not a closed solid: {} edges shared by more than two triangles",
+            t.nonmanifold_edges
         ));
     }
-    // Two triangles on one edge are oriented alike when they run it in
-    // opposite directions.
-    let flipped = adj
-        .iter()
-        .filter(|(e, faces)| {
-            let runs_ab = |f: u32| {
-                let t = mesh.tris[f as usize];
-                (0..3).any(|k| t[k] == e.0 && t[(k + 1) % 3] == e.1)
-            };
-            faces.len() == 2 && runs_ab(faces[0]) == runs_ab(faces[1])
-        })
-        .count();
-    if flipped > 0 {
+    if t.flipped_edges > 0 {
         return Some(format!(
-            "triangles not consistently oriented: {flipped} edges between flipped triangles"
+            "triangles not consistently oriented: {} edges between flipped triangles",
+            t.flipped_edges
         ));
     }
-    let volume: f64 = (0..mesh.face_count())
-        .map(|f| {
-            let [a, b, c] = mesh.triangle(f).map(|p| p.as_dvec3());
-            a.dot(b.cross(c)) / 6.0
-        })
-        .sum();
+    let volume = t.volume_mm3;
     if volume.is_nan() || volume <= 0.0 {
         return Some(format!(
             "volume {volume:.3} mm³ is not positive (triangles facing inward)"
         ));
     }
-    None
+    match t.genus {
+        Some(g) if g > 0 => Some(format!("{g} holes through the wall (genus {g})")),
+        _ => None,
+    }
 }
 
 /// Orients, supports and checks one part; `cancel` is polled before the
-/// work starts.
+/// work starts and before each further pose. The pose of
+/// [`orient::orient_with`] is tried first; when its supports fail a hard
+/// check, the poses of [`orient::wide_poses`] are tried in turn and the
+/// first that passes is kept. When none does, the failure with the fewest
+/// unsupported islands is reported, with the number of poses tried.
 fn support_part(
     part: &PrintPart,
     job: &PrintJob,
@@ -499,15 +507,46 @@ fn support_part(
         layer_um,
         ..job.support.clone()
     };
-    let orientation = orient::orient_with(&part.mesh, &fitting, &orient_params);
-    let mesh = orient::oriented_mesh(&part.mesh, &orientation);
-    let set = support::supports(&mesh, &fitting, &support_params);
-    let failed = |source| JobError::Support {
+    // A pose, supported and checked; on failure, the check and where its
+    // island is in the part's own coordinates.
+    let attempt = |o: &Orientation| {
+        let mesh = orient::oriented_mesh(&part.mesh, o);
+        let set = support::supports(&mesh, &fitting, &support_params);
+        let checked = support::check_no_fitting_contact(&mesh, &fitting, &set)
+            .and_then(|()| support::check_islands(&mesh, &set, layer_um));
+        match checked {
+            Ok(()) => Ok((mesh, set)),
+            Err(e) => {
+                let at = island_in_part(&part.mesh, &mesh, o, &e, layer_um);
+                Err((e, at))
+            }
+        }
+    };
+    let first = orient::orient_with(&part.mesh, &fitting, &orient_params);
+    let mut tried = vec![first];
+    let mut fewest = attempt(&first).map(|done| (first, done));
+    if fewest.is_err() {
+        for o in orient::wide_poses(&part.mesh, &fitting, &orient_params, &tried) {
+            if cancel() {
+                return Err(JobError::Cancelled);
+            }
+            tried.push(o);
+            match (attempt(&o), &fewest) {
+                (Ok(done), _) => {
+                    fewest = Ok((o, done));
+                    break;
+                }
+                (Err(f), Err(g)) if unsupported(&f.0) < unsupported(&g.0) => fewest = Err(f),
+                _ => {}
+            }
+        }
+    }
+    let (orientation, (mesh, set)) = fewest.map_err(|(source, at_mm)| JobError::Support {
         part: part.id.clone(),
         source,
-    };
-    support::check_no_fitting_contact(&mesh, &fitting, &set).map_err(failed)?;
-    support::check_islands(&mesh, &set, layer_um).map_err(failed)?;
+        poses: tried.len(),
+        at_mm,
+    })?;
     let contacts = set.struts.len();
     // the raft's pads and bands overlap: count their union once
     let volume_mm3 = mesh_volume_mm3(&mesh)
@@ -525,6 +564,44 @@ fn support_part(
         contacts,
         footprint,
         volume_mm3,
+    })
+}
+
+/// Unsupported islands of a failed check, for ranking the failures; a
+/// contact on the fitting side ranks last.
+fn unsupported(e: &SupportError) -> usize {
+    match e {
+        SupportError::IslandUnsupported { count, .. } => *count,
+        SupportError::FittingContact { .. } => usize::MAX,
+    }
+}
+
+/// Where the lowest island of `e` starts in the coordinates of `part`, the
+/// mesh `oriented` is `part` in pose `o` (plate space, before nesting).
+fn island_in_part(
+    part: &TriMesh,
+    oriented: &TriMesh,
+    o: &Orientation,
+    e: &SupportError,
+    layer_um: u32,
+) -> Option<[f32; 3]> {
+    let SupportError::IslandUnsupported {
+        layer, x_mm, y_mm, ..
+    } = *e
+    else {
+        return None;
+    };
+    // oriented = rotation · part + shift
+    let shift = *oriented.positions.first()? - o.rotation * *part.positions.first()?;
+    let z = (layer as f32 + 0.5) * layer_um as f32 / 1000.0;
+    let p = o.rotation.inverse() * (Vec3::new(x_mm, y_mm, z) - shift);
+    Some(p.to_array())
+}
+
+/// The part of the [`JobError::Support`] message that says where.
+fn at_text(at_mm: &Option<[f32; 3]>) -> String {
+    at_mm.map_or(String::new(), |[x, y, z]| {
+        format!("; the lowest at ({x:.2}, {y:.2}, {z:.2}) mm in the part's coordinates")
     })
 }
 

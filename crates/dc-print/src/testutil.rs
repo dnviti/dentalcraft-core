@@ -530,6 +530,64 @@ impl Section {
     }
 }
 
+/// A part with a pocket of the fitting side that hangs down: a slab
+/// 12 × 12 × 1.5 mm (top face at z = 1.5, fitting) with a square pyramid
+/// 4 × 4 mm hanging 8 mm under its bottom (fitting). Returns the closed,
+/// outward mesh and its fitting flags. With the opening (up) tilted by up
+/// to 45°, the tip of the pyramid is where the solid starts, in mid-air on
+/// the fitting side; tilted far enough to the side (about 80°), the
+/// pyramid hangs from the slab's lower edge and the solid starts on the
+/// outer side.
+pub(crate) fn spiked_slab() -> (TriMesh, Vec<bool>) {
+    let mut m = TriMesh::default();
+    let mut fitting = Vec::new();
+    // a convex polygon as a fan, wound to face `outward`
+    let mut poly = |pts: &[Vec3], outward: Vec3, fit: bool| {
+        let ids: Vec<u32> = pts
+            .iter()
+            .map(|&p| match m.positions.iter().position(|&v| v == p) {
+                Some(i) => i as u32,
+                None => {
+                    m.positions.push(p);
+                    (m.positions.len() - 1) as u32
+                }
+            })
+            .collect();
+        let flip = (pts[1] - pts[0]).cross(pts[2] - pts[0]).dot(outward) < 0.0;
+        for k in 1..ids.len() - 1 {
+            let t = [ids[0], ids[k], ids[k + 1]];
+            m.tris.push(if flip { [t[0], t[2], t[1]] } else { t });
+            fitting.push(fit);
+        }
+    };
+    let (o, i, top, tip) = (6.0f32, 2.0f32, 1.5f32, -8.0f32);
+    let ring =
+        |r: f32, z: f32| [(-r, -r), (r, -r), (r, r), (-r, r)].map(|(x, y)| Vec3::new(x, y, z));
+    let (bottom_out, bottom_in, upper) = (ring(o, 0.0), ring(i, 0.0), ring(o, top));
+    poly(&upper, Vec3::Z, true);
+    for k in 0..4 {
+        let n = (k + 1) % 4;
+        let side = (bottom_out[k] + bottom_out[n]).with_z(0.0);
+        poly(
+            &[bottom_out[k], bottom_out[n], upper[n], upper[k]],
+            side,
+            false,
+        );
+        poly(
+            &[bottom_out[k], bottom_out[n], bottom_in[n], bottom_in[k]],
+            -Vec3::Z,
+            false,
+        );
+        let face = (bottom_in[k] + bottom_in[n]).with_z(-1.0);
+        poly(
+            &[bottom_in[k], bottom_in[n], Vec3::new(0.0, 0.0, tip)],
+            face,
+            true,
+        );
+    }
+    (m, fitting)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
