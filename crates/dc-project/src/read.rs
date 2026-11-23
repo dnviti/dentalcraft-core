@@ -22,6 +22,22 @@ use crate::{
 /// Upper bound for an entry that is not listed in the manifest.
 const UNLISTED_LIMIT: u64 = 64 << 20;
 
+/// Largest pre-allocation for one entry: sizes come from the file, so a
+/// larger entry grows its buffer while it is actually read.
+const PREALLOC_CAP: u64 = 64 << 20;
+
+/// Largest uncompressed size of one entry (2 GiB); a file declaring more is
+/// refused before anything is read.
+pub const MAX_ENTRY_BYTES: u64 = 2 << 30;
+
+/// Largest uncompressed size of all entries together (16 GiB). The total is
+/// also bounded by 1100 times the file length (deflate's limit is ~1032:1).
+pub const MAX_TOTAL_BYTES: u64 = 16 << 30;
+
+/// Deflate cannot expand more than about 1032:1, so a project declaring
+/// more than this many times its file length is lying about its sizes.
+const MAX_RATIO: u64 = 1100;
+
 fn zip_err(e: ZipError) -> DcprjError {
     match e {
         ZipError::Io(e) => DcprjError::Io(e),
@@ -29,14 +45,22 @@ fn zip_err(e: ZipError) -> DcprjError {
     }
 }
 
-/// Reads at most `limit + 1` bytes of entry `name`.
+/// Reads at most `limit + 1` bytes of entry `name`. With `exact`, an entry
+/// whose ZIP size is not `limit` (the manifest size) is refused.
 fn read_entry<R: Read + Seek>(
     ar: &mut ZipArchive<R>,
     name: &str,
     limit: u64,
+    exact: bool,
 ) -> Result<Vec<u8>, String> {
     let entry = ar.by_name(name).map_err(|e| e.to_string())?;
-    let mut buf = Vec::with_capacity(entry.size().min(limit) as usize);
+    if exact && entry.size() != limit {
+        return Err(format!(
+            "size {} differs from the manifest ({limit} bytes)",
+            entry.size()
+        ));
+    }
+    let mut buf = Vec::with_capacity(entry.size().min(limit).min(PREALLOC_CAP) as usize);
     entry
         .take(limit.saturating_add(1))
         .read_to_end(&mut buf)
@@ -51,7 +75,7 @@ fn read_verified<R: Read + Seek>(
     info: &EntryInfo,
     issues: &mut Vec<LoadIssue>,
 ) -> Option<Vec<u8>> {
-    match read_entry(ar, name, info.bytes) {
+    match read_entry(ar, name, info.bytes, true) {
         Err(reason) => {
             issues.push(LoadIssue::UnreadableEntry {
                 path: name.to_owned(),
@@ -74,7 +98,9 @@ fn corrupt(msg: impl Into<String>) -> DcprjError {
 }
 
 pub(crate) fn load(path: &Path, codecs: &ModuleCodecs) -> Result<LoadOutcome, DcprjError> {
-    let mut ar = ZipArchive::new(BufReader::new(File::open(path)?)).map_err(zip_err)?;
+    let file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut ar = ZipArchive::new(BufReader::new(file)).map_err(zip_err)?;
     let mut issues = Vec::new();
 
     // `mimetype` must be the first entry, stored, with the exact content.
@@ -95,8 +121,7 @@ pub(crate) fn load(path: &Path, codecs: &ModuleCodecs) -> Result<LoadOutcome, Dc
         }
     }
 
-    // Manifest: unreadable means the whole file is unusable.
-    let manifest_bytes = read_entry(&mut ar, MANIFEST_PATH, UNLISTED_LIMIT)
+    let manifest_bytes = read_entry(&mut ar, MANIFEST_PATH, UNLISTED_LIMIT, false)
         .map_err(|_| DcprjError::MissingEntry(MANIFEST_PATH.to_owned()))?;
     if manifest_bytes.len() as u64 > UNLISTED_LIMIT {
         return Err(corrupt("manifest.json is too large"));
@@ -125,6 +150,11 @@ pub(crate) fn load(path: &Path, codecs: &ModuleCodecs) -> Result<LoadOutcome, Dc
         .ok_or_else(|| corrupt("manifest.entries is missing"))?;
     let entries: std::collections::BTreeMap<String, EntryInfo> =
         serde_json::from_value(entries_value)?;
+    // The zip crate keeps one entry per name: ask it whether some were
+    // dropped, then guard against names equal only after lossy decoding.
+    if ar.has_duplicate_names() {
+        return Err(corrupt("duplicate archive entry names"));
+    }
     let raw_names: Vec<String> = ar
         .file_names_raw()
         .map(|n| String::from_utf8_lossy(n).into_owned())
@@ -132,6 +162,23 @@ pub(crate) fn load(path: &Path, codecs: &ModuleCodecs) -> Result<LoadOutcome, Dc
     let names: BTreeSet<String> = raw_names.iter().cloned().collect();
     if names.len() != raw_names.len() {
         return Err(corrupt("duplicate archive entry names"));
+    }
+    // Declared sizes bound every read below: refuse impossible ones first.
+    let mut total: u64 = 0;
+    for (name, info) in entries.iter().filter(|(n, _)| names.contains(*n)) {
+        if info.bytes > MAX_ENTRY_BYTES {
+            return Err(corrupt(format!(
+                "{name} declares {} bytes, more than the limit of {MAX_ENTRY_BYTES}",
+                info.bytes
+            )));
+        }
+        total = total.saturating_add(info.bytes);
+    }
+    let total_limit = MAX_TOTAL_BYTES.min(file_len.saturating_mul(MAX_RATIO));
+    if total > total_limit {
+        return Err(corrupt(format!(
+            "entries declare {total} bytes in total, more than the limit of {total_limit}"
+        )));
     }
     for name in &names {
         if name != MIMETYPE_PATH && name != MANIFEST_PATH && !entries.contains_key(name) {
@@ -149,7 +196,7 @@ pub(crate) fn load(path: &Path, codecs: &ModuleCodecs) -> Result<LoadOutcome, Dc
     // Case: unreadable or corrupt means the file is unusable.
     let case_info =
         listed(CASE_PATH, &names).ok_or_else(|| DcprjError::MissingEntry(CASE_PATH.to_owned()))?;
-    let case_bytes = match read_entry(&mut ar, CASE_PATH, case_info.bytes) {
+    let case_bytes = match read_entry(&mut ar, CASE_PATH, case_info.bytes, true) {
         Ok(b) => b,
         Err(reason) => return Err(corrupt(format!("{CASE_PATH}: {reason}"))),
     };
@@ -282,9 +329,12 @@ pub(crate) fn load(path: &Path, codecs: &ModuleCodecs) -> Result<LoadOutcome, Dc
             }),
         }
     }
-    for scan in &state.case.scans {
-        if !blobs.contains(&scan.mesh) {
-            issues.push(LoadIssue::MissingBlob(scan.mesh));
+    // Every mesh a scan or a module refers to (sorted: issues are stable).
+    let mut referenced: Vec<BlobRef> = state.referenced_blobs().into_iter().collect();
+    referenced.sort_unstable();
+    for r in referenced {
+        if !blobs.contains(&r) {
+            issues.push(LoadIssue::MissingBlob(r));
         }
     }
     state.blobs = blobs;

@@ -22,9 +22,15 @@
 //!
 //! * Output is deterministic (fixed entry order, timestamps and permissions):
 //!   `save` -> `load` -> `save` yields identical bytes.
-//! * [`save`] is atomic: it writes `<path>.tmp`, fsyncs it, hard-links the
-//!   previous file to `<path>.bak` (one backup is kept), renames the
-//!   temporary file over `<path>` and fsyncs the directory.
+//! * [`save`] is atomic: it writes a uniquely named `<path>.<uuid>.tmp`
+//!   (created exclusively, so two writers never share it), fsyncs it,
+//!   hard-links the previous file to `<path>.bak` (one backup is kept),
+//!   renames the temporary file over `<path>` and fsyncs the directory. A
+//!   backup or directory sync failure is a [`SaveWarning`], not a failed
+//!   save. There is no lock between processes: the last rename wins.
+//! * [`save`] refuses data with a NaN or infinite number
+//!   ([`DcprjError::NonFinite`]) before touching any file: JSON cannot store
+//!   it and the file would not reopen.
 //! * Garbage collection: [`save`] only writes the blobs referenced by a case
 //!   scan or by a module ([`dc_case::ModuleData::referenced_blobs`]); the
 //!   others are dropped. State of modules kept opaque is scanned for blob
@@ -33,7 +39,8 @@
 //!   are unusable. Any other problem (corrupt or missing blob, hash mismatch,
 //!   newer module schema, ...) is reported in [`LoadOutcome::issues`] and
 //!   makes the outcome [`LoadOutcome::read_only`]: callers must not overwrite
-//!   such a file.
+//!   such a file. Entry sizes are checked against the manifest and bounded
+//!   ([`MAX_ENTRY_BYTES`], [`MAX_TOTAL_BYTES`]) before anything is read.
 //! * Older container versions are migrated on `serde_json::Value`s;
 //!   module states are migrated by their [`ModuleCodec`]. State of modules
 //!   without a codec (or of a newer schema) is kept as
@@ -54,6 +61,7 @@ use uuid::Uuid;
 use dc_case::{BlobRef, CaseState};
 
 pub use codec::{ModuleCodec, ModuleCodecs};
+pub use read::{MAX_ENTRY_BYTES, MAX_TOTAL_BYTES};
 
 /// MIME type, stored as the first ZIP entry `mimetype`.
 pub const MIME_TYPE: &str = "application/vnd.dentalcraft.project+zip";
@@ -133,6 +141,17 @@ pub enum DcprjError {
     /// Module id that cannot be used as an archive path component.
     #[error("invalid module id {0:?}")]
     InvalidModuleId(String),
+    /// A number that JSON cannot store (NaN or ±infinity): nothing was
+    /// written, the previous file and its backup are unchanged.
+    #[error(
+        "cannot save: {entry} contains an invalid number (not finite) at {path}; the previous file is unchanged"
+    )]
+    NonFinite {
+        /// Archive entry the value belongs to.
+        entry: String,
+        /// Path of the value inside the entry.
+        path: String,
+    },
 }
 
 impl From<zip::result::ZipError> for DcprjError {
@@ -284,7 +303,7 @@ pub enum LoadIssue {
         /// Reason.
         reason: String,
     },
-    /// A scan references a mesh that could not be loaded.
+    /// A scan or a module references a mesh that could not be loaded.
     MissingBlob(BlobRef),
     /// No codec for the module: its state is kept opaque (informational).
     ModuleKeptOpaque {
@@ -334,7 +353,7 @@ impl std::fmt::Display for LoadIssue {
             Self::HashMismatch(p) => write!(f, "corrupt entry {p}: hash mismatch"),
             Self::UnreadableEntry { path, reason } => write!(f, "cannot read {path}: {reason}"),
             Self::BlobDecode { path, reason } => write!(f, "invalid mesh {path}: {reason}"),
-            Self::MissingBlob(r) => write!(f, "scan mesh {r} could not be loaded"),
+            Self::MissingBlob(r) => write!(f, "mesh {r} could not be loaded"),
             Self::ModuleKeptOpaque { id } => write!(f, "module {id} is unknown: state kept as is"),
             Self::ModuleTooNew {
                 id,
@@ -362,8 +381,43 @@ pub struct LoadOutcome {
     pub issues: Vec<LoadIssue>,
 }
 
-/// Writes `project` to `path` atomically (see the module docs).
-pub fn save(path: &Path, project: &Project) -> Result<(), DcprjError> {
+/// A problem of a save that still succeeded: the new file is in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveWarning {
+    /// The previous file could not be kept as `<path>.bak`: the backup is
+    /// an older version or missing.
+    Backup {
+        /// The backup path.
+        path: std::path::PathBuf,
+        /// Reason.
+        reason: String,
+    },
+    /// The directory could not be synced after the rename: a power loss
+    /// right now could still lose the new file.
+    DirSync(String),
+}
+
+impl std::fmt::Display for SaveWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backup { path, reason } => write!(
+                f,
+                "saved, but the backup {} could not be updated: {reason}",
+                path.display()
+            ),
+            Self::DirSync(reason) => {
+                write!(
+                    f,
+                    "saved, but the folder could not be synced to disk: {reason}"
+                )
+            }
+        }
+    }
+}
+
+/// Writes `project` to `path` atomically (see the module docs). Returns the
+/// warnings of a save that succeeded (see [`SaveWarning`]).
+pub fn save(path: &Path, project: &Project) -> Result<Vec<SaveWarning>, DcprjError> {
     write::save(path, project)
 }
 

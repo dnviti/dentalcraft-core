@@ -42,6 +42,9 @@ impl ModuleData for Counter {
     fn to_json(&self) -> Result<Value, serde_json::Error> {
         serde_json::to_value(self)
     }
+    fn find_non_finite(&self) -> Option<String> {
+        dc_case::find_non_finite(self)
+    }
     fn scan_replaced(&mut self, _role: ScanRole) -> Vec<&'static str> {
         if self.count == 0 {
             return Vec::new();
@@ -446,6 +449,40 @@ fn dcprj_round_trip_through_save_and_open() {
         Err(SessionError::Project(_))
     ));
     assert_eq!(count(&u), 7);
+}
+
+#[test]
+fn an_unreadable_history_keeps_the_file_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let saved = dir.path().join("case.dcprj");
+    let mut s = session();
+    s.execute("project.new", json!({"patient_code": "PZ-0002"}))
+        .unwrap();
+    let out = s
+        .execute("project.save", json!({"path": saved.to_str().unwrap()}))
+        .unwrap();
+    assert_eq!(out["warnings"], json!([]));
+    // the same file with a step history of another schema
+    let mut loaded = dc_project::load(&saved, &s.codecs()).unwrap();
+    loaded.project.history = json!("not a step history");
+    dc_project::save(&saved, &loaded.project).unwrap();
+    let before = std::fs::read(&saved).unwrap();
+
+    let mut t = session();
+    let out = t
+        .execute("project.open", json!({"path": saved.to_str().unwrap()}))
+        .unwrap();
+    assert_eq!(out["read_only"], true);
+    assert!(
+        out["issues"].to_string().contains("history/steps.json"),
+        "{out}"
+    );
+    // never saved over with an empty history
+    assert!(matches!(
+        t.execute("project.save", Value::Null),
+        Err(SessionError::ReadOnly(_))
+    ));
+    assert_eq!(std::fs::read(&saved).unwrap(), before);
 }
 
 // ---------------------------------------------------------------- import

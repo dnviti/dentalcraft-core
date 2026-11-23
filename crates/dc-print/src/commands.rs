@@ -9,14 +9,29 @@
 //! |---|---|---|
 //! | `print.profiles` | none | `{profiles}`, each with a summary of its machine parameters (`entries`: their count) |
 //! | `print.machine-params` | `profile?` | the machine parameters of the profile: the typed values and every entry with its comment |
-//! | `print.prepare` | `inputs` (shell files) or `dir`, `out_dir`, the resin values `layer_um`, `exposure_s`, `bottom_exposure_s`, `bottom_layers`, `rest_s`, `resin_name`, `density_g_ml` (all required), `profile?`, `pwm?`, `gap_mm?`, `margin_mm?` | the summary also written to `summary.json` |
+//! | `print.prepare` | `inputs` (shell files) or `dir`, `out_dir`, the resin values `layer_um`, `exposure_s`, `bottom_exposure_s`, `bottom_layers`, `rest_s`, `resin_name`, `density_g_ml` (all required), `profile?`, `pwm?`, `gap_mm?`, `margin_mm?` | the summary also written to `summary.json`, with `profile_validated` and `warnings` |
 //!
 //! `print.prepare` reads one part per file, runs [`crate::job::prepare`],
 //! then writes `plate_NN.goo` and `plate_NN.stl` per plate (NN from 01)
-//! and `summary.json` into `out_dir`. Each file is written to a `.tmp`
-//! first, synced and renamed, so a failed or cancelled run leaves no
-//! partial file. A missing resin value is refused before anything is read
-//! (`print-no-resin-preset`): no value is ever guessed.
+//! and `summary.json` into `out_dir`. Every file is first written to a
+//! fresh temporary file beside it (created new, never through an existing
+//! file or link) and synced; only when the whole set is written are the
+//! `plate_NN.goo`/`.stl` of an earlier run that this run did not write
+//! removed and the new files renamed into place. A failed or cancelled run
+//! leaves `out_dir` as it was; nothing but those plate files is ever
+//! removed. A missing resin value is refused before anything is read
+//! (`print-no-resin-preset`): no value is ever guessed. A part that is not
+//! a closed, consistently oriented solid with a positive volume (open or
+//! non-manifold edges, flipped or inward triangles) is refused
+//! (`print-invalid-part`) before it is sliced.
+//!
+//! The summary's `profile_validated` is the profile's
+//! [`PrinterProfile::validated`]; `warnings` lists `{code, message}`
+//! objects, today only [`crate::profile::PROFILE_NOT_VALIDATED`]
+//! (`print-profile-not-validated`): the profile's dimensional scale and
+//! left/right orientation are not yet checked against the printer, so the
+//! size of a test piece must be verified before use. Printing is not
+//! blocked.
 //!
 //! A shell of a DentalCraft export (`stampa_resina/` with
 //! `modelli_termoformatura/` beside it) takes its fitting side from its
@@ -543,88 +558,213 @@ fn prepare_files(
     let count = prepared.plates.len();
     let mut plates = Vec::with_capacity(count);
     let (mut volume_ml, mut weight_g, mut time_s) = (0.0, 0.0, 0u64);
-    for (i, plate) in prepared.plates.iter().enumerate() {
-        let name = format!("plate_{:02}", i + 1);
-        let goo = format!("{name}.goo");
-        let stl = format!("{name}.stl");
-        let summary = write_atomic(&out_dir.join(&goo), |w| {
-            job::write_plate_with(
-                plate,
-                &job,
-                w,
-                &mut |done, total| {
-                    let plate_done = f64::from(done) / f64::from(total.max(1));
-                    progress((0.1 + 0.9 * (i as f64 + plate_done) / count as f64) as f32);
-                },
-                cancel,
-                &file_time,
-            )
+    // Every file is staged first: a failed or cancelled run leaves the
+    // earlier set as it was, never a mix of old and new plates.
+    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(2 * count + 1);
+    let result = (|| {
+        for (i, plate) in prepared.plates.iter().enumerate() {
+            let name = format!("plate_{:02}", i + 1);
+            let goo = format!("{name}.goo");
+            let stl = format!("{name}.stl");
+            let goo_path = out_dir.join(&goo);
+            let (tmp, summary) = write_staged(&goo_path, |w| {
+                job::write_plate_with(
+                    plate,
+                    &job,
+                    w,
+                    &mut |done, total| {
+                        let plate_done = f64::from(done) / f64::from(total.max(1));
+                        progress((0.1 + 0.9 * (i as f64 + plate_done) / count as f64) as f32);
+                    },
+                    cancel,
+                    &file_time,
+                )
+            })?;
+            staged.push((tmp, goo_path));
+            let stl_path = out_dir.join(&stl);
+            let (tmp, ()) = write_staged(&stl_path, |w| job::write_plate_stl(plate, w))?;
+            staged.push((tmp, stl_path));
+            volume_ml += summary.volume_ml;
+            weight_g += summary.weight_g;
+            time_s += u64::from(summary.est_time_s);
+            let mut entry = serde_json::to_value(&summary).map_err(json_error)?;
+            entry["goo"] = json!(goo);
+            entry["stl"] = json!(stl);
+            plates.push(entry);
+        }
+        let summary = json!({
+            "out_dir": out_dir.display().to_string(),
+            "profile": job.profile.id,
+            "profile_validated": job.profile.validated,
+            "warnings": warnings(&job.profile),
+            "resin_name": job.job.resin_name,
+            "layer_um": job.job.layer_um,
+            "density_g_ml": job.density_g_ml,
+            "plates": plates,
+            "parts": part_plans,
+            "total": {
+                "plates": count,
+                "parts": parts.len(),
+                "volume_ml": volume_ml,
+                "weight_g": weight_g,
+                "est_time_s": time_s,
+            },
+        });
+        let summary_path = out_dir.join("summary.json");
+        let (tmp, ()) = write_staged(&summary_path, |w| {
+            serde_json::to_writer_pretty(&mut *w, &summary).map_err(json_error)?;
+            w.write_all(b"\n")?;
+            Ok(())
         })?;
-        write_atomic(&out_dir.join(&stl), |w| job::write_plate_stl(plate, w))?;
-        volume_ml += summary.volume_ml;
-        weight_g += summary.weight_g;
-        time_s += u64::from(summary.est_time_s);
-        let mut entry = serde_json::to_value(&summary).map_err(json_error)?;
-        entry["goo"] = json!(goo);
-        entry["stl"] = json!(stl);
-        plates.push(entry);
+        staged.push((tmp, summary_path));
+        Ok(summary)
+    })();
+    let summary = match result {
+        Ok(s) => s,
+        Err(e) => {
+            for (tmp, _) in &staged {
+                // best effort: the staged files are ours
+                let _ = fs::remove_file(tmp);
+            }
+            return Err(e);
+        }
+    };
+    let new: Vec<&Path> = staged.iter().map(|(_, path)| path.as_path()).collect();
+    remove_stale_plates(out_dir, &new)?;
+    for (i, (tmp, path)) in staged.iter().enumerate() {
+        if let Err(source) = fs::rename(tmp, path) {
+            for (tmp, _) in &staged[i..] {
+                let _ = fs::remove_file(tmp);
+            }
+            return Err(PrintCommandError::Write {
+                path: path.display().to_string(),
+                source,
+            });
+        }
     }
-    let summary = json!({
-        "out_dir": out_dir.display().to_string(),
-        "profile": job.profile.id,
-        "resin_name": job.job.resin_name,
-        "layer_um": job.job.layer_um,
-        "density_g_ml": job.density_g_ml,
-        "plates": plates,
-        "parts": part_plans,
-        "total": {
-            "plates": count,
-            "parts": parts.len(),
-            "volume_ml": volume_ml,
-            "weight_g": weight_g,
-            "est_time_s": time_s,
-        },
-    });
-    write_atomic(&out_dir.join("summary.json"), |w| {
-        serde_json::to_writer_pretty(&mut *w, &summary).map_err(json_error)?;
-        w.write_all(b"\n")?;
-        Ok(())
-    })?;
     progress(1.0);
     Ok(summary)
+}
+
+/// `true` for the plate file names `print.prepare` writes:
+/// `plate_<two or more digits>.goo` or `.stl`.
+fn is_plate_file(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("plate_") else {
+        return false;
+    };
+    let Some(digits) = rest
+        .strip_suffix(".goo")
+        .or_else(|| rest.strip_suffix(".stl"))
+    else {
+        return false;
+    };
+    digits.len() >= 2 && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Removes the plate files of `out_dir` that are not in `keep`: an earlier
+/// run's plates must not sit beside this run's. Nothing else is touched.
+fn remove_stale_plates(out_dir: &Path, keep: &[&Path]) -> Result<(), PrintCommandError> {
+    let io = |path: &Path| {
+        let path = path.display().to_string();
+        move |source| PrintCommandError::Write { path, source }
+    };
+    for entry in fs::read_dir(out_dir).map_err(io(out_dir))? {
+        let entry = entry.map_err(io(out_dir))?;
+        let path = entry.path();
+        let stale = entry.file_name().to_str().is_some_and(is_plate_file)
+            && !keep.contains(&path.as_path())
+            && !entry.file_type().map_err(io(&path))?.is_dir();
+        if stale {
+            fs::remove_file(&path).map_err(io(&path))?;
+        }
+    }
+    Ok(())
+}
+
+/// The `{code, message}` warnings of a result prepared with `profile`.
+fn warnings(profile: &PrinterProfile) -> Vec<Value> {
+    profile
+        .warnings()
+        .into_iter()
+        .map(|code| {
+            let message = match code {
+                crate::profile::PROFILE_NOT_VALIDATED => format!(
+                    "the dimensional scale and the left/right orientation of printer profile {} are not yet checked against the printer: verify the size of a test piece before use",
+                    profile.id
+                ),
+                _ => code.to_owned(),
+            };
+            json!({ "code": code, "message": message })
+        })
+        .collect()
 }
 
 fn json_error(e: serde_json::Error) -> JobError {
     JobError::Io(e.into())
 }
 
-/// Writes `path` through `<path>.tmp`: written, synced, then renamed over
-/// `path`. On failure the `.tmp` is removed and `path` is left as it was.
+/// Writes `path` through a staged temporary file ([`write_staged`]), then
+/// renames it over `path`. On failure `path` is left as it was.
+#[cfg(test)]
 fn write_atomic<T>(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<T, JobError>,
 ) -> Result<T, PrintCommandError> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
+    let (tmp, value) = write_staged(path, write)?;
+    fs::rename(&tmp, path).map_err(|source| {
+        let _ = fs::remove_file(&tmp);
+        PrintCommandError::Write {
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
+    Ok(value)
+}
+
+/// Writes a new temporary file beside `path` and syncs it; returns its
+/// path, to be renamed over `path`. The file gets a fresh name
+/// (`<name>.<pid>.<n>.tmp`) and is created with `create_new`, so an
+/// existing file or link of that name is never followed or overwritten.
+/// On failure the temporary file is removed.
+fn write_staged<T>(
+    path: &Path,
+    write: impl FnOnce(&mut BufWriter<File>) -> Result<T, JobError>,
+) -> Result<(PathBuf, T), PrintCommandError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let io = |source| PrintCommandError::Write {
         path: path.display().to_string(),
         source,
     };
+    let (tmp, file) = loop {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let tmp = PathBuf::from(tmp);
+        match File::options().write(true).create_new(true).open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(io(e)),
+        }
+    };
     let result = (|| {
-        let mut w = BufWriter::new(File::create(&tmp).map_err(io)?);
+        let mut w = BufWriter::new(file);
         let value = write(&mut w)?;
         let file = w.into_inner().map_err(|e| io(e.into_error()))?;
         file.sync_all().map_err(io)?;
-        drop(file);
-        fs::rename(&tmp, path).map_err(io)?;
         Ok(value)
     })();
-    if result.is_err() {
-        // best effort: the tmp may not exist
-        let _ = fs::remove_file(&tmp);
+    match result {
+        Ok(value) => Ok((tmp, value)),
+        Err(e) => {
+            // best effort: the file is ours
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
     }
-    result
 }
 
 #[cfg(test)]
@@ -883,6 +1023,93 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"new");
     }
 
+    #[test]
+    fn temp_files_are_fresh_and_never_reused() {
+        let dir = TempDir::new("fresh");
+        let path = dir.0.join("plate_01.goo");
+        // a file at the old predictable name is neither followed nor touched
+        let old_tmp = dir.0.join("plate_01.goo.tmp");
+        fs::write(&old_tmp, b"someone else's").unwrap();
+        let (a, ()) = write_staged(&path, |w| Ok(w.write_all(b"a")?)).unwrap();
+        let (b, ()) = write_staged(&path, |w| Ok(w.write_all(b"b")?)).unwrap();
+        assert_ne!(a, b);
+        assert_ne!(a, old_tmp);
+        assert_eq!(fs::read(&a).unwrap(), b"a");
+        assert_eq!(fs::read(&b).unwrap(), b"b");
+        assert_eq!(fs::read(&old_tmp).unwrap(), b"someone else's");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn only_stale_plate_files_are_removed() {
+        for (name, plate) in [
+            ("plate_01.goo", true),
+            ("plate_03.stl", true),
+            ("plate_123.goo", true),
+            ("plate_1.goo", false),
+            ("plate_01.goo.tmp", false),
+            ("plate_ab.stl", false),
+            ("summary.json", false),
+            ("myplate_01.goo", false),
+        ] {
+            assert_eq!(is_plate_file(name), plate, "{name}");
+        }
+        let dir = TempDir::new("stale");
+        for name in [
+            "plate_01.goo",
+            "plate_01.stl",
+            "plate_02.goo",
+            "plate_02.stl",
+            "plate_03.goo",
+            "notes.txt",
+            "plate_1.goo",
+        ] {
+            fs::write(dir.0.join(name), b"x").unwrap();
+        }
+        fs::create_dir(dir.0.join("plate_04.stl")).unwrap();
+        let keep = [dir.0.join("plate_01.goo"), dir.0.join("plate_01.stl")];
+        let keep: Vec<&Path> = keep.iter().map(PathBuf::as_path).collect();
+        remove_stale_plates(&dir.0, &keep).unwrap();
+        let mut left: Vec<String> = fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "notes.txt",
+                "plate_01.goo",
+                "plate_01.stl",
+                "plate_04.stl",
+                "plate_1.goo"
+            ]
+        );
+    }
+
+    /// A part that is not a closed solid is refused before any file is
+    /// written, and an earlier run's plates stay as they were.
+    #[test]
+    fn open_parts_are_refused_and_earlier_plates_kept() {
+        let dir = TempDir::new("open");
+        let (mut cup, _) = crate::job::tests::cup(glam::Vec3::new(20.0, 12.0, 8.0), 1.0);
+        cup.tris.pop();
+        let path = dir.0.join("SUP_allineatore_01.stl");
+        dc_mesh::io::write(&path, &cup, dc_mesh::MeshFormat::Stl).unwrap();
+        let out = dir.0.join("out");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("plate_02.goo"), b"old").unwrap();
+        let e = run(
+            PRINT_PREPARE,
+            with(resin(), json!({"inputs": [path], "out_dir": out})),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), "print-invalid-part", "{e}");
+        assert!(e.to_string().contains("SUP_allineatore_01"), "{e}");
+        assert_eq!(fs::read(out.join("plate_02.goo")).unwrap(), b"old");
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
+    }
+
     /// The whole command on two cups (needs orientation, supports and the
     /// slicer).
     #[test]
@@ -894,6 +1121,11 @@ mod tests {
             dc_mesh::io::write(&path, &cup, dc_mesh::MeshFormat::Stl).unwrap();
         }
         let out = dir.0.join("out");
+        // an earlier run's plates and a file of the user's
+        fs::create_dir_all(&out).unwrap();
+        for name in ["plate_07.goo", "plate_07.stl", "notes.txt"] {
+            fs::write(out.join(name), b"old").unwrap();
+        }
         let mut fractions = Vec::new();
         let v = execute(
             PRINT_PREPARE,
@@ -932,6 +1164,20 @@ mod tests {
             .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
             .collect();
         assert!(leftovers.is_empty());
+        assert!(!out.join("plate_07.goo").exists() && !out.join("plate_07.stl").exists());
+        assert_eq!(fs::read(out.join("notes.txt")).unwrap(), b"old");
+        assert_eq!(v["profile_validated"], false);
+        assert_eq!(
+            v["warnings"][0]["code"],
+            crate::profile::PROFILE_NOT_VALIDATED
+        );
+        assert!(
+            v["warnings"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("test piece")
+        );
+        assert_eq!(v["warnings"].as_array().unwrap().len(), 1);
     }
 
     /// A shell of an export (`stampa_resina` beside

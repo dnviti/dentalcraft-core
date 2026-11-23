@@ -989,6 +989,9 @@ impl ModuleData for Labels {
     fn to_json(&self) -> Result<serde_json::Value, serde_json::Error> {
         serde_json::to_value(self)
     }
+    fn find_non_finite(&self) -> Option<String> {
+        dc_case::find_non_finite(self)
+    }
     fn referenced_blobs(&self) -> Vec<BlobRef> {
         self.labels.iter().map(|(_, b)| *b).collect()
     }

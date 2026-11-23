@@ -5,6 +5,10 @@ use serde_json::{Value, json};
 
 use crate::{Host, HostError, HostResult, base64};
 
+/// Most commands in one `batch` call and most files in one `import_scan`
+/// call: a longer list is refused before anything runs.
+pub const MAX_ITEMS: usize = 256;
+
 fn obj(properties: Value, required: &[&str]) -> Value {
     json!({
         "type": "object",
@@ -57,11 +61,12 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "batch",
             "Execute commands",
-            "Runs several commands in order and returns their outputs. Stops at the first failure; the commands before it stay applied.",
+            "Runs several commands in order (at most 256 per call) and returns their outputs. Stops at the first failure; the commands before it stay applied.",
             obj(
                 json!({
                     "commands": {
                         "type": "array",
+                        "maxItems": MAX_ITEMS,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -264,6 +269,12 @@ fn import_scan<H: Host>(host: &mut H, args: &Value) -> HostResult {
     let path = opt_str_arg(args, "path")?;
     let paths = match args.get("paths") {
         None | Some(Value::Null) => None,
+        Some(Value::Array(items)) if items.len() > MAX_ITEMS => {
+            return Err(HostError::new(format!(
+                "argument `paths` holds {} files, at most {MAX_ITEMS} per call",
+                items.len()
+            )));
+        }
         Some(Value::Array(items)) => Some(
             items
                 .iter()
@@ -303,6 +314,12 @@ fn parse_batch(args: &Value) -> HostResult<Vec<(String, Value)>> {
         .get("commands")
         .and_then(Value::as_array)
         .ok_or_else(|| HostError::new("missing array argument `commands`"))?;
+    if items.len() > MAX_ITEMS {
+        return Err(HostError::new(format!(
+            "argument `commands` holds {} commands, at most {MAX_ITEMS} per batch",
+            items.len()
+        )));
+    }
     items
         .iter()
         .enumerate()

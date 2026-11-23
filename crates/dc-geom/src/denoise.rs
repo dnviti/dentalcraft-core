@@ -93,23 +93,19 @@ pub fn denoise(mesh: &mut TriMesh, params: &DenoiseParams) -> Result<f32> {
     let (centroid, area, mut normal) = geometry(&mesh.positions);
 
     // spatial range: the mean distance between neighbouring centroids
-    let (sum, count) = tris
-        .par_iter()
-        .enumerate()
-        .map(|(f, t)| {
-            let mut s = 0.0f64;
-            let mut k = 0usize;
-            for &v in t {
-                for &g in ring(v) {
-                    if g as usize != f {
-                        s += f64::from(centroid[f].distance(centroid[g as usize]));
-                        k += 1;
-                    }
+    let (sum, count) = sum_in_chunks(tris.len(), |f| {
+        let mut s = 0.0f64;
+        let mut k = 0usize;
+        for &v in &tris[f] {
+            for &g in ring(v) {
+                if g as usize != f {
+                    s += f64::from(centroid[f].distance(centroid[g as usize]));
+                    k += 1;
                 }
             }
-            (s, k)
-        })
-        .reduce(|| (0.0, 0), |x, y| (x.0 + y.0, x.1 + y.1));
+        }
+        (s, k)
+    });
     let sigma_c = if count > 0 {
         (sum / count as f64) as f32
     } else {
@@ -184,9 +180,58 @@ pub fn denoise(mesh: &mut TriMesh, params: &DenoiseParams) -> Result<f32> {
         .reduce(|| 0.0, f32::max))
 }
 
+/// Σ `term(i)` for `i` in `0..n`, deterministic: fixed chunks of
+/// [`crate::sparse::CHUNK`] summed in parallel, then folded in chunk order
+/// (an f64 sum depends on its order; rayon's `reduce` order depends on
+/// thread scheduling).
+fn sum_in_chunks(n: usize, term: impl Fn(usize) -> (f64, usize) + Sync) -> (f64, usize) {
+    use crate::sparse::CHUNK;
+    let chunks = n.div_ceil(CHUNK);
+    (0..chunks)
+        .into_par_iter()
+        .map(|c| {
+            (c * CHUNK..((c + 1) * CHUNK).min(n))
+                .map(&term)
+                .fold((0.0, 0), |x, y| (x.0 + y.0, x.1 + y.1))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .fold((0.0, 0), |x, y| (x.0 + y.0, x.1 + y.1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunked_sum_does_not_depend_on_the_threads() {
+        // terms of very different sizes: the f64 sum depends on its order
+        let term = |i: usize| {
+            let x = (i as f64 * 0.618_033_988_7).fract();
+            (x * 10f64.powi((i % 17) as i32 - 8), 1)
+        };
+        let n = 5 * crate::sparse::CHUNK + 123;
+        // the reference: chunks summed one by one, in order
+        let mut expected = (0.0f64, 0usize);
+        for c in 0..n.div_ceil(crate::sparse::CHUNK) {
+            let lo = c * crate::sparse::CHUNK;
+            let hi = (lo + crate::sparse::CHUNK).min(n);
+            let part = (lo..hi)
+                .map(term)
+                .fold((0.0, 0), |x, y| (x.0 + y.0, x.1 + y.1));
+            expected = (expected.0 + part.0, expected.1 + part.1);
+        }
+        for threads in [1, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let got = pool.install(|| sum_in_chunks(n, term));
+            assert_eq!(got.0.to_bits(), expected.0.to_bits(), "{threads} threads");
+            assert_eq!(got.1, n);
+        }
+        assert_eq!(sum_in_chunks(0, term), (0.0, 0));
+    }
 
     /// `n x n` grid over 10 x 10 mm with a crease (a roof, slope 0.5) and
     /// noise of `amp` mm.

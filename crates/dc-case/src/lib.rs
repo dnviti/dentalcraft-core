@@ -16,6 +16,7 @@
 mod blob;
 mod case;
 mod fdi;
+mod finite;
 pub mod import;
 mod module;
 mod names;
@@ -24,6 +25,7 @@ mod pose;
 pub use blob::{BlobRef, BlobStore};
 pub use case::{Case, CaseState, Jaws, MAX_BITE_SCANS, RoleSource, Scan, ScanRole, WorldFrame};
 pub use fdi::Fdi;
+pub use finite::find_non_finite;
 pub use module::{ModuleData, ModuleState, OpaqueModuleData};
 pub use names::{arch_hint, role_from_name};
 pub use pose::Pose;
@@ -42,6 +44,9 @@ pub enum CaseError {
     /// A referenced blob is not in the store.
     #[error("missing blob {0}")]
     MissingBlob(BlobRef),
+    /// A rotation quaternion of zero length or with non-finite components.
+    #[error("invalid rotation {0:?}: not a non-zero finite quaternion")]
+    InvalidRotation([f64; 4]),
     /// Module data could not be (de)serialized.
     #[error(transparent)]
     Json(#[from] serde_json::Error),

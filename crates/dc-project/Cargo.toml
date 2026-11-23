@@ -14,7 +14,8 @@ dc-case.workspace = true
 dc-mesh.workspace = true
 blake3.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# exact f64 parsing: save -> load -> save must give identical bytes
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 thiserror.workspace = true
 uuid.workspace = true
 zip.workspace = true
