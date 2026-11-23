@@ -454,6 +454,74 @@ fn preview_follows_the_layer_pixel_map() {
     }
 }
 
+/// A part whose every tilt of up to 45° starts an island on the fitting
+/// side (it was refused, `print-island-unsupported`) is prepared in a pose
+/// of the wide search, its opening turned to the side, every hard check
+/// passed.
+#[test]
+fn a_part_the_tilts_cannot_hold_is_prepared_in_another_pose() {
+    let (mesh, fitting) = crate::testutil::spiked_slab();
+    let part = PrintPart {
+        id: "spike".into(),
+        mesh,
+        fitting: Some(fitting),
+    };
+    let job = print_job(small_profile());
+    let first = orient::orient_with(
+        &part.mesh,
+        part.fitting.as_ref().unwrap(),
+        &OrientParams {
+            layer_um: job.job.layer_um,
+            ..job.orient.clone()
+        },
+    );
+    let prepared = prepare(std::slice::from_ref(&part), &job).unwrap();
+    let chosen = prepared.parts[0].orientation;
+    assert_ne!(chosen, first);
+    assert!((chosen.rotation * Vec3::Z).z < 0.5, "{chosen:?}");
+    // the same pose every time
+    let again = prepare(&[part], &job).unwrap();
+    assert_eq!(again.parts[0].orientation, chosen);
+}
+
+/// When no pose holds a part, the refusal says how many islands are left,
+/// how many poses were tried and where the lowest island starts on the
+/// part.
+#[test]
+fn a_part_no_pose_holds_is_refused_with_its_islands() {
+    // a box all of whose faces are fitting: wherever it stands, it starts
+    // in mid-air on the fitting side
+    let mesh = cuboid(Vec3::new(1.0, 2.0, 3.0), Vec3::new(5.0, 6.0, 7.0));
+    let part = PrintPart {
+        id: "box".into(),
+        fitting: Some(vec![true; mesh.face_count()]),
+        mesh,
+    };
+    let e = prepare(&[part], &print_job(small_profile())).unwrap_err();
+    assert_eq!(e.code(), "print-island-unsupported", "{e}");
+    let JobError::Support {
+        source: SupportError::IslandUnsupported { count, .. },
+        poses,
+        at_mm: Some(at),
+        ..
+    } = &e
+    else {
+        panic!("{e:?}");
+    };
+    assert!(*count >= 1 && *poses >= 1, "{e}");
+    // the island starts on the box, in its own coordinates
+    let inside = |v: f32, lo: f32, hi: f32| (lo - 0.2..=hi + 0.2).contains(&v);
+    assert!(
+        inside(at[0], 1.0, 5.0) && inside(at[1], 2.0, 6.0) && inside(at[2], 3.0, 7.0),
+        "{e}"
+    );
+    let text = e.to_string();
+    assert!(
+        text.contains("regions start in mid-air") && text.contains("poses tried"),
+        "{text}"
+    );
+}
+
 #[test]
 fn only_closed_outward_solids_are_accepted() {
     let cube = cuboid(Vec3::ZERO, Vec3::new(5.0, 5.0, 5.0));

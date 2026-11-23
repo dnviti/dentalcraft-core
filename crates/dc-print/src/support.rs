@@ -144,11 +144,14 @@ pub enum SupportError {
         /// Distance from the tip to the nearest fitting face, mm.
         distance_mm: f32,
     },
-    /// A region of a layer starts in mid-air and no strut touches it.
+    /// Regions of layers start in mid-air and no strut touches them; the
+    /// lowest one is named.
     #[error(
-        "print-island-unsupported: layer {layer} at ({x_mm:.2}, {y_mm:.2}) mm, {area_mm2:.3} mm²"
+        "print-island-unsupported: {count} regions start in mid-air without a strut, the lowest at layer {layer} at ({x_mm:.2}, {y_mm:.2}) mm, {area_mm2:.3} mm²"
     )]
     IslandUnsupported {
+        /// Unsupported islands.
+        count: usize,
         /// Layer index (0-based).
         layer: u32,
         /// X of the island's centre, plate space, mm.
@@ -333,8 +336,10 @@ pub fn check_islands(
         meshes.push(&set.raft);
     }
     meshes.extend(set.solids.iter());
-    match islands::first_island(&meshes, layer_um) {
+    let found = islands::islands(&meshes, layer_um);
+    match found.first() {
         Some(i) => Err(SupportError::IslandUnsupported {
+            count: found.len(),
             layer: i.layer,
             x_mm: i.centre.x,
             y_mm: i.centre.y,
