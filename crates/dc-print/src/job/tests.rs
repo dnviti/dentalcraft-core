@@ -489,6 +489,68 @@ fn only_closed_outward_solids_are_accepted() {
     let tip = (fin.positions.len() - 1) as u32;
     fin.tris.push([b, a, tip]);
     assert!(refused(fin).contains("open (boundary) edges"));
+    // two boxes sharing one edge: four triangles on it
+    let other = cuboid(Vec3::new(5.0, 5.0, 0.0), Vec3::new(10.0, 10.0, 5.0));
+    let mut pair = cube.clone();
+    let n = pair.positions.len() as u32;
+    pair.positions.extend(&other.positions);
+    pair.tris
+        .extend(other.tris.iter().map(|t| t.map(|i| i + n)));
+    assert!(refused(pair).contains("shared by more than two triangles"));
+    // a hole through the wall: a square ring
+    assert!(refused(ring()).contains("1 holes through the wall (genus 1)"));
+}
+
+/// A square ring 10 × 10 × 2 mm around a 4 × 4 mm hole: a closed outward
+/// solid of genus 1.
+fn ring() -> TriMesh {
+    let mut m = TriMesh::default();
+    let (lo, hi, a, b, h) = (0.0, 10.0, 3.0, 7.0, 2.0);
+    let at = |x: f32, y: f32, z: f32| Vec3::new(x, y, z);
+    // outer and inner corners, counter-clockwise from above
+    let outer = [(lo, lo), (hi, lo), (hi, hi), (lo, hi)];
+    let inner = [(a, a), (b, a), (b, b), (a, b)];
+    // from the centre of the ring to the middle of a side
+    let side =
+        |p: (f32, f32), q: (f32, f32)| at((p.0 + q.0) / 2.0 - 5.0, (p.1 + q.1) / 2.0 - 5.0, 0.0);
+    for k in 0..4 {
+        let (o0, o1) = (outer[k], outer[(k + 1) % 4]);
+        let (i0, i1) = (inner[k], inner[(k + 1) % 4]);
+        for (z, up) in [(0.0, -Vec3::Z), (h, Vec3::Z)] {
+            quad(
+                &mut m,
+                [
+                    at(o0.0, o0.1, z),
+                    at(o1.0, o1.1, z),
+                    at(i1.0, i1.1, z),
+                    at(i0.0, i0.1, z),
+                ],
+                up,
+            );
+        }
+        // the outer side faces away from the centre, the inner one towards it
+        quad(
+            &mut m,
+            [
+                at(o0.0, o0.1, 0.0),
+                at(o1.0, o1.1, 0.0),
+                at(o1.0, o1.1, h),
+                at(o0.0, o0.1, h),
+            ],
+            side(o0, o1),
+        );
+        quad(
+            &mut m,
+            [
+                at(i0.0, i0.1, 0.0),
+                at(i1.0, i1.1, 0.0),
+                at(i1.0, i1.1, h),
+                at(i0.0, i0.1, h),
+            ],
+            -side(i0, i1),
+        );
+    }
+    m
 }
 
 #[test]

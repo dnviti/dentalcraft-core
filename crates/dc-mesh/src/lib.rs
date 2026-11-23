@@ -6,7 +6,9 @@
 //! `u16` labels (FDI numbers, `0` = gingiva / unlabeled).
 //!
 //! The crate also provides topology queries ([`EdgeAdjacency`], boundary
-//! loops, connected components), a validation report ([`ValidationReport`]),
+//! loops, connected components), the topology of a mesh as a solid with
+//! vertices identified by exact position ([`solid_topology`], the shared
+//! definition of a printable closed solid), a validation report ([`ValidationReport`]),
 //! the canonical `DCM1` blob encoding ([`dcm`]) and the mesh file I/O
 //! readers and writers ([`io`]: STL, OBJ, PLY, unit detection).
 //! [`PointCloud`] is the scanner's point set (positions with optional
@@ -17,6 +19,7 @@ pub mod cleanup;
 pub mod cloud;
 pub mod dcm;
 pub mod io;
+pub mod solid;
 mod topology;
 mod validate;
 
@@ -25,6 +28,7 @@ use glam::Vec3;
 pub use cleanup::{BadFaceReport, remove_bad_faces, rotate_y_up_to_z_up};
 pub use cloud::PointCloud;
 pub use io::{MeshFormat, ScanFile, Units, read_scan};
+pub use solid::{SolidTopology, solid_topology};
 pub use topology::{EdgeAdjacency, EdgeKey};
 pub use validate::ValidationReport;
 

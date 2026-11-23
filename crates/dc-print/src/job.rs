@@ -156,7 +156,8 @@ pub enum JobError {
     #[error("print-no-parts: nothing to print")]
     NoParts,
     /// A part cannot be printed as given (empty, broken or non-finite mesh,
-    /// fitting flags of the wrong length).
+    /// not a closed outward solid, a hole through its wall, fitting flags
+    /// of the wrong length).
     #[error("print-invalid-part: {part}: {reason}")]
     InvalidPart {
         /// Part id.
@@ -408,50 +409,42 @@ impl Supported {
 }
 
 /// Why `mesh` is not a closed, consistently oriented solid with a positive
-/// volume (the slicer's winding rule needs one), `None` when it is.
-fn solid_defect(mesh: &TriMesh) -> Option<String> {
-    let adj = mesh.edge_adjacency();
-    let boundary = adj.boundary_edge_count();
-    if boundary > 0 {
+/// volume and no hole through its wall (the slicer's winding rule needs a
+/// closed solid; an aligner shell or a model with a tunnel is broken),
+/// `None` when it is. The criteria are those of the aligners' export print
+/// check, on [`dc_mesh::solid_topology`]: vertices are identified by their
+/// exact position, as in the STL file, and triangles with no area are left
+/// out.
+pub(crate) fn solid_defect(mesh: &TriMesh) -> Option<String> {
+    let t = dc_mesh::solid_topology(mesh);
+    if t.boundary_edges > 0 {
         return Some(format!(
-            "not a closed solid: {boundary} open (boundary) edges"
+            "not a closed solid: {} open (boundary) edges",
+            t.boundary_edges
         ));
     }
-    let non_manifold = adj.non_manifold_edge_count();
-    if non_manifold > 0 {
+    if t.nonmanifold_edges > 0 {
         return Some(format!(
-            "not a closed solid: {non_manifold} edges shared by more than two triangles"
+            "not a closed solid: {} edges shared by more than two triangles",
+            t.nonmanifold_edges
         ));
     }
-    // Two triangles on one edge are oriented alike when they run it in
-    // opposite directions.
-    let flipped = adj
-        .iter()
-        .filter(|(e, faces)| {
-            let runs_ab = |f: u32| {
-                let t = mesh.tris[f as usize];
-                (0..3).any(|k| t[k] == e.0 && t[(k + 1) % 3] == e.1)
-            };
-            faces.len() == 2 && runs_ab(faces[0]) == runs_ab(faces[1])
-        })
-        .count();
-    if flipped > 0 {
+    if t.flipped_edges > 0 {
         return Some(format!(
-            "triangles not consistently oriented: {flipped} edges between flipped triangles"
+            "triangles not consistently oriented: {} edges between flipped triangles",
+            t.flipped_edges
         ));
     }
-    let volume: f64 = (0..mesh.face_count())
-        .map(|f| {
-            let [a, b, c] = mesh.triangle(f).map(|p| p.as_dvec3());
-            a.dot(b.cross(c)) / 6.0
-        })
-        .sum();
+    let volume = t.volume_mm3;
     if volume.is_nan() || volume <= 0.0 {
         return Some(format!(
             "volume {volume:.3} mm³ is not positive (triangles facing inward)"
         ));
     }
-    None
+    match t.genus {
+        Some(g) if g > 0 => Some(format!("{g} holes through the wall (genus {g})")),
+        _ => None,
+    }
 }
 
 /// Orients, supports and checks one part; `cancel` is polled before the

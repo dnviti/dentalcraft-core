@@ -6,7 +6,10 @@
 //! [`crate::layout::nest`] (position on the plate) →
 //! [`crate::slice::slice_plate`] (layers as runs) → GOO file.
 
-use dc_mesh::TriMesh;
+use std::path::Path;
+
+use dc_mesh::io::ReadOptions;
+use dc_mesh::{MeshError, MeshFormat, TriMesh};
 use glam::{Quat, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
@@ -94,6 +97,22 @@ pub fn rotate_mesh(mesh: &mut TriMesh, rotation: Quat) {
             *v = rotation * *v;
         }
     }
+}
+
+/// Reads a part (or a stage model) from a mesh file, vertices identified by
+/// their exact position. An STL file has no connectivity: the default
+/// tolerance weld of [`dc_mesh::io::read`] would merge the two ends of the
+/// very short edges of a fine shell, folding their triangles, and the solid
+/// check would see edges the file does not have.
+///
+/// # Errors
+/// The file cannot be read or is not a valid mesh.
+pub fn read_mesh(path: &Path) -> Result<TriMesh, MeshError> {
+    let format = MeshFormat::from_path(path)?;
+    let exact = ReadOptions {
+        weld_tolerance: 0.0,
+    };
+    dc_mesh::io::read_with(path, format, &exact)
 }
 
 /// Translate a mesh in place.
