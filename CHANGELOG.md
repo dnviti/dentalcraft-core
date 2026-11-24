@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.0-alpha.10](https://github.com/dnviti/dentalcraft-core/compare/v0.3.0-alpha.9...v0.3.0-alpha.10) (2026-11-24)
+
+
+### Features
+
+* **case:** an import warning for a scan that could not be closed ([#34](https://github.com/dnviti/dentalcraft-core/issues/34)) ([52e53a6](https://github.com/dnviti/dentalcraft-core/commit/52e53a637cdc88f157a18b531fca99786434bb50))
+
+
+### Bug Fixes
+
+* **print:** agree with the export check on solids and search more poses for supports ([#33](https://github.com/dnviti/dentalcraft-core/issues/33)) ([c82b79d](https://github.com/dnviti/dentalcraft-core/commit/c82b79d90c09eab4e7d315c3d22ed78b6c109ee9))
+* refuse unsafe saves, hostile project files and invalid print parts ([#31](https://github.com/dnviti/dentalcraft-core/issues/31)) ([a41bad6](https://github.com/dnviti/dentalcraft-core/commit/a41bad679479573c3b7258a1477d812295d24cc1))
+* **session:** an empty step history is not an unreadable one ([#32](https://github.com/dnviti/dentalcraft-core/issues/32)) ([e5fc03d](https://github.com/dnviti/dentalcraft-core/commit/e5fc03d3bff4b9dff8b39da71e07726c1222d416))
+
 ## [0.3.0-alpha.9](https://github.com/dnviti/dentalcraft-core/compare/v0.3.0-alpha.8...v0.3.0-alpha.9) (2026-11-22)
 
 
